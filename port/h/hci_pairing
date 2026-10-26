@@ -1,0 +1,26 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#ifndef BTV_HCI_PAIRING_H
+#define BTV_HCI_PAIRING_H
+#include <stddef.h>
+#include <stdint.h>
+
+typedef struct btv_hci_pairing
+{
+    uint8_t address[6], pin[16], pin_bytes;
+    uint8_t link_key[16], link_key_type, have_link_key;
+    uint8_t allow_just_works, pairing_complete, pairing_status;
+} btv_hci_pairing;
+
+/* Credentials are copied. A NULL/zero PIN and missing link key cause explicit
+ * negative replies. Just Works confirmation is opt-in. */
+int btv_hci_pairing_init(btv_hci_pairing *pairing, const uint8_t address[6],
+                         const uint8_t *pin, size_t pin_bytes,
+                         const uint8_t *link_key, uint8_t link_key_type,
+                         int allow_just_works);
+/* Return 0 for unrelated events, a command byte count for a required reply,
+ * or -1 for malformed/matching unsafe input. Output is unchanged on 0/-1. */
+int btv_hci_pairing_event(btv_hci_pairing *pairing, const uint8_t *event,
+                          size_t bytes, uint8_t *output, size_t capacity);
+
+#endif

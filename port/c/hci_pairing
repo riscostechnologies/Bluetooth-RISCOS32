@@ -1,0 +1,98 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/* Pairing request policy derived from NetBSD HCI event/command layouts. */
+#include "hci_pairing.h"
+#include "hci_frame.h"
+#include <string.h>
+
+int btv_hci_pairing_init(btv_hci_pairing *pairing, const uint8_t address[6],
+                         const uint8_t *pin, size_t pin_bytes,
+                         const uint8_t *link_key, uint8_t link_key_type,
+                         int allow_just_works)
+{
+    if (pairing == 0 || address == 0 || pin_bytes > 16 ||
+        (pin == 0 && pin_bytes != 0))
+        return 0;
+    memset(pairing, 0, sizeof(*pairing));
+    memcpy(pairing->address, address, 6);
+    if (pin_bytes != 0) memcpy(pairing->pin, pin, pin_bytes);
+    pairing->pin_bytes = (uint8_t)pin_bytes;
+    if (link_key != 0)
+    {
+        memcpy(pairing->link_key, link_key, 16);
+        pairing->link_key_type = link_key_type;
+        pairing->have_link_key = 1;
+    }
+    pairing->allow_just_works = allow_just_works != 0;
+    return 1;
+}
+
+static int reply(uint8_t *output, size_t capacity, uint16_t opcode,
+                 const uint8_t *address, const uint8_t *extra, size_t extra_bytes)
+{
+    uint8_t parameters[23];
+    size_t bytes;
+    memcpy(parameters, address, 6);
+    if (extra_bytes != 0) memcpy(parameters + 6, extra, extra_bytes);
+    bytes = btv_hci_command(output, capacity, opcode, parameters,
+                            6 + extra_bytes);
+    return bytes == 0 ? -1 : (int)bytes;
+}
+
+int btv_hci_pairing_event(btv_hci_pairing *pairing, const uint8_t *event,
+                          size_t bytes, uint8_t *output, size_t capacity)
+{
+    uint8_t extra[17];
+    size_t expected;
+    uint16_t opcode;
+    if (pairing == 0 || output == 0 ||
+        btv_hci_frame_size(BTV_HCI_EVENT, event, bytes, 255, &expected) !=
+        BTV_HCI_COMPLETE || expected != bytes)
+        return -1;
+    if (event[0] == 0x18)
+    {
+        if (bytes != 25) return -1;
+        if (memcmp(event + 2, pairing->address, 6) != 0) return 0;
+        memcpy(pairing->link_key, event + 8, 16);
+        pairing->link_key_type = event[24];
+        pairing->have_link_key = 1;
+        return 0;
+    }
+    if (event[0] == 0x36)
+    {
+        if (bytes != 9) return -1;
+        if (memcmp(event + 3, pairing->address, 6) != 0) return 0;
+        pairing->pairing_complete = 1;
+        pairing->pairing_status = event[2];
+        return 0;
+    }
+    if (event[0] != 0x16 && event[0] != 0x17 && event[0] != 0x31 &&
+        event[0] != 0x33 && event[0] != 0x34)
+        return 0;
+    if (bytes != (event[0] == 0x33 ? 12u : 8u)) return -1;
+    if (memcmp(event + 2, pairing->address, 6) != 0) return 0;
+    if (event[0] == 0x17)
+        return pairing->have_link_key ?
+            reply(output, capacity, 0x040b, pairing->address,
+                  pairing->link_key, 16) :
+            reply(output, capacity, 0x040c, pairing->address, 0, 0);
+    if (event[0] == 0x16)
+    {
+        if (pairing->pin_bytes == 0)
+            return reply(output, capacity, 0x040e, pairing->address, 0, 0);
+        memset(extra, 0, sizeof(extra));
+        extra[0] = pairing->pin_bytes;
+        memcpy(extra + 1, pairing->pin, pairing->pin_bytes);
+        return reply(output, capacity, 0x040d, pairing->address, extra, 17);
+    }
+    if (event[0] == 0x31)
+    {
+        extra[0] = 3; /* NoInputNoOutput. */
+        extra[1] = 0; /* No OOB authentication data. */
+        extra[2] = 2; /* Dedicated bonding, MITM protection not required. */
+        return reply(output, capacity, 0x042b, pairing->address, extra, 3);
+    }
+    opcode = event[0] == 0x33 && pairing->allow_just_works ? 0x042c :
+             event[0] == 0x33 ? 0x042d : 0x042f;
+    return reply(output, capacity, opcode, pairing->address, 0, 0);
+}

@@ -1,0 +1,57 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        bt_sdpc
+ * Purpose:     A small SDP client for the core: one ServiceSearchAttribute
+ *              transaction on an SDP channel, with continuation, collecting
+ *              the attribute lists of every record that has a UUID.  Pure:
+ *              the caller opens the L2CAP channel (PSM 1), sends what
+ *              btv_sdpc_request makes, and feeds it what comes back.
+ * Reference:   Bluetooth Core, Vol 3 Part B (SDP): ServiceSearchAttribute
+ *              request 0x06 / response 0x07, data elements, continuation
+ *              state.  The older client (sdp_query.c) asks for fixed
+ *              attributes; this one takes the attribute list.
+ * Licence:     BSD-2-Clause (see LICENSE).
+ ******************************************************************/
+#ifndef BTP_SDPC_H
+#define BTP_SDPC_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#define BTP_SDPC_BYTES 640u       /* a HID record with its report descriptor */
+#define BTP_SDPC_ATTRIBUTES 8
+
+enum btp_sdpc_state
+{
+    BTP_SDPC_IDLE, BTP_SDPC_SEND, BTP_SDPC_WAIT, BTP_SDPC_DONE, BTP_SDPC_FAILED
+};
+
+typedef struct btp_sdpc
+{
+    uint8_t state, attribute_count, continuation_bytes;
+    uint8_t continuation[16];
+    uint16_t transaction, uuid, used;
+    uint16_t attributes[BTP_SDPC_ATTRIBUTES];
+    uint32_t sent_at;
+    uint8_t data[BTP_SDPC_BYTES];
+} btp_sdpc;
+
+/* Begin a search for records of this 16-bit UUID, wanting these attributes
+ * (single ids; at most BTP_SDPC_ATTRIBUTES). */
+void btp_sdpc_start(btp_sdpc *c, uint16_t uuid, const uint16_t *attributes,
+                    unsigned int count, uint16_t transaction);
+/* The next request PDU, when there is one to send (state SEND): 0 when not.
+ * The state becomes WAIT. */
+size_t btp_sdpc_request(btp_sdpc *c, uint8_t *out, size_t room, uint32_t now);
+/* A PDU from the server.  Returns 1 when the search is finished (DONE),
+ * -1 on a failure (FAILED), 0 when more is to come (the state is SEND
+ * again) or the PDU was not for this transaction. */
+int btp_sdpc_response(btp_sdpc *c, const uint8_t *pdu, size_t bytes);
+/* Nothing came back for this long: failed. */
+void btp_sdpc_tick(btp_sdpc *c, uint32_t now, uint32_t timeout_ms);
+/* The collected attribute lists: a data element sequence, one attribute
+ * list per record.  Valid in DONE. */
+const uint8_t *btp_sdpc_result(const btp_sdpc *c, size_t *bytes);
+
+#endif

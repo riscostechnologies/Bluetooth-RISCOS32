@@ -1,0 +1,108 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        usb_stream_path
+ * Purpose:     Build validated RISC OS USBDriver DeviceFS paths.
+ ******************************************************************/
+#include <usb_stream_path.h>
+#include <string.h>
+
+#define BTV_USB_PATH_BYTES 160
+
+static int append_text(char *output, size_t capacity, size_t *used,
+                       const char *text)
+{
+    size_t bytes;
+    bytes = strlen(text);
+    if (bytes >= capacity - *used) return 0;
+    memcpy(output + *used, text, bytes);
+    *used += bytes;
+    output[*used] = 0;
+    return 1;
+}
+
+static int append_number(char *output, size_t capacity, size_t *used,
+                         size_t value)
+{
+    char digits[12];
+    size_t count, index;
+    count = 0;
+    do
+    {
+        if (count == sizeof(digits)) return 0;
+        digits[count++] = (char)('0' + value % 10);
+        value /= 10;
+    }
+    while (value != 0);
+    if (count >= capacity - *used) return 0;
+    for (index = count; index != 0; --index)
+        output[(*used)++] = digits[index - 1];
+    output[*used] = 0;
+    return 1;
+}
+
+static int build_path(char *output, size_t capacity, const char *device,
+                      uint8_t interface_number, uint8_t alternate,
+                      uint8_t endpoint, enum btv_usb_stream_kind kind,
+                      size_t buffer_bytes, int nopad, uint16_t paced_bytes);
+
+int btv_usb_stream_path(char *output, size_t capacity, const char *device,
+                        uint8_t interface_number, uint8_t alternate,
+                        uint8_t endpoint, enum btv_usb_stream_kind kind,
+                        size_t buffer_bytes, int nopad)
+{
+    return build_path(output, capacity, device, interface_number, alternate,
+                      endpoint, kind, buffer_bytes, nopad, 0);
+}
+
+int btv_usb_isoc_stream_path(char *output, size_t capacity, const char *device,
+                             uint8_t interface_number, uint8_t alternate,
+                             uint8_t endpoint, size_t buffer_bytes,
+                             uint16_t packet_bytes)
+{
+    if (packet_bytes == 0) return 0;
+    return build_path(output, capacity, device, interface_number, alternate,
+                      endpoint, BTV_USB_STREAM_ISOCHRONOUS, buffer_bytes, 1,
+                      packet_bytes);
+}
+
+static int build_path(char *output, size_t capacity, const char *device,
+                      uint8_t interface_number, uint8_t alternate,
+                      uint8_t endpoint, enum btv_usb_stream_kind kind,
+                      size_t buffer_bytes, int nopad, uint16_t paced_bytes)
+{
+    char path[BTV_USB_PATH_BYTES];
+    const char *type;
+    size_t used, device_bytes;
+    if (output == NULL || device == NULL || capacity == 0 || endpoint > 15 ||
+        buffer_bytes == 0) return 0;
+    device_bytes = strlen(device);
+    if (device_bytes == 0 || device_bytes > 31) return 0;
+    if (kind == BTV_USB_STREAM_BULK) type = "bulk";
+    else if (kind == BTV_USB_STREAM_INTERRUPT) type = "interrupt";
+    else if (kind == BTV_USB_STREAM_ISOCHRONOUS) type = "isochronous";
+    else return 0;
+    path[0] = 0;
+    used = 0;
+    if (!append_text(path, sizeof(path), &used, "devices#interface") ||
+        !append_number(path, sizeof(path), &used, interface_number) ||
+        !append_text(path, sizeof(path), &used, ";alternate") ||
+        !append_number(path, sizeof(path), &used, alternate) ||
+        !append_text(path, sizeof(path), &used, ";endpoint") ||
+        !append_number(path, sizeof(path), &used, endpoint) ||
+        !append_text(path, sizeof(path), &used, ";") ||
+        !append_text(path, sizeof(path), &used, type) ||
+        (nopad && !append_text(path, sizeof(path), &used, ";nopad")) ||
+        !append_text(path, sizeof(path), &used, ";size") ||
+        !append_number(path, sizeof(path), &used, buffer_bytes) ||
+        (paced_bytes != 0 &&
+         (!append_text(path, sizeof(path), &used, ";samplerate") ||
+          !append_number(path, sizeof(path), &used,
+                         (size_t)paced_bytes * 1000u) ||
+          !append_text(path, sizeof(path), &used, ";samplesize1"))) ||
+        !append_text(path, sizeof(path), &used, ":") ||
+        !append_text(path, sizeof(path), &used, device) || used >= capacity)
+        return 0;
+    memcpy(output, path, used + 1);
+    return 1;
+}

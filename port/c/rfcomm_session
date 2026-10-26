@@ -1,0 +1,223 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/* Serialized composition of the bounded RFCOMM protocol components. */
+#include "rfcomm_session.h"
+#include <string.h>
+
+void btv_rfcomm_session_abort(btv_rfcomm_session *s)
+{
+    if (s == NULL) return;
+    s->state = BTV_RS_FAILED;
+    s->selected = 0;
+    btv_rfcomm_mux_abort(&s->mux);
+    btv_rfcomm_dlc_abort(&s->dlc);
+}
+
+int btv_rfcomm_session_start(btv_rfcomm_session *s, int initiator,
+    uint8_t channel, uint16_t receive_limit, uint16_t transmit_limit, uint32_t now)
+{
+    if (s == NULL || (initiator != 0 && initiator != 1) || channel < 1 || channel > 30 ||
+        receive_limit < 48 || receive_limit > 518 || transmit_limit < 48) return 0;
+    memset(s, 0, sizeof(*s));
+    s->dlci = (uint8_t)((channel << 1) | !initiator);
+    s->receive_limit = receive_limit;
+    s->transmit_limit = transmit_limit;
+    s->mtu = receive_limit - 6;
+    if (s->mtu > transmit_limit - 6) s->mtu = transmit_limit - 6;
+    btv_rfcomm_control_init(&s->control, s->control_storage, sizeof(s->control_storage));
+    btv_rfcomm_mux_start(&s->mux, initiator, now);
+    s->state = BTV_RS_MUX;
+    return 1;
+}
+
+void btv_rfcomm_session_tick(btv_rfcomm_session *s, uint32_t now)
+{
+    if (s == NULL || s->state == BTV_RS_IDLE || s->state >= BTV_RS_CLOSED) return;
+    btv_rfcomm_mux_tick(&s->mux, now);
+    if (s->mux.state == BTV_MUX_FAILED || s->control.failed) goto failed;
+    if (s->mux.state == BTV_MUX_CLOSED || s->mux.state == BTV_MUX_CLOSING)
+    {
+        btv_rfcomm_dlc_abort(&s->dlc);
+        s->state = s->mux.state == BTV_MUX_CLOSED ? BTV_RS_CLOSED : BTV_RS_CLOSING;
+        return;
+    }
+    if (s->state == BTV_RS_MUX && s->mux.state == BTV_MUX_OPEN)
+    {
+        if (!btv_rfcomm_pn_start(&s->pn, s->dlci, s->mtu, 4, -1, now)) goto failed;
+        s->state = BTV_RS_PN;
+    }
+    if (s->state == BTV_RS_PN)
+    {
+        btv_rfcomm_pn_tick(&s->pn, now);
+        if (s->pn.state == BTV_PN_FAILED) goto failed;
+        if (s->pn.state == BTV_PN_DONE)
+        {
+            if (!s->pn.credit_mode || !btv_rfcomm_dlc_start(&s->dlc, &s->pn, s->mux.initiator, 4, now) ||
+                !btv_rfcomm_rx_init(&s->rx, &s->dlc, s->receive_storage, sizeof(s->receive_storage))) goto failed;
+            s->state = BTV_RS_DLC;
+        }
+    }
+    if (s->state >= BTV_RS_DLC && s->state <= BTV_RS_CLOSING)
+    {
+        btv_rfcomm_dlc_tick(&s->dlc, now);
+        if (s->dlc.control.state == BTV_MUX_FAILED) goto failed;
+        if (s->dlc.control.state == BTV_MUX_CLOSING || s->dlc.control.state == BTV_MUX_CLOSED)
+        {
+            s->state = BTV_RS_CLOSING;
+            if (s->dlc.control.state == BTV_MUX_CLOSED)
+                btv_rfcomm_mux_close(&s->mux, now);
+            return;
+        }
+        if (s->state == BTV_RS_DLC && s->dlc.control.state == BTV_MUX_OPEN)
+        {
+            if (!btv_rfcomm_msc_start(&s->msc, s->dlci, 0x8c, now) ||
+                !btv_rfcomm_tx_init(&s->tx, &s->dlc, &s->msc, s->transmit_storage,
+                    sizeof(s->transmit_storage), s->transmit_limit)) goto failed;
+            s->state = BTV_RS_MSC;
+        }
+        if (s->state == BTV_RS_MSC || s->state == BTV_RS_READY)
+        {
+            btv_rfcomm_msc_tick(&s->msc, now);
+            if (s->msc.failed) goto failed;
+            s->state = btv_rfcomm_msc_ready(&s->msc) ? BTV_RS_READY : BTV_RS_MSC;
+        }
+    }
+    return;
+failed:
+    btv_rfcomm_session_abort(s);
+}
+
+int btv_rfcomm_session_receive(btv_rfcomm_session *s, const uint8_t *data, size_t bytes, uint32_t now)
+{
+    btv_rfcomm_frame frame;
+    btv_rfcomm_mcc mcc;
+    int result;
+    if (s == NULL || data == NULL) return -1;
+    btv_rfcomm_session_tick(s, now);
+    if (s->state == BTV_RS_IDLE || s->state >= BTV_RS_CLOSED) return -1;
+    if (bytes == 0 || bytes > s->receive_limit) goto failed;
+    if ((data[0] >> 2) != 0 && (data[0] >> 2) != s->dlci) return 0;
+    if (btv_rfcomm_frame_decode(data, bytes, s->dlc.credit_mode, &frame) != 1) goto failed;
+    if (frame.dlci == 0)
+    {
+        result = btv_rfcomm_mux_receive(&s->mux, &frame, now);
+        if (result != 0 || frame.type != 0xef) goto done;
+        if (s->mux.state != BTV_MUX_OPEN) goto failed;
+        if (s->state == BTV_RS_CLOSING) return 0;
+        if (btv_rfcomm_mcc_decode(frame.data, frame.bytes, &mcc) != 1) goto failed;
+        if (mcc.type == 0x20)
+            result = btv_rfcomm_pn_receive(&s->pn, &mcc, now);
+        else if (mcc.type == 0x38)
+            result = s->msc.active ? btv_rfcomm_msc_receive(&s->msc, &mcc, now) : 0;
+        else
+        {
+            if ((mcc.type == 0x24 || mcc.type == 0x14) &&
+                ((mcc.data[0] >> 2) != s->dlci || s->dlc.control.state != BTV_MUX_OPEN)) return 0;
+            result = btv_rfcomm_control_receive(&s->control, frame.data, frame.bytes);
+        }
+    }
+    else
+    {
+        if (s->mux.state != BTV_MUX_OPEN || s->state < BTV_RS_DLC) goto failed;
+        result = btv_rfcomm_dlc_receive(&s->dlc, &frame, now);
+        if (result == 0 && frame.type == 0xef)
+            result = btv_rfcomm_rx_feed(&s->rx, data, bytes, now);
+    }
+done:
+    if (result < 0) goto failed;
+    btv_rfcomm_session_tick(s, now);
+    return s->state == BTV_RS_FAILED ? -1 : result;
+failed:
+    btv_rfcomm_session_abort(s);
+    return -1;
+}
+
+size_t btv_rfcomm_session_output(btv_rfcomm_session *s, uint8_t *output, size_t capacity, uint32_t now)
+{
+    size_t bytes, encoded;
+    unsigned int kind;
+    if (s == NULL || output == NULL) return 0;
+    s->selected = 0;
+    btv_rfcomm_session_tick(s, now);
+    if (s->state == BTV_RS_IDLE || s->state >= BTV_RS_CLOSED) return 0;
+    if (capacity > s->transmit_limit) capacity = s->transmit_limit;
+    bytes = btv_rfcomm_mux_output(&s->mux, output, capacity, &s->token, now);
+    if (bytes) { s->selected = 1; return bytes; }
+    if (s->mux.state != BTV_MUX_OPEN) return 0;
+    if (s->state == BTV_RS_CLOSING)
+    {
+        bytes = btv_rfcomm_dlc_output(&s->dlc, output, capacity, &s->token, now);
+        if (bytes) s->selected = 5;
+        return bytes;
+    }
+    bytes = btv_rfcomm_control_output(&s->control, s->scratch, sizeof(s->scratch));
+    kind = 2;
+    if (!bytes && s->msc.active)
+    {
+        bytes = btv_rfcomm_msc_output(&s->msc, s->scratch, sizeof(s->scratch), &s->token, now);
+        kind = 3;
+    }
+    if (!bytes && s->state == BTV_RS_PN)
+    {
+        bytes = btv_rfcomm_pn_output(&s->pn, s->scratch, sizeof(s->scratch), now);
+        kind = 4;
+    }
+    if (bytes)
+    {
+        if (bytes + (bytes < 128 ? 4 : 5) > s->transmit_limit)
+        { btv_rfcomm_session_abort(s); return 0; }
+        encoded = btv_rfcomm_frame_encode(output, capacity, 0, s->mux.initiator, 0xef, 0, -1, s->scratch, bytes);
+        if (encoded) s->selected = kind;
+        return encoded;
+    }
+    if (s->state >= BTV_RS_DLC)
+    {
+        bytes = btv_rfcomm_dlc_output(&s->dlc, output, capacity, &s->token, now);
+        if (bytes) { s->selected = 5; return bytes; }
+    }
+    if (s->state == BTV_RS_READY)
+    {
+        bytes = btv_rfcomm_tx_output(&s->tx, output, capacity, now);
+        if (bytes) s->selected = 6;
+        return bytes;
+    }
+    return 0;
+}
+
+int btv_rfcomm_session_sent(btv_rfcomm_session *s, uint32_t now)
+{
+    int result;
+    if (s == NULL) return 0;
+    switch (s->selected)
+    {
+        case 1: result = btv_rfcomm_mux_sent(&s->mux, s->token); break;
+        case 2: result = btv_rfcomm_control_sent(&s->control); break;
+        case 3: result = btv_rfcomm_msc_sent(&s->msc, s->token); break;
+        case 4: result = btv_rfcomm_pn_sent(&s->pn); break;
+        case 5: result = btv_rfcomm_dlc_sent(&s->dlc, s->token); break;
+        case 6: result = btv_rfcomm_tx_sent(&s->tx); break;
+        default: return 0;
+    }
+    s->selected = 0;
+    if (!result) btv_rfcomm_session_abort(s);
+    else btv_rfcomm_session_tick(s, now);
+    return result;
+}
+
+int btv_rfcomm_session_write(btv_rfcomm_session *s, const uint8_t *data, size_t bytes)
+{
+    return s != NULL && s->state == BTV_RS_READY ? btv_rfcomm_tx_queue(&s->tx, data, bytes) : 0;
+}
+
+size_t btv_rfcomm_session_read(btv_rfcomm_session *s, uint8_t *output, size_t capacity)
+{
+    return s != NULL && s->state == BTV_RS_READY ? btv_rfcomm_rx_read(&s->rx, output, capacity) : 0;
+}
+
+int btv_rfcomm_session_close(btv_rfcomm_session *s, uint32_t now)
+{
+    if (s == NULL || s->state < BTV_RS_PN || s->state > BTV_RS_READY ||
+        !btv_rfcomm_mux_close(&s->mux, now)) return 0;
+    btv_rfcomm_session_tick(s, now);
+    return 1;
+}

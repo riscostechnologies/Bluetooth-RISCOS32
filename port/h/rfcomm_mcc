@@ -1,0 +1,23 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#ifndef BTV_RFCOMM_MCC_H
+#define BTV_RFCOMM_MCC_H
+#include "rfcomm_frame.h"
+typedef struct btv_rfcomm_mcc
+{
+    uint8_t type, command;
+    const uint8_t *data;
+    size_t bytes;
+} btv_rfcomm_mcc;
+/* Exactly one MCC message, carried inside a validated DLCI-0 UIH frame on an
+ * OPEN multiplexer. MCC length octets each have an EA bit, unlike the second
+ * RFCOMM frame length octet. Output unchanged on failure. Unknown one-octet
+ * types are exposed for NSC handling; extended type fields are unsupported. */
+int btv_rfcomm_mcc_decode(const uint8_t *data, size_t bytes, btv_rfcomm_mcc *mcc);
+/* Encodes MCC bytes only, not the surrounding UIH/L2CAP frame. type is the
+ * six-bit decoded type (PN=20, MSC=38 hexadecimal). command is the inner MCC
+ * C/R bit, independent of the role-dependent outer frame C/R. Nonoverlapping
+ * buffers required. Returns bytes or 0, with no partial output on failure. */
+size_t btv_rfcomm_mcc_encode(uint8_t *output, size_t capacity, uint8_t type,
+                            int command, const uint8_t *data, size_t bytes);
+#endif

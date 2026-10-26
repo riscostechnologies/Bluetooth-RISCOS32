@@ -1,0 +1,979 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        usb_probe
+ * Purpose:     Native RISC OS USB inventory and Bluetooth transport probe.
+ *              Default is discovery only. --load-stack is reserved for the
+ *              isolated harness and loads its prepared official USB modules.
+ ******************************************************************/
+#define _POSIX_C_SOURCE 200809L
+#include "usb_service.h"
+#include "hci_stream.h"
+#include "hci_version.h"
+#include "usb_stream_path.h"
+#include <kernel.h>
+#include <swis.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+#define SERVICE_USB 0xd2
+#define USB_CONNECTED 1
+#define OS_MODULE_FREE 7
+#define OS_MODULE_LOAD 1
+#define DEVICEFS_USB_REQUEST 0x80000000u
+#define DEVICEFS_BUFFER_SPACE 0x80000002u
+#define DEVICEFS_CAPABILITIES 0x80000009u
+#define DEVICEFS_RELEASE_REQUEST 0x8000000au
+#define DEVICEFS_CAP_ASYNC_CONTROL 1u
+#define DEVICEFS_CAP_RELEASE 2u
+#define FSCONTROL_ENUMERATE_HANDLES 58
+#define ARGS_CANONICALISE_HANDLE 7
+#define USB_REQUEST_POLL 1
+#define USB_STATUS_PENDING 0
+#define USB_STATUS_COMPLETE 1
+#define USB_STATUS_NAK 2
+#define USB_STATUS_STALL 3
+#define USB_STATUS_RETRY 4
+#define USB_STATUS_TIMEOUT 5
+#define USB_STATUS_INACTIVE 6
+#define CONTROL_WARNING_CS 200u
+#define CONTROL_FAILURE_CS 800u
+
+/* Breadcrumb file for --hci-bisect. Each line is written and the file closed
+ * at once: a network filing system only commits data on close, and a frozen
+ * machine never flushes an open report. */
+static char trail_path[256];
+
+static void crumb(const char *format, ...)
+{
+    FILE *trail;
+    va_list arguments;
+    if (trail_path[0] == '\0') return;
+    trail = fopen(trail_path, "a");
+    if (trail == NULL) return;
+    va_start(arguments, format);
+    vfprintf(trail, format, arguments);
+    va_end(arguments);
+    fputc('\n', trail);
+    fclose(trail);
+}
+
+static int swi_number(const char *name, int *number)
+{
+    _kernel_swi_regs registers;
+    memset(&registers, 0, sizeof(registers));
+    registers.r[1] = (int)name;
+    if (_kernel_swi(OS_SWINumberFromString, &registers, &registers) != NULL)
+        return 0;
+    *number = registers.r[0];
+    return 1;
+}
+
+/* Resolve a module SWI name without loading or changing any module. */
+static int has_swi(const char *name)
+{
+    _kernel_swi_regs registers;
+    memset(&registers, 0, sizeof(registers));
+    registers.r[1] = (int)name;
+    return _kernel_swi(OS_SWINumberFromString, &registers, &registers) == NULL;
+}
+
+static unsigned int monotonic_time(void)
+{
+    _kernel_swi_regs registers;
+    memset(&registers, 0, sizeof(registers));
+    if (_kernel_swi(OS_ReadMonotonicTime, &registers, &registers) != NULL)
+        return 0;
+    return (unsigned int)registers.r[0];
+}
+
+/*******************************************************************
+ Function:      report_open_handles
+ Description:   Report canonical names for every FileSwitch handle so an
+                existing DeviceFS endpoint owner can be diagnosed.
+ Returns:       none
+ ******************************************************************/
+static void report_open_handles(void)
+{
+    char name[256];
+    _kernel_swi_regs registers;
+    _kernel_oserror *error;
+    int handle;
+    handle = -1;
+    puts("Open FileSwitch handles before Bluetooth endpoint claim:");
+    for (;;)
+    {
+        memset(&registers, 0, sizeof(registers));
+        registers.r[0] = FSCONTROL_ENUMERATE_HANDLES;
+        registers.r[1] = handle;
+        error = _kernel_swi(OS_FSControl, &registers, &registers);
+        if (error != NULL)
+        {
+            printf("  unavailable: &%X: %s\n", error->errnum, error->errmess);
+            return;
+        }
+        handle = registers.r[1];
+        if (handle == -1) return;
+        memset(name, 0, sizeof(name));
+        memset(&registers, 0, sizeof(registers));
+        registers.r[0] = ARGS_CANONICALISE_HANDLE;
+        registers.r[1] = handle;
+        registers.r[2] = (int)name;
+        registers.r[5] = sizeof(name);
+        error = _kernel_swi(OS_Args, &registers, &registers);
+        if (error == NULL)
+            printf("  %d %s\n", handle, name);
+    }
+}
+
+static void close_stream(int handle)
+{
+    _kernel_swi_regs registers;
+    if (handle == 0) return;
+    memset(&registers, 0, sizeof(registers));
+    registers.r[1] = handle;
+    (void)_kernel_swi(OS_Find, &registers, &registers);
+}
+
+static int open_stream(const btv_usb_device *device, unsigned int endpoint,
+                       const char *type, int output, int *handle)
+{
+    char path[96];
+    _kernel_swi_regs registers;
+    _kernel_oserror *error;
+    enum btv_usb_stream_kind kind;
+    kind = strcmp(type, "interrupt") == 0 ? BTV_USB_STREAM_INTERRUPT :
+                                           BTV_USB_STREAM_BULK;
+    if (!btv_usb_stream_path(path, sizeof(path), device->name, 0, 0,
+                             (uint8_t)(endpoint & 15u), kind, 4096, 1))
+    {
+        printf("FAIL: building %s endpoint path\n", type);
+        return 0;
+    }
+    memset(&registers, 0, sizeof(registers));
+    /* Open input/output, requiring an existing non-directory. */
+    registers.r[0] = output ? 0x8f : 0x4f;
+    registers.r[1] = (int)path;
+    error = _kernel_swi(OS_Find, &registers, &registers);
+    if (error != NULL || registers.r[0] == 0)
+    {
+        printf("FAIL: opening %s endpoint %s%s%s\n", type, path,
+               error != NULL ? ": " : "", error != NULL ? error->errmess : "");
+        return 0;
+    }
+    *handle = registers.r[0];
+    printf("Opened native %s %s stream %s\n", type,
+           output ? "output" : "input", path);
+    fflush(stdout);
+    return 1;
+}
+
+/*******************************************************************
+ Function:      wait_control_status
+ Description:   Poll an asynchronous USB control request with a finite
+                foreground deadline.
+ Parameters:    status = USBDriver-owned pollable status byte
+                opcode = HCI opcode for diagnostics
+ Returns:       non-zero only for successful completion
+ ******************************************************************/
+static int release_control_status(int devicefs_swi,
+                                  const btv_usb_device *device,
+                                  volatile uint8_t *status)
+{
+    _kernel_swi_regs registers;
+    memset(&registers, 0, sizeof(registers));
+    registers.r[0] = (int)DEVICEFS_RELEASE_REQUEST;
+    registers.r[1] = (int)device->name;
+    registers.r[3] = (int)status;
+    return _kernel_swi(devicefs_swi, &registers, &registers) == NULL;
+}
+
+static int wait_control_status(int devicefs_swi,
+                               const btv_usb_device *device,
+                               volatile uint8_t *status, uint16_t opcode)
+{
+    unsigned int started;
+    int warned;
+    uint8_t current;
+    if (status == NULL)
+    {
+        printf("FAIL: HCI command %04X returned no asynchronous status\n",
+               opcode);
+        return 0;
+    }
+    started = monotonic_time();
+    warned = 0;
+    for (;;)
+    {
+        current = *status;
+        if (current == USB_STATUS_COMPLETE)
+        {
+            if (!release_control_status(devicefs_swi, device, status))
+            {
+                printf("FAIL: HCI command %04X status release failed\n", opcode);
+                return 0;
+            }
+            return 1;
+        }
+        if (current == USB_STATUS_STALL || current == USB_STATUS_TIMEOUT ||
+            current == USB_STATUS_INACTIVE)
+        {
+            printf("FAIL: HCI command %04X USB status %u\n", opcode, current);
+            if (!release_control_status(devicefs_swi, device, status))
+                printf("FAIL: HCI command %04X status release failed\n", opcode);
+            return 0;
+        }
+        if (current != USB_STATUS_PENDING && current != USB_STATUS_NAK &&
+            current != USB_STATUS_RETRY)
+        {
+            printf("FAIL: HCI command %04X unknown USB status %u\n",
+                   opcode, current);
+            if (!release_control_status(devicefs_swi, device, status))
+                printf("FAIL: HCI command %04X status release failed\n", opcode);
+            return 0;
+        }
+        if (!warned &&
+            (unsigned int)(monotonic_time() - started) >= CONTROL_WARNING_CS)
+        {
+            printf("WAIT: HCI command %04X exceeded %u cs; retaining its buffer until USBDriver completes\n",
+                   opcode, CONTROL_WARNING_CS);
+            fflush(stdout);
+            warned = 1;
+        }
+        if ((unsigned int)(monotonic_time() - started) >= CONTROL_FAILURE_CS)
+        {
+            printf("FAIL: HCI command %04X did not complete within %u cs; retaining its buffer and USBDriver slot\n",
+                   opcode, CONTROL_FAILURE_CS);
+            fflush(stdout);
+            return 0;
+        }
+        usleep(10000);
+    }
+}
+
+static int send_command(int devicefs_swi, const btv_usb_device *device,
+                        const uint8_t *command, size_t bytes)
+{
+    _kernel_swi_regs registers;
+    _kernel_oserror *error;
+    volatile uint8_t *status;
+    uint16_t opcode;
+    memset(&registers, 0, sizeof(registers));
+    registers.r[0] = (int)DEVICEFS_USB_REQUEST;
+    registers.r[1] = (int)device->name;
+    registers.r[3] = 0x20; /* Host-to-device, Class, Device; bRequest zero. */
+    registers.r[4] = (int)((uint32_t)bytes << 16);
+    registers.r[5] = (int)command;
+    registers.r[6] = USB_REQUEST_POLL;
+    error = _kernel_swi(devicefs_swi, &registers, &registers);
+    if (error != NULL)
+    {
+        printf("FAIL: native HCI command %02X%02X: &%X: %s\n",
+               command[1], command[0], error->errnum, error->errmess);
+        return 0;
+    }
+    opcode = (uint16_t)((uint16_t)command[0] | ((uint16_t)command[1] << 8));
+    status = (volatile uint8_t *)registers.r[7];
+    crumb("command %04X submitted, status byte at &%08X", opcode,
+          (unsigned int)status);
+    if (!wait_control_status(devicefs_swi, device, status, opcode))
+    {
+        crumb("command %04X control stage failed", opcode);
+        return 0;
+    }
+    crumb("command %04X control stage complete", opcode);
+    return 1;
+}
+
+static int supports_async_control(int devicefs_swi,
+                                  const btv_usb_device *device)
+{
+    _kernel_swi_regs registers;
+    _kernel_oserror *error;
+    memset(&registers, 0, sizeof(registers));
+    registers.r[0] = (int)DEVICEFS_CAPABILITIES;
+    registers.r[1] = (int)device->name;
+    error = _kernel_swi(devicefs_swi, &registers, &registers);
+    return error == NULL &&
+           (registers.r[3] &
+            (int)(DEVICEFS_CAP_ASYNC_CONTROL | DEVICEFS_CAP_RELEASE)) ==
+           (int)(DEVICEFS_CAP_ASYNC_CONTROL | DEVICEFS_CAP_RELEASE);
+}
+
+static int wait_event(int devicefs_swi, const btv_usb_device *device,
+                      int handle, uint16_t opcode, btv_hci_version *version)
+{
+    uint8_t input[257], storage[257];
+    btv_hci_stream stream;
+    _kernel_swi_regs registers;
+    _kernel_oserror *error;
+    const uint8_t *packet;
+    size_t packet_bytes, consumed, offset, amount;
+    unsigned int started;
+    int result;
+    btv_hci_stream_init(&stream, BTV_HCI_EVENT, storage, sizeof(storage));
+    started = monotonic_time();
+    while ((unsigned int)(monotonic_time() - started) < 500u)
+    {
+        memset(&registers, 0, sizeof(registers));
+        registers.r[0] = (int)DEVICEFS_BUFFER_SPACE;
+        registers.r[1] = (int)device->name;
+        registers.r[2] = handle;
+        error = _kernel_swi(devicefs_swi, &registers, &registers);
+        if (error != NULL)
+        {
+            printf("FAIL: event buffer query &%X: %s\n", error->errnum, error->errmess);
+            return 0;
+        }
+        /* R3 is the buffer size and R4 its free space. Only size - free
+         * bytes are waiting; asking OS_GBPB for more blocks in DeviceFS
+         * until they arrive, which froze the machine single-tasking. */
+        if (registers.r[4] < 0 || registers.r[4] > registers.r[3])
+        {
+            printf("FAIL: event buffer size %d free %d\n",
+                   registers.r[3], registers.r[4]);
+            return 0;
+        }
+        amount = (size_t)(registers.r[3] - registers.r[4]);
+        if (amount > sizeof(input)) amount = sizeof(input);
+        if (amount == 0) { usleep(10000); continue; }
+        crumb("event %04X: %u bytes buffered, reading", opcode,
+              (unsigned int)amount);
+        memset(&registers, 0, sizeof(registers));
+        registers.r[0] = 4; /* OSGBPB_Read, from the current stream position. */
+        registers.r[1] = handle;
+        registers.r[2] = (int)input;
+        registers.r[3] = (int)amount;
+        error = _kernel_swi(OS_GBPB, &registers, &registers);
+        if (error != NULL)
+        {
+            printf("FAIL: reading event stream &%X: %s\n", error->errnum, error->errmess);
+            return 0;
+        }
+        amount -= registers.r[3] > 0 ? (size_t)registers.r[3] : 0;
+        crumb("event %04X: read %u bytes", opcode, (unsigned int)amount);
+        offset = 0;
+        while (offset < amount)
+        {
+            result = btv_hci_stream_feed(&stream, input + offset,
+                                         amount - offset, &consumed);
+            offset += consumed;
+            if (result == BTV_HCI_INVALID) return 0;
+            if (result == BTV_HCI_MORE) break;
+            packet = btv_hci_stream_packet(&stream, &packet_bytes);
+            if (packet != NULL && packet_bytes >= 5 && packet[0] == 0x0e &&
+                packet[3] == (uint8_t)opcode && packet[4] == (uint8_t)(opcode >> 8))
+            {
+                if (version != NULL)
+                    return btv_hci_version_event(packet, packet_bytes, version) == BTV_VERSION_READY;
+                return packet_bytes == 6 && packet[5] == 0;
+            }
+            btv_hci_stream_take(&stream);
+        }
+    }
+    printf("FAIL: timed out waiting for HCI opcode %04X\n", opcode);
+    return 0;
+}
+
+static int native_hci_probe(const btv_usb_device *device, int claim_acl,
+                            int execute_commands)
+{
+    static const uint8_t reset[] = {0x03, 0x0c, 0x00};
+    static const uint8_t version_command[] = {0x01, 0x10, 0x00};
+    btv_hci_version version;
+    int devicefs_swi, event_handle, acl_in_handle, acl_out_handle, ok;
+    event_handle = acl_in_handle = acl_out_handle = 0;
+    report_open_handles();
+    if (!swi_number("DeviceFS_CallDevice", &devicefs_swi))
+    {
+        puts("FAIL: DeviceFS_CallDevice is unavailable");
+        return 0;
+    }
+    if (execute_commands && !supports_async_control(devicefs_swi, device))
+    {
+        puts("FAIL: USBDriver lacks the asynchronous-control capability; refusing a synchronous HCI request that can freeze this machine");
+        return 0;
+    }
+    if (!open_stream(device, device->endpoints.event_in, "interrupt", 0,
+                     &event_handle) ||
+        (claim_acl &&
+         (!open_stream(device, device->endpoints.acl_in, "bulk", 0,
+                       &acl_in_handle) ||
+          !open_stream(device, device->endpoints.acl_out, "bulk", 1,
+                       &acl_out_handle))))
+    {
+        close_stream(acl_out_handle);
+        close_stream(acl_in_handle);
+        close_stream(event_handle);
+        return 0;
+    }
+    if (!execute_commands)
+    {
+        close_stream(acl_out_handle);
+        close_stream(acl_in_handle);
+        close_stream(event_handle);
+        puts("PASS: native RISC OS interrupt and ACL stream-open gate");
+        return 1;
+    }
+    ok = send_command(devicefs_swi, device, reset, sizeof(reset)) &&
+         wait_event(devicefs_swi, device, event_handle, 0x0c03, NULL) &&
+         send_command(devicefs_swi, device, version_command, sizeof(version_command)) &&
+         wait_event(devicefs_swi, device, event_handle, 0x1001, &version);
+    close_stream(acl_out_handle);
+    close_stream(acl_in_handle);
+    close_stream(event_handle);
+    if (!ok) return 0;
+    printf("PASS: native RISC OS control and interrupt%s gate: HCI %u revision %04X; LMP %u manufacturer %04X subversion %04X\n",
+           claim_acl ? " plus ACL endpoint" : "",
+           version.hci_version, version.hci_revision, version.lmp_version,
+           version.manufacturer, version.lmp_subversion);
+    return 1;
+}
+
+/*******************************************************************
+ Function:      native_hci_bisect
+ Description:   Separate the two untested halves of the control gate on a
+                machine that freezes: an OUT-data control request with no
+                stream open, then first delivery of interrupt-endpoint data.
+                The controller holds its Command Complete event until the
+                interrupt pipe is polled, so opening the stream afterwards
+                still receives it.
+ Returns:       non-zero when both halves pass
+ ******************************************************************/
+static int drain_first;
+
+static int drain_acl_input(int devicefs_swi, const btv_usb_device *device);
+
+static int native_hci_bisect(const btv_usb_device *device)
+{
+    static const uint8_t reset[] = {0x03, 0x0c, 0x00};
+    static const uint8_t version_command[] = {0x01, 0x10, 0x00};
+    btv_hci_version version;
+    int devicefs_swi, event_handle, ok;
+    event_handle = 0;
+    crumb("bisect start %s", device->name);
+    if (!swi_number("DeviceFS_CallDevice", &devicefs_swi) ||
+        !supports_async_control(devicefs_swi, device))
+    {
+        crumb("no asynchronous control; stopping");
+        puts("FAIL: safe asynchronous USB control is unavailable");
+        return 0;
+    }
+    if (drain_first && !drain_acl_input(devicefs_swi, device))
+        crumb("ACL drain could not run");
+    crumb("step 1: HCI Reset with no stream open");
+    if (!send_command(devicefs_swi, device, reset, sizeof(reset)))
+        return 0;
+    crumb("step 2: opening event stream");
+    if (!open_stream(device, device->endpoints.event_in, "interrupt", 0,
+                     &event_handle))
+    {
+        crumb("event stream open failed");
+        return 0;
+    }
+    crumb("step 3: waiting for Reset Command Complete");
+    ok = wait_event(devicefs_swi, device, event_handle, 0x0c03, NULL);
+    crumb("step 3 %s", ok ? "passed" : "failed");
+    if (ok)
+    {
+        crumb("step 4: Read Local Version with stream open");
+        ok = send_command(devicefs_swi, device, version_command,
+                          sizeof(version_command)) &&
+             wait_event(devicefs_swi, device, event_handle, 0x1001, &version);
+        crumb("step 4 %s", ok ? "passed" : "failed");
+    }
+    crumb("closing event stream");
+    close_stream(event_handle);
+    crumb("closed");
+    if (!ok) return 0;
+    printf("PASS: native HCI bisect: HCI %u revision %04X; LMP %u manufacturer %04X subversion %04X\n",
+           version.hci_version, version.hci_revision, version.lmp_version,
+           version.manufacturer, version.lmp_subversion);
+    return 1;
+}
+
+/*******************************************************************
+ Function:      drain_acl_input
+ Description:   Pull bulk ACL IN for a fixed time without blocking. Bulk
+                pipes only read after WakeUpRX, so issue it (with the
+                driver's stream from GetHandles2 R5) whenever the buffer
+                is empty, and read only the bytes already buffered.
+ Returns:       non-zero when the stream could be opened and polled
+ ******************************************************************/
+static int drain_acl_input(int devicefs_swi, const btv_usb_device *device)
+{
+    uint8_t input[1024];
+    _kernel_swi_regs registers;
+    _kernel_oserror *error;
+    int handle, driver_stream;
+    unsigned int started, total, wakeups;
+    size_t amount;
+    handle = 0;
+    if (!open_stream(device, device->endpoints.acl_in, "bulk", 0, &handle))
+        return 0;
+    memset(&registers, 0, sizeof(registers));
+    registers.r[0] = 0x80000007; /* GetHandles2 */
+    registers.r[1] = (int)device->name;
+    registers.r[2] = handle;
+    error = _kernel_swi(devicefs_swi, &registers, &registers);
+    if (error != NULL || registers.r[5] == 0)
+    {
+        crumb("GetHandles2 on ACL IN failed");
+        close_stream(handle);
+        return 0;
+    }
+    driver_stream = registers.r[5];
+    total = wakeups = 0;
+    started = monotonic_time();
+    crumb("draining ACL IN for 3 s");
+    while ((unsigned int)(monotonic_time() - started) < 300u)
+    {
+        memset(&registers, 0, sizeof(registers));
+        registers.r[0] = (int)DEVICEFS_BUFFER_SPACE;
+        registers.r[1] = (int)device->name;
+        registers.r[2] = handle;
+        error = _kernel_swi(devicefs_swi, &registers, &registers);
+        if (error != NULL || registers.r[4] > registers.r[3]) break;
+        amount = (size_t)(registers.r[3] - registers.r[4]);
+        if (amount == 0)
+        {
+            memset(&registers, 0, sizeof(registers));
+            registers.r[0] = 3; /* DeviceCall_WakeUpRX */
+            registers.r[1] = (int)device->name;
+            registers.r[2] = driver_stream;
+            registers.r[3] = sizeof(input);
+            (void)_kernel_swi(devicefs_swi, &registers, &registers);
+            ++wakeups;
+            usleep(10000);
+            continue;
+        }
+        if (amount > sizeof(input)) amount = sizeof(input);
+        memset(&registers, 0, sizeof(registers));
+        registers.r[0] = 4;
+        registers.r[1] = handle;
+        registers.r[2] = (int)input;
+        registers.r[3] = (int)amount;
+        if (_kernel_swi(OS_GBPB, &registers, &registers) != NULL) break;
+        total += (unsigned int)amount - (unsigned int)registers.r[3];
+        crumb("ACL IN: %u bytes so far, first %02X %02X %02X %02X", total,
+              input[0], input[1], input[2], input[3]);
+    }
+    crumb("drain done: %u ACL bytes, %u wakeups", total, wakeups);
+    printf("ACL IN drain: %u bytes in 3 s (%u wakeups)\n", total, wakeups);
+    close_stream(handle);
+    return 1;
+}
+
+/*******************************************************************
+ Function:      native_iso_test
+ Description:   Exercise full-speed isochronous SCO endpoints on
+                alternate 2 without any Bluetooth link: read input for two
+                seconds, write two seconds of silence, closing each stream.
+                Closing aborts the pipe - the step that used to hang USB.
+ Returns:       non-zero when every open, transfer and close returned
+ ******************************************************************/
+static int iso_open_stream(const btv_usb_device *device, int output,
+                           int *handle)
+{
+    char path[128];
+    _kernel_swi_regs regs;
+    _kernel_oserror *err;
+    if (!btv_usb_isoc_stream_path(path, sizeof(path), device->name, 1, 2, 3,
+                                  4096, 17))
+        return 0;
+    crumb("opening %s %s", output ? "OUT" : "IN", path);
+    memset(&regs, 0, sizeof(regs));
+    regs.r[0] = output ? 0x8f : 0x4f;
+    regs.r[1] = (int)path;
+    err = _kernel_swi(OS_Find, &regs, &regs);
+    if (err != NULL)
+    {
+        crumb("open failed &%X: %s", err->errnum, err->errmess);
+        printf("ISO %s OPEN ERROR &%X: %s\n", output ? "OUT" : "IN",
+               err->errnum, err->errmess);
+        return 0;
+    }
+    *handle = regs.r[0];
+    crumb("opened handle %d", *handle);
+    return 1;
+}
+
+static int native_iso_test(const btv_usb_device *device)
+{
+    static uint8_t data[1024];
+    _kernel_swi_regs regs;
+    int devicefs_swi, handle, driver_stream, space;
+    unsigned int started, total, polls, written;
+    size_t amount;
+
+    if (!swi_number("DeviceFS_CallDevice", &devicefs_swi))
+        return 0;
+    /* Input. */
+    if (!iso_open_stream(device, 0, &handle))
+        return 0;
+    memset(&regs, 0, sizeof(regs));
+    regs.r[0] = 0x80000007;
+    regs.r[1] = (int)device->name;
+    regs.r[2] = handle;
+    driver_stream = _kernel_swi(devicefs_swi, &regs, &regs) == NULL ?
+                    regs.r[5] : 0;
+    crumb("IN driver stream &%X; reading 2 s", (unsigned int)driver_stream);
+    total = polls = 0;
+    started = monotonic_time();
+    while ((unsigned int)(monotonic_time() - started) < 200u)
+    {
+        ++polls;
+        if (driver_stream != 0)
+        {
+            memset(&regs, 0, sizeof(regs));
+            regs.r[0] = 3;
+            regs.r[1] = (int)device->name;
+            regs.r[2] = driver_stream;
+            regs.r[3] = sizeof(data);
+            (void)_kernel_swi(devicefs_swi, &regs, &regs);
+        }
+        memset(&regs, 0, sizeof(regs));
+        regs.r[0] = (int)DEVICEFS_BUFFER_SPACE;
+        regs.r[1] = (int)device->name;
+        regs.r[2] = handle;
+        if (_kernel_swi(devicefs_swi, &regs, &regs) != NULL ||
+            regs.r[4] > regs.r[3])
+            break;
+        amount = (size_t)(regs.r[3] - regs.r[4]);
+        if (amount == 0) { usleep(10000); continue; }
+        if (amount > sizeof(data)) amount = sizeof(data);
+        memset(&regs, 0, sizeof(regs));
+        regs.r[0] = 4;
+        regs.r[1] = handle;
+        regs.r[2] = (int)data;
+        regs.r[3] = (int)amount;
+        if (_kernel_swi(OS_GBPB, &regs, &regs) != NULL) break;
+        total += (unsigned int)amount - (unsigned int)regs.r[3];
+    }
+    crumb("IN read %u bytes in %u polls; closing", total, polls);
+    printf("ISO IN: %u bytes in 2 s (%u polls)\n", total, polls);
+    fflush(stdout);
+    close_stream(handle);
+    crumb("IN closed");
+
+    /* Output: 16 bytes every 10 ms of silence, well inside the buffer. */
+    if (!iso_open_stream(device, 1, &handle))
+        return 0;
+    memset(data, 0, sizeof(data));
+    written = 0;
+    started = monotonic_time();
+    while ((unsigned int)(monotonic_time() - started) < 200u)
+    {
+        memset(&regs, 0, sizeof(regs));
+        regs.r[0] = (int)DEVICEFS_BUFFER_SPACE;
+        regs.r[1] = (int)device->name;
+        regs.r[2] = handle;
+        if (_kernel_swi(devicefs_swi, &regs, &regs) != NULL) break;
+        space = regs.r[4];
+        if (space >= 160)
+        {
+            memset(&regs, 0, sizeof(regs));
+            regs.r[0] = 2;
+            regs.r[1] = handle;
+            regs.r[2] = (int)data;
+            regs.r[3] = 160;
+            if (_kernel_swi(OS_GBPB, &regs, &regs) != NULL) break;
+            written += 160 - (unsigned int)regs.r[3];
+        }
+        usleep(100000);
+    }
+    crumb("OUT wrote %u bytes; closing", written);
+    printf("ISO OUT: %u bytes written in 2 s\n", written);
+    fflush(stdout);
+    close_stream(handle);
+    crumb("OUT closed");
+    puts("PASS: isochronous open, transfer and close");
+    return 1;
+}
+
+static int native_capability_probe(const btv_usb_device *device)
+{
+    int devicefs_swi;
+    if (!swi_number("DeviceFS_CallDevice", &devicefs_swi))
+    {
+        puts("FAIL: DeviceFS_CallDevice is unavailable");
+        return 0;
+    }
+    if (!supports_async_control(devicefs_swi, device))
+    {
+        puts("FAIL: USBDriver lacks asynchronous control and release capabilities");
+        return 0;
+    }
+    puts("PASS: USBDriver asynchronous control and release capabilities");
+    return 1;
+}
+
+static int native_control_safety_probe(const btv_usb_device *device)
+{
+    static uint8_t descriptor[18];
+    volatile uint8_t *request_status;
+    _kernel_swi_regs registers;
+    _kernel_oserror *error;
+    int devicefs_swi;
+
+    if (!swi_number("DeviceFS_CallDevice", &devicefs_swi) ||
+        !supports_async_control(devicefs_swi, device))
+    {
+        puts("FAIL: safe asynchronous USB control is unavailable");
+        return 0;
+    }
+    memset(descriptor, 0, sizeof(descriptor));
+    memset(&registers, 0, sizeof(registers));
+    registers.r[0] = (int)DEVICEFS_USB_REQUEST;
+    registers.r[1] = (int)device->name;
+    /* GET_DESCRIPTOR(Device): bmRequestType 80, request 06,
+     * wValue 0100, wIndex 0000, wLength 0012. */
+    registers.r[3] = 0x01000680;
+    registers.r[4] = (int)(sizeof(descriptor) << 16);
+    registers.r[5] = (int)descriptor;
+    registers.r[6] = USB_REQUEST_POLL;
+    error = _kernel_swi(devicefs_swi, &registers, &registers);
+    request_status = (volatile uint8_t *)registers.r[7];
+    if (error != NULL || request_status == NULL)
+    {
+        printf("FAIL: descriptor control submission%s%s\n",
+               error != NULL ? ": " : "",
+               error != NULL ? error->errmess : "");
+        return 0;
+    }
+    if (!wait_control_status(devicefs_swi, device, request_status, 0xffff))
+        return 0;
+    if (descriptor[0] != sizeof(descriptor) || descriptor[1] != 1 ||
+        ((unsigned int)descriptor[8] | ((unsigned int)descriptor[9] << 8)) !=
+            device->vendor ||
+        ((unsigned int)descriptor[10] | ((unsigned int)descriptor[11] << 8)) !=
+            device->product)
+    {
+        puts("FAIL: asynchronous descriptor reply was invalid");
+        return 0;
+    }
+    printf("PASS: deferred asynchronous USB control %04X:%04X\n",
+           device->vendor, device->product);
+    return 1;
+}
+
+/* Load only the harness's fixed module paths, reporting the actual OS error.
+ * The isolated process is discarded after the test, including loaded modules. */
+static int load_stack(int include_ohci)
+{
+    static const char *paths[] = {
+        "HostFS:$.RTSupport", "HostFS:$.USBDriver", "HostFS:$.OHCIDriver"
+    };
+    _kernel_swi_regs registers;
+    _kernel_oserror *error;
+    unsigned int index;
+    for (index = 0; index < (include_ohci ? 3u : 2u); ++index)
+    {
+        printf("Loading %s\n", paths[index]);
+        fflush(stdout);
+        memset(&registers, 0, sizeof(registers));
+        registers.r[0] = OS_MODULE_LOAD;
+        registers.r[1] = (int)paths[index];
+        error = _kernel_swi(OS_Module, &registers, &registers);
+        if (error != NULL)
+        {
+            /* Official OHCIDriver reports this when neither PCI nor the HAL
+             * exposes an OHCI controller. This is a diagnostic outcome only. */
+            if (include_ohci && index == 2 && error->errnum == 0x820a01)
+            {
+                printf("NO_OHCI_CONTROLLER: &%X: %s\n", error->errnum, error->errmess);
+                puts("OHCI-PROBE-COMPLETE");
+                return 0;
+            }
+            printf("FAIL: module load &%X: %s\n", error->errnum, error->errmess);
+            return 1;
+        }
+        printf("Loaded %s\n", paths[index]);
+        fflush(stdout);
+    }
+    if (include_ohci)
+        puts("OHCI-PROBE-COMPLETE");
+    return 0;
+}
+
+/* Query provider-owned lists and release each returned RMA allocation. */
+int main(int argc, char **argv)
+{
+    _kernel_swi_regs registers;
+    _kernel_oserror *error;
+    uint8_t *answer, *next, *record;
+    btv_usb_device device, selected;
+    unsigned int total, bluetooth, size;
+    int status, failed, hci_probe, claim_acl, execute_commands, capability_only;
+    int control_safety, bisect, dump_records, iso_open, iso_test;
+    if ((argc != 2 && argc != 3) ||
+        (argc == 3 && strcmp(argv[2], "--load-stack") != 0 &&
+         strcmp(argv[2], "--load-ohci") != 0 &&
+         strcmp(argv[2], "--hci-version") != 0 &&
+         strcmp(argv[2], "--hci-control") != 0 &&
+         strcmp(argv[2], "--capability-only") != 0 &&
+         strcmp(argv[2], "--control-safety") != 0 &&
+         strcmp(argv[2], "--hci-bisect") != 0 &&
+         strcmp(argv[2], "--drain-acl") != 0 &&
+         strcmp(argv[2], "--dump-records") != 0 &&
+         strcmp(argv[2], "--iso-open") != 0 &&
+         strcmp(argv[2], "--iso-test") != 0 &&
+         strcmp(argv[2], "--transport-open") != 0) ||
+        freopen(argv[1], "w", stdout) == NULL)
+        return 2;
+    drain_first = argc == 3 && strcmp(argv[2], "--drain-acl") == 0;
+    dump_records = argc == 3 && strcmp(argv[2], "--dump-records") == 0;
+    iso_open = argc == 3 && strcmp(argv[2], "--iso-open") == 0;
+    iso_test = argc == 3 && strcmp(argv[2], "--iso-test") == 0;
+    if (iso_test && strlen(argv[1]) + 2 < sizeof(trail_path))
+    {
+        FILE *trail;
+        strcpy(trail_path, argv[1]);
+        strcat(trail_path, "T");
+        trail = fopen(trail_path, "w");
+        if (trail != NULL) fclose(trail);
+    }
+    if (iso_open) dump_records = 0;
+    bisect = argc == 3 && (strcmp(argv[2], "--hci-bisect") == 0 || drain_first);
+    if (bisect && strlen(argv[1]) + 2 < sizeof(trail_path))
+    {
+        FILE *trail;
+        strcpy(trail_path, argv[1]);
+        strcat(trail_path, "T");
+        trail = fopen(trail_path, "w");
+        if (trail != NULL) fclose(trail);
+    }
+    hci_probe = argc == 3 &&
+                (strcmp(argv[2], "--hci-version") == 0 ||
+                 strcmp(argv[2], "--hci-control") == 0 ||
+                 strcmp(argv[2], "--transport-open") == 0);
+    claim_acl = argc == 3 &&
+                (strcmp(argv[2], "--hci-version") == 0 ||
+                 strcmp(argv[2], "--transport-open") == 0);
+    capability_only = argc == 3 &&
+                      strcmp(argv[2], "--capability-only") == 0;
+    control_safety = argc == 3 &&
+                     strcmp(argv[2], "--control-safety") == 0;
+    execute_commands = argc == 3 &&
+                       !capability_only &&
+                       strcmp(argv[2], "--transport-open") != 0;
+    failed = argc == 3 && !hci_probe && !capability_only && !control_safety &&
+             !bisect && !dump_records && !iso_open && !iso_test ?
+             load_stack(strcmp(argv[2], "--load-ohci") == 0) : 0;
+    memset(&selected, 0, sizeof(selected));
+    printf("USBDriver SWI present: %s\n", has_swi("USBDriver_Version") ? "yes" : "no");
+    printf("DeviceFS SWI present: %s\n", has_swi("DeviceFS_CallDevice") ? "yes" : "no");
+    if (has_swi("USBDriver_Version"))
+    {
+        memset(&registers, 0, sizeof(registers));
+        registers.r[1] = (int)"USBDriver_Version";
+        error = _kernel_swi(OS_SWINumberFromString, &registers, &registers);
+        if (error == NULL)
+            error = _kernel_swi(registers.r[0], &registers, &registers);
+        if (error == NULL)
+            printf("USBDriver version: %d\n", registers.r[0]);
+        else
+        {
+            failed = 1;
+            printf("FAIL: USBDriver version &%X: %s\n", error->errnum, error->errmess);
+        }
+    }
+    fflush(stdout);
+    memset(&registers, 0, sizeof(registers));
+    registers.r[0] = USB_CONNECTED;
+    registers.r[1] = SERVICE_USB;
+    error = _kernel_swi(OS_ServiceCall, &registers, &registers);
+    failed |= error != NULL;
+    if (error != NULL)
+        printf("FAIL: Service_USB query &%X: %s\n", error->errnum, error->errmess);
+    answer = error == NULL ? (uint8_t *)registers.r[2] : NULL;
+    total = bluetooth = 0;
+    while (answer != NULL)
+    {
+        /* OS service records and their link are RMA word-aligned. Save the
+         * next link before releasing this record, including unsupported ones. */
+        memcpy(&next, answer, sizeof(next));
+        record = answer + sizeof(next);
+        size = (unsigned int)record[0] | ((unsigned int)record[1] << 8);
+        status = btv_usb_service_decode(record, size, 0, &device);
+        ++total;
+        if (status == BTV_USB_READY && dump_records)
+        {
+            /* Raw record as the running USBDriver holds it, for checking
+             * the endpoint types it reports. No USB traffic. */
+            unsigned int offset;
+            printf("RECORD %u bytes\n", size);
+            for (offset = 0; offset < size; ++offset)
+                printf("%02X%s", record[offset],
+                       (offset % 16) == 15 || offset + 1 == size ? "\n" : " ");
+        }
+        if (status == BTV_USB_READY)
+        {
+            if (bluetooth == 0) selected = device;
+            ++bluetooth;
+            printf("Bluetooth controller %s %04X:%04X bus=%u address=%u event=%02X ACL=%02X/%02X\n",
+                   device.name, device.vendor, device.product, device.bus, device.address,
+                   device.endpoints.event_in, device.endpoints.acl_in, device.endpoints.acl_out);
+        }
+        else
+            printf("USB record %u: %s\n", total,
+                   status == BTV_USB_INVALID ? "invalid descriptor record" : "not supported by Bluetooth transport");
+        memset(&registers, 0, sizeof(registers));
+        registers.r[0] = OS_MODULE_FREE;
+        registers.r[2] = (int)answer;
+        error = _kernel_swi(OS_Module, &registers, &registers);
+        if (error != NULL)
+        {
+            failed = 1;
+            printf("FAIL: releasing service record &%X: %s\n", error->errnum, error->errmess);
+        }
+        answer = next;
+    }
+    printf("USB records: %u; supported Bluetooth controllers: %u\n", total, bluetooth);
+    if (bluetooth == 0)
+        puts("NO_TRANSPORT: no supported Bluetooth controller is exposed to this guest");
+    else if (capability_only && !native_capability_probe(&selected))
+        failed = 1;
+    else if (control_safety && !native_control_safety_probe(&selected))
+        failed = 1;
+    else if (bisect && !native_hci_bisect(&selected))
+        failed = 1;
+    else if (iso_test && !native_iso_test(&selected))
+        failed = 1;
+    else if (iso_open)
+    {
+        /* Open the SCO IN isochronous stream on alternate 2 and deliberately
+         * leave it open: closing it is what hung USB. Reboot to release. */
+        char path[128];
+        _kernel_swi_regs regs;
+        _kernel_oserror *err;
+        if (!btv_usb_stream_path(path, sizeof(path), selected.name, 1, 2, 3,
+                                 BTV_USB_STREAM_ISOCHRONOUS, 4096, 1))
+            puts("FAIL: building isochronous path");
+        else
+        {
+            printf("Opening %s\n", path);
+            fflush(stdout);
+            memset(&regs, 0, sizeof(regs));
+            regs.r[0] = 0x4f;
+            regs.r[1] = (int)path;
+            err = _kernel_swi(OS_Find, &regs, &regs);
+            if (err != NULL)
+                printf("ISO OPEN ERROR &%X: %s\n", err->errnum, err->errmess);
+            else
+                printf("ISO OPEN OK handle %d (left open - reboot to release)\n",
+                       regs.r[0]);
+        }
+    }
+    else if (hci_probe &&
+             !native_hci_probe(&selected, claim_acl, execute_commands))
+        failed = 1;
+    if (!failed)
+        puts("USB-PROBE-COMPLETE");
+    puts("BT-TEST-DONE");
+    if (fclose(stdout) != 0)
+        return 2;
+    return failed ? 1 : 0;
+}

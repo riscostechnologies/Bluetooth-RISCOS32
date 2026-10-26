@@ -1,0 +1,6 @@
+| SPDX-License-Identifier: BSD-2-Clause
+| Copyright (c) 2026 RISC OS Technologies
+| !Install for Bluetooth
+Set Install$Dir <Obey$Dir>
+WimpSlot -min 128K -max 128K
+BASIC -quit <Install$Dir>.!RunImage

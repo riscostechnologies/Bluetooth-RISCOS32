@@ -1,0 +1,75 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        bt_a2dp
+ * Purpose:     A2DP source: AVDTP signalling (as initiator, and answering
+ *              a sink that drives the setup itself), SBC configuration and
+ *              the paced RTP media stream fed from system sound.
+ ******************************************************************/
+#ifndef BTP_A2DP_H
+#define BTP_A2DP_H
+
+#include <stddef.h>
+#include <stdint.h>
+#include "sbc_encoder.h"
+
+#define BTP_A2DP_PACKET_BYTES 1024u
+#define BTP_A2DP_SEPS 8
+
+enum btp_a2dp_state
+{
+    BTP_A2DP_IDLE,
+    BTP_A2DP_SECURING,
+    BTP_A2DP_SIGNALLING,     /* opening the signalling channel */
+    BTP_A2DP_DISCOVERING,
+    BTP_A2DP_CAPABILITIES,
+    BTP_A2DP_CONFIGURING,
+    BTP_A2DP_OPENING,
+    BTP_A2DP_MEDIA,          /* opening the media channel */
+    BTP_A2DP_STARTING,
+    BTP_A2DP_STREAMING,
+    BTP_A2DP_SUSPENDED,
+    BTP_A2DP_CLOSING,
+    BTP_A2DP_FAILED
+};
+
+typedef struct btp_a2dp
+{
+    uint8_t state, link, active;
+    int signal_channel, media_channel;
+    uint8_t label, waiting_signal, waiting_label;
+    uint8_t remote_seid, local_seid, sink_initiated;
+    uint8_t auto_start;           /* start the stream if the sink doesn't */
+    uint32_t start_at;
+    uint8_t seps[BTP_A2DP_SEPS], sep_count, sep_index;
+    uint8_t caps[4];              /* the sink's SBC capability octets */
+    uint8_t config[4];            /* chosen SBC configuration octets */
+    uint32_t step_started;
+    uint32_t error;
+    /* Media. */
+    btv_sbc_encoder encoder;
+    uint32_t sample_rate;
+    uint16_t sequence;
+    uint32_t timestamp;
+    uint32_t clock_ms, owed_milli;   /* samples owed, x1000 */
+    uint16_t frame_bytes, frame_samples, frames_per_packet;
+    /* Adaptive bitpool (32-bit build, CSR adapter): the bitpool in use,
+     * the room for frames in one ACL packet, and the adaptation clock. */
+    uint8_t bitpool_now, bitpool_max;
+    uint16_t frame_room;
+    uint32_t adapt_at, clear_since;
+    uint32_t packets, underruns, late;
+    uint8_t packet[BTP_A2DP_PACKET_BYTES];
+    int16_t pcm[2 * 128];            /* one SBC frame of input */
+    uint32_t beat_at;
+    /* Idle: after `idle_ms` of silence the stream is suspended (the radio
+     * and the speaker are left alone, and a Bluetooth keyboard or mouse
+     * has the air), and started again when sound comes. */
+    uint32_t idle_ms, audible_at, retry_at;
+    uint8_t idle_suspending, idle_suspended, keep_queue;
+} btp_a2dp;
+
+/* How long a silent stream is kept going; 0 never suspends. */
+#define BTP_A2DP_IDLE_MS 8000u
+
+#endif

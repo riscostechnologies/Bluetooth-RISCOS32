@@ -1,0 +1,27 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#ifndef BTV_RFCOMM_FRAME_H
+#define BTV_RFCOMM_FRAME_H
+#include <stddef.h>
+#include <stdint.h>
+typedef struct btv_rfcomm_frame
+{
+    uint8_t dlci, cr, type, pf, has_credit, credit;
+    const uint8_t *data;
+    size_t bytes;
+} btv_rfcomm_frame;
+/* One complete RFCOMM frame carried as an L2CAP payload. credit_mode is the
+ * negotiated per-DLC mode, not guessed from length. Validates exact length and
+ * FCS; returns 1 or -1, leaves output unchanged on failure. Data is borrowed.
+ * UIH FCS covers address/control only, not data, length or optional credits.
+ * Owner still validates role, DLC ownership, PF semantics and negotiated MTU. */
+int btv_rfcomm_frame_decode(const uint8_t *packet, size_t bytes,
+                            int credit_mode, btv_rfcomm_frame *frame);
+/* Encode SABM(2f), DISC(43), UA(63), DM(0f), UIH(ef). credit=-1 means absent;
+ * 0..255 supplies a credit octet, requiring UIH, PF and nonzero DLCI. Control
+ * frames require zero information bytes. Input/output must not overlap.
+ * Returns bytes or 0 without partial output. No flow-control accounting. */
+size_t btv_rfcomm_frame_encode(uint8_t *packet, size_t capacity,
+                              uint8_t dlci, int cr, uint8_t type, int pf,
+                              int credit, const uint8_t *data, size_t bytes);
+#endif

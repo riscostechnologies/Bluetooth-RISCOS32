@@ -1,0 +1,500 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        sbc_encoder
+ * Purpose:     Fixed-point A2DP SBC encoder (analysis, scale factors,
+ *              joint stereo, bit allocation, quantisation, packing).
+ * Reference:   A2DP 1.3 Appendix B. Integer only: 32-bit products,
+ *              shifts for every division, no compiler helpers.
+ ******************************************************************/
+#include "sbc_encoder.h"
+#include <string.h>
+
+/* Subband samples carry 14 fractional bits (Q14 PCM units): the window
+ * is applied at Q15/Q16, folded pairs are rounded to Q2 and the Q13
+ * cosine matrix gives Q15, halved once. The peak analysis gain is 1.6,
+ * so every accumulator stays below 2^31 for any 16-bit input. */
+#define BTV_SBC_FRACTION 14
+#define BTV_SBC_FOLD4_SHIFT 13  /* Q15 window -> Q2 */
+#define BTV_SBC_FOLD8_SHIFT 14  /* Q16 window -> Q2 */
+
+/* Prototype window C[i] of the specification, Q15. */
+static const int16_t btv_sbc_proto4[40] =
+{
+         0,     18,     49,     90,    126,    128,     61,   -100,
+       358,    670,    946,   1055,    848,    201,   -944,  -2544,
+      4443,   6389,   8082,   9235,   9644,   9235,   8082,   6389,
+     -4443,  -2544,   -944,    201,    848,   1055,    946,    670,
+      -358,   -100,     61,    128,    126,     90,     49,     18
+};
+
+/* Prototype window C[i] of the specification, Q16. */
+static const int16_t btv_sbc_proto8[80] =
+{
+         0,     10,     22,     36,     54,     75,     97,    117,
+       132,    138,    131,    106,     59,    -12,   -108,   -229,
+       371,    526,    685,    835,    960,   1042,   1063,   1004,
+       848,    580,    192,   -322,   -959,  -1711,  -2561,  -3486,
+      4456,   5438,   6395,   7287,   8078,   8734,   9224,   9528,
+      9631,   9528,   9224,   8734,   8078,   7287,   6395,   5438,
+     -4456,  -3486,  -2561,  -1711,   -959,   -322,    192,    580,
+       848,   1004,   1063,   1042,    960,    835,    685,    526,
+      -371,   -229,   -108,    -12,     59,    106,    131,    138,
+       132,    117,     97,     75,     54,     36,     22,     10
+};
+
+/* M[i][k] = cos((i + 0.5)(k - M/2)pi/M), Q13, folded to M columns using
+ * M[i][k] == M[i][M-k] and M[i][k] == -M[i][3M-k]. Column order is
+ * k = 0..M/2-1 (+k'=M-k), k = M/2, k = M+1..3M/2-1 (-k'=3M-k). */
+static const int16_t btv_sbc_cos4[16] =
+{
+      5793,   7568,   8192,   3135,
+     -5793,   3135,   8192,  -7568,
+     -5793,  -3135,   8192,   7568,
+      5793,  -7568,   8192,  -3135
+};
+
+static const int16_t btv_sbc_cos8[64] =
+{
+      5793,   6811,   7568,   8035,   8192,   4551,   3135,   1598,
+     -5793,  -1598,   3135,   6811,   8192,  -8035,  -7568,  -4551,
+     -5793,  -8035,  -3135,   4551,   8192,   1598,   7568,   6811,
+      5793,  -4551,  -7568,   1598,   8192,   6811,  -3135,  -8035,
+      5793,   4551,  -7568,  -1598,   8192,  -6811,  -3135,   8035,
+     -5793,   8035,  -3135,  -4551,   8192,  -1598,   7568,  -6811,
+     -5793,   1598,   3135,  -6811,   8192,   8035,  -7568,   4551,
+      5793,  -6811,   7568,  -8035,   8192,  -4551,   3135,  -1598
+};
+
+/* Loudness offsets indexed by sampling frequency code, then subband. */
+static const signed char btv_sbc_offset4[4][4] =
+{
+    { -1, 0, 0, 0 }, { -2, 0, 0, 1 }, { -2, 0, 0, 1 }, { -2, 0, 0, 1 }
+};
+
+static const signed char btv_sbc_offset8[4][8] =
+{
+    { -2, 0, 0, 0, 0, 0, 0, 1 }, { -3, 0, 0, 0, 0, 0, 1, 2 },
+    { -4, 0, 0, 0, 0, 0, 1, 2 }, { -4, 0, 0, 0, 0, 0, 1, 2 }
+};
+
+typedef struct btv_sbc_writer
+{
+    uint8_t *next;
+    uint32_t cache;
+    unsigned int used;
+} btv_sbc_writer;
+
+/* Append up to 16 bits MSB first; completed octets are emitted at once. */
+static void btv_sbc_put(btv_sbc_writer *writer, uint32_t value,
+                        unsigned int bits)
+{
+    writer->cache = (writer->cache << bits) | value;
+    writer->used += bits;
+    while (writer->used >= 8)
+    {
+        writer->used -= 8;
+        *writer->next++ = (uint8_t)(writer->cache >> writer->used);
+    }
+}
+
+/* CRC-8, polynomial x^8+x^4+x^3+x^2+1, over a bit string MSB first. */
+static unsigned int btv_sbc_crc(unsigned int crc, const uint8_t *data,
+                                unsigned int bits)
+{
+    unsigned int i, bit;
+    for (i = 0; i < bits; ++i)
+    {
+        bit = (data[i >> 3] >> (7 - (i & 7))) & 1;
+        bit ^= (crc >> 7) & 1;
+        crc = (crc << 1) & 0xff;
+        if (bit)
+            crc ^= 0x1d;
+    }
+    return crc;
+}
+
+/* One analysis block. x holds 10M samples, newest first; s receives M
+ * subband samples in Q14. Right shifts of negative values are
+ * arithmetic on every supported compiler. */
+static void btv_sbc_analyse(const int16_t *x, int32_t *s,
+                            unsigned int subbands)
+{
+    int32_t y[2 * BTV_SBC_MAX_SUBBANDS], v[BTV_SBC_MAX_SUBBANDS], acc;
+    const int16_t *window, *matrix;
+    unsigned int span = subbands << 1, half = subbands >> 1;
+    unsigned int k, n, i, j, shift;
+    int32_t round;
+    if (subbands == 8)
+    {
+        window = btv_sbc_proto8;
+        matrix = btv_sbc_cos8;
+        shift = BTV_SBC_FOLD8_SHIFT;
+    }
+    else
+    {
+        window = btv_sbc_proto4;
+        matrix = btv_sbc_cos4;
+        shift = BTV_SBC_FOLD4_SHIFT;
+    }
+    round = (int32_t)1 << (shift - 1);
+    /* Z[i] = C[i] X[i]; Y[k] = sum over the five 2M periods. */
+    for (k = 0; k < span; ++k)
+    {
+        acc = 0;
+        for (n = k; n < 10 * subbands; n += span)
+            acc += (int32_t)window[n] * x[n];
+        y[k] = acc;
+    }
+    /* Fold the 2M-column matrix to M columns (see btv_sbc_cos8). */
+    j = 0;
+    for (k = 0; k < half; ++k)
+        v[j++] = (y[k] + y[subbands - k] + round) >> shift;
+    v[j++] = (y[half] + round) >> shift;
+    for (k = subbands + 1; k < subbands + half; ++k)
+        v[j++] = (y[k] - y[3 * subbands - k] + round) >> shift;
+    for (i = 0; i < subbands; ++i)
+    {
+        acc = 1;
+        for (j = 0; j < subbands; ++j)
+            acc += (int32_t)matrix[j] * v[j];
+        matrix += subbands;
+        s[i] = acc >> 1;
+    }
+}
+
+/* Smallest scale factor with |sample| < 2^(sf+1), limited to 15. */
+static unsigned int btv_sbc_scale_factor(int32_t peak)
+{
+    unsigned int sf = 0;
+    while (sf < 15 && peak >= (int32_t)1 << (sf + 1 + BTV_SBC_FRACTION))
+        ++sf;
+    return sf;
+}
+
+static int32_t btv_sbc_abs(int32_t value)
+{
+    return value < 0 ? -value : value;
+}
+
+/* Scale factors per channel/subband, then the joint stereo choice:
+ * a subband goes mid/side when that needs smaller scale factors. */
+static void btv_sbc_scale(btv_sbc_encoder *enc)
+{
+    unsigned int ch, sb, blk, sf_mid, sf_side;
+    int32_t peak, peak_mid, peak_side, left, right;
+    for (ch = 0; ch < enc->channels; ++ch)
+        for (sb = 0; sb < enc->subbands; ++sb)
+        {
+            peak = 0;
+            for (blk = 0; blk < enc->blocks; ++blk)
+                if (btv_sbc_abs(enc->samples[blk][ch][sb]) > peak)
+                    peak = btv_sbc_abs(enc->samples[blk][ch][sb]);
+            enc->scale[ch][sb] = (uint8_t)btv_sbc_scale_factor(peak);
+        }
+    enc->join = 0;
+    if (enc->config.channel_mode != BTV_SBC_JOINT_STEREO)
+        return;
+    for (sb = 0; sb + 1 < enc->subbands; ++sb)
+    {
+        peak_mid = 0;
+        peak_side = 0;
+        for (blk = 0; blk < enc->blocks; ++blk)
+        {
+            left = enc->samples[blk][0][sb];
+            right = enc->samples[blk][1][sb];
+            peak = btv_sbc_abs((left + right) >> 1);
+            if (peak > peak_mid)
+                peak_mid = peak;
+            peak = btv_sbc_abs((left - right) >> 1);
+            if (peak > peak_side)
+                peak_side = peak;
+        }
+        sf_mid = btv_sbc_scale_factor(peak_mid);
+        sf_side = btv_sbc_scale_factor(peak_side);
+        if (sf_mid + sf_side >=
+            (unsigned int)enc->scale[0][sb] + enc->scale[1][sb])
+            continue;
+        enc->join |= (uint8_t)(1u << sb);
+        enc->scale[0][sb] = (uint8_t)sf_mid;
+        enc->scale[1][sb] = (uint8_t)sf_side;
+        for (blk = 0; blk < enc->blocks; ++blk)
+        {
+            left = enc->samples[blk][0][sb];
+            right = enc->samples[blk][1][sb];
+            enc->samples[blk][0][sb] = (left + right) >> 1;
+            enc->samples[blk][1][sb] = (left - right) >> 1;
+        }
+    }
+}
+
+/* Bit need per the specification: SNR uses the scale factor, loudness
+ * weights it by the frequency-dependent offset table. */
+static void btv_sbc_bitneed(const btv_sbc_encoder *enc, unsigned int ch,
+                            int *need)
+{
+    const signed char *offset;
+    unsigned int sb;
+    int loudness;
+    offset = enc->subbands == 8 ? btv_sbc_offset8[enc->frequency] :
+        btv_sbc_offset4[enc->frequency];
+    for (sb = 0; sb < enc->subbands; ++sb)
+    {
+        if (enc->config.allocation == BTV_SBC_SNR)
+            need[sb] = enc->scale[ch][sb];
+        else if (enc->scale[ch][sb] == 0)
+            need[sb] = -5;
+        else
+        {
+            loudness = (int)enc->scale[ch][sb] - offset[sb];
+            need[sb] = loudness > 0 ? loudness >> 1 : loudness;
+        }
+    }
+}
+
+/* Allocate bitpool over count channels together: one call per channel
+ * for mono and dual channel, one call over both for (joint) stereo.
+ * need[] and bits[] are indexed [channel * subbands + subband]; the
+ * distribution loops visit channels alternately within each subband. */
+static void btv_sbc_distribute(const int *need, uint8_t *bits,
+                               unsigned int count, unsigned int subbands,
+                               int bitpool)
+{
+    unsigned int total = count * subbands, i, at;
+    int max_need = need[0], slice, bitcount = 0, slicecount = 0, b;
+    for (i = 1; i < total; ++i)
+        if (need[i] > max_need)
+            max_need = need[i];
+    slice = max_need + 1;
+    do
+    {
+        --slice;
+        bitcount += slicecount;
+        slicecount = 0;
+        for (i = 0; i < total; ++i)
+        {
+            if (need[i] > slice + 1 && need[i] < slice + 16)
+                ++slicecount;
+            else if (need[i] == slice + 1)
+                slicecount += 2;
+        }
+    } while (bitcount + slicecount < bitpool);
+    if (bitcount + slicecount == bitpool)
+    {
+        bitcount += slicecount;
+        --slice;
+    }
+    for (i = 0; i < total; ++i)
+    {
+        if (need[i] < slice + 2)
+            bits[i] = 0;
+        else
+        {
+            b = need[i] - slice;
+            bits[i] = (uint8_t)(b > 16 ? 16 : b);
+        }
+    }
+    /* Visit sb 0 ch 0, sb 0 ch 1, sb 1 ch 0, ... for two channels. */
+    for (i = 0; bitcount < bitpool && i < total; ++i)
+    {
+        at = count == 1 ? i : ((i & 1) ? subbands : 0) + (i >> 1);
+        if (bits[at] >= 2 && bits[at] < 16)
+        {
+            ++bits[at];
+            ++bitcount;
+        }
+        else if (need[at] == slice + 1 && bitpool > bitcount + 1)
+        {
+            bits[at] = 2;
+            bitcount += 2;
+        }
+    }
+    for (i = 0; bitcount < bitpool && i < total; ++i)
+    {
+        at = count == 1 ? i : ((i & 1) ? subbands : 0) + (i >> 1);
+        if (bits[at] < 16)
+        {
+            ++bits[at];
+            ++bitcount;
+        }
+    }
+}
+
+static void btv_sbc_allocate(btv_sbc_encoder *enc)
+{
+    int need[BTV_SBC_MAX_CHANNELS * BTV_SBC_MAX_SUBBANDS];
+    uint8_t bits[BTV_SBC_MAX_CHANNELS * BTV_SBC_MAX_SUBBANDS];
+    unsigned int ch, sb, sbs = enc->subbands;
+    int bitpool = enc->config.bitpool;
+    for (ch = 0; ch < enc->channels; ++ch)
+        btv_sbc_bitneed(enc, ch, need + ch * sbs);
+    if (enc->config.channel_mode >= BTV_SBC_STEREO)
+        btv_sbc_distribute(need, bits, 2, sbs, bitpool);
+    else
+        for (ch = 0; ch < enc->channels; ++ch)
+            btv_sbc_distribute(need + ch * sbs, bits + ch * sbs, 1, sbs,
+                               bitpool);
+    for (ch = 0; ch < enc->channels; ++ch)
+        for (sb = 0; sb < sbs; ++sb)
+            enc->bits[ch][sb] = bits[ch * sbs + sb];
+}
+
+/* floor((s / 2^(sf+1) + 1) * (2^bits - 1) / 2) without 64-bit maths:
+ * normalise s + 2^(sf+1) to 30 bits, then multiply in two halves. */
+static uint32_t btv_sbc_quantise(int32_t sample, unsigned int sf,
+                                 unsigned int bits)
+{
+    uint32_t delta = (uint32_t)1 << (sf + 1 + BTV_SBC_FRACTION);
+    uint32_t levels = ((uint32_t)1 << bits) - 1, r;
+    int32_t limit = (int32_t)(delta - 1);
+    if (sample > limit)
+        sample = limit;
+    else if (sample < -limit)
+        sample = -limit;
+    r = (uint32_t)sample + delta;          /* 1 .. 2*delta - 1 */
+    if (sf < 15)
+        r <<= 14 - sf;
+    else
+        r >>= 1;                            /* r < 2^30 */
+    return (((r >> 15) * levels) + (((r & 0x7fff) * levels) >> 15)) >> 15;
+}
+
+int btv_sbc_init(btv_sbc_encoder *enc, const btv_sbc_config *config)
+{
+    unsigned int frequency, blocks, channels, limit, bits;
+    if (enc == NULL || config == NULL)
+        return 0;
+    switch (config->sample_rate)
+    {
+        case 16000: frequency = 0; break;
+        case 32000: frequency = 1; break;
+        case 44100: frequency = 2; break;
+        case 48000: frequency = 3; break;
+        default: return 0;
+    }
+    switch (config->blocks)
+    {
+        case 4: blocks = 0; break;
+        case 8: blocks = 1; break;
+        case 12: blocks = 2; break;
+        case 16: blocks = 3; break;
+        default: return 0;
+    }
+    if ((config->subbands != 4 && config->subbands != 8) ||
+        config->channel_mode > BTV_SBC_JOINT_STEREO ||
+        config->allocation > BTV_SBC_SNR)
+        return 0;
+    channels = config->channel_mode == BTV_SBC_MONO ? 1 : 2;
+    /* Bitpool is per channel for mono/dual, shared for stereo modes. */
+    limit = config->subbands * (config->channel_mode >= BTV_SBC_STEREO ?
+        32 : 16);
+    if (limit > 250)
+        limit = 250;
+    if (config->bitpool < 2 || config->bitpool > limit)
+        return 0;
+    memset(enc, 0, sizeof(*enc));
+    enc->config = *config;
+    enc->channels = channels;
+    enc->blocks = config->blocks;
+    enc->subbands = config->subbands;
+    enc->frequency = (uint8_t)frequency;
+    enc->header[0] = (uint8_t)((frequency << 6) | (blocks << 4) |
+        (config->channel_mode << 2) | (config->allocation << 1) |
+        (config->subbands == 8 ? 1 : 0));
+    enc->header[1] = config->bitpool;
+    if (config->channel_mode >= BTV_SBC_STEREO)
+        bits = (config->channel_mode == BTV_SBC_JOINT_STEREO ?
+            config->subbands : 0) + config->blocks * config->bitpool;
+    else
+        bits = config->blocks * channels * config->bitpool;
+    enc->frame_bytes = 4 + ((4 * config->subbands * channels) >> 3) +
+        ((bits + 7) >> 3);
+    return 1;
+}
+
+/* A new bitpool for the frames that follow, keeping the analysis filter's
+ * history: re-initialising cleared it and every change clicked. */
+int btv_sbc_set_bitpool(btv_sbc_encoder *enc, uint8_t bitpool)
+{
+    unsigned int limit, bits, channels = enc->channels;
+    const btv_sbc_config *c = &enc->config;
+    limit = c->subbands * (c->channel_mode >= BTV_SBC_STEREO ? 32 : 16);
+    if (limit > 250) limit = 250;
+    if (bitpool < 2 || bitpool > limit) return 0;
+    enc->config.bitpool = bitpool;
+    enc->header[1] = bitpool;
+    if (c->channel_mode >= BTV_SBC_STEREO)
+        bits = (c->channel_mode == BTV_SBC_JOINT_STEREO ? c->subbands : 0) +
+               c->blocks * bitpool;
+    else
+        bits = c->blocks * channels * bitpool;
+    enc->frame_bytes = 4 + ((4 * c->subbands * channels) >> 3) +
+        ((bits + 7) >> 3);
+    return 1;
+}
+
+size_t btv_sbc_frame_bytes(const btv_sbc_encoder *enc)
+{
+    return enc->frame_bytes;
+}
+
+unsigned int btv_sbc_frame_samples(const btv_sbc_encoder *enc)
+{
+    return enc->blocks * enc->subbands;
+}
+
+size_t btv_sbc_encode(btv_sbc_encoder *enc, const int16_t *pcm,
+                      uint8_t *out, size_t capacity)
+{
+    unsigned int blk, ch, sb, i, sbs, span, crc_bits;
+    int16_t *x;
+    btv_sbc_writer writer;
+    if (enc == NULL || pcm == NULL || out == NULL ||
+        enc->frame_bytes == 0 || capacity < enc->frame_bytes)
+        return 0;
+    sbs = enc->subbands;
+    span = 10 * sbs;
+    for (blk = 0; blk < enc->blocks; ++blk)
+        for (ch = 0; ch < enc->channels; ++ch)
+        {
+            /* X[] shifts by M; the block's oldest sample lands at M-1. */
+            x = enc->history[ch];
+            memmove(x + sbs, x, (span - sbs) * sizeof(*x));
+            for (i = 0; i < sbs; ++i)
+                x[sbs - 1 - i] = pcm[(blk * sbs + i) * enc->channels + ch];
+            btv_sbc_analyse(x, enc->samples[blk][ch], sbs);
+        }
+    btv_sbc_scale(enc);
+    btv_sbc_allocate(enc);
+
+    memset(out, 0, enc->frame_bytes);
+    out[0] = BTV_SBC_SYNCWORD;
+    out[1] = enc->header[0];
+    out[2] = enc->header[1];
+    writer.next = out + 4;
+    writer.cache = 0;
+    writer.used = 0;
+    crc_bits = 4 * sbs * enc->channels;
+    if (enc->config.channel_mode == BTV_SBC_JOINT_STEREO)
+    {
+        /* join[0..M-2] then one reserved zero bit. */
+        for (sb = 0; sb < sbs; ++sb)
+            btv_sbc_put(&writer, (enc->join >> sb) & 1, 1);
+        crc_bits += sbs;
+    }
+    for (ch = 0; ch < enc->channels; ++ch)
+        for (sb = 0; sb < sbs; ++sb)
+            btv_sbc_put(&writer, enc->scale[ch][sb], 4);
+    for (blk = 0; blk < enc->blocks; ++blk)
+        for (ch = 0; ch < enc->channels; ++ch)
+            for (sb = 0; sb < sbs; ++sb)
+                if (enc->bits[ch][sb] != 0)
+                    btv_sbc_put(&writer, btv_sbc_quantise(
+                        enc->samples[blk][ch][sb], enc->scale[ch][sb],
+                        enc->bits[ch][sb]), enc->bits[ch][sb]);
+    if (writer.used != 0)
+        *writer.next = (uint8_t)(writer.cache << (8 - writer.used));
+    out[3] = (uint8_t)btv_sbc_crc(btv_sbc_crc(0x0f, out + 1, 16), out + 4,
+                                  crc_bits);
+    return enc->frame_bytes;
+}

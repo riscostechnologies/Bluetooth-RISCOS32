@@ -1,0 +1,1226 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#define _POSIX_C_SOURCE 200809L
+/*******************************************************************
+ * File:        btbar
+ * Purpose:     !Bluetooth icon bar task.  Starts the BluetoothVoice
+ *              core (which then runs by itself in the module), lists and
+ *              connects devices - speakers and headphones (A2DP),
+ *              keyboards and mice (classic and Low Energy) - and keeps
+ *              the pairing keys in Choices.
+ ******************************************************************/
+#include "btsettings.h"
+#include "btstack.h"
+#include "btwimp.h"
+#include <swis.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define TASK_NAME "Bluetooth"
+#define VERSION_TEXT "0.92 (25-Oct-26)"
+#define VOICE_VERSION 92
+
+#define SWI_CORE 0x000d7bc8
+#define SWI_SCAN 0x000d7bc9
+#define SWI_DEVICES 0x000d7bca
+#define SWI_CONNECT 0x000d7bcb
+#define SWI_DISCONNECT 0x000d7bcc
+#define SWI_KEYS 0x000d7bcd
+#define SWI_AUDIO 0x000d7bce
+
+#define CORE_OFF 0
+#define CORE_READY 3
+
+#define DEV_AUDIO_SINK 0x0001u
+#define DEV_HANDSFREE 0x0002u
+#define DEV_HID 0x0004u
+#define DEV_KEYBOARD 0x0008u
+#define DEV_MOUSE 0x0010u
+#define DEV_LE 0x0020u
+#define DEV_PAIRED 0x0080u
+#define DEV_CONNECTED 0x0100u
+
+#define PROFILE_A2DP 1
+#define PROFILE_HID 2
+#define PROFILE_LE_HID 3
+
+#define MAX_DEVICES 32
+#define ENTRY_BYTES 96
+#define LIST_ROWS 14
+#define KEYS_BYTES 4096
+
+typedef struct device
+{
+    unsigned char address[6];
+    unsigned int flags;
+    int rssi, address_type;
+    int link_state, profile_state, security;
+    char name[64];
+} device;
+
+static device devices[MAX_DEVICES];
+static int device_count, row_device[LIST_ROWS];
+static unsigned int core_state, core_error, last_generation = 0xffffffffu;
+static unsigned int passkey_generation, keys_generation = 0xffffffffu;
+static unsigned int last_problem, shown_problem;
+static int scanning, quitting, quit_started;
+static int iconbar_icon = -1, info_window, devices_window;
+static int auto_connect_pending;
+/* Set when the sound device of a previous instance is still in the
+ * kernel's device list: only a restart clears it. */
+static int sound_stale;
+/* A core that stops by itself (not from Quit) is restarted a few times. */
+static int core_wanted, restarts, restart_at;
+static int boot_tries, boot_retry_at;
+static char problem_note[100];
+static int problem_note_until;
+static int start_pending;   /* started, not yet seen READY or failed */
+static unsigned char selected_address[6];
+static int have_selection;
+static char status_line[80] = "Starting";
+static bt_settings settings;
+
+enum { M_STATUS, M_INFO, M_DEVICES, M_CONNECT, M_DISCONNECT, M_CONFIGURE,
+       M_HELP, M_QUIT, M_COUNT };
+enum { D_STATUS, D_ROW0, D_SCAN = D_ROW0 + LIST_ROWS, D_FORGET,
+       D_DISCONNECT, D_CONNECT, D_COUNT };
+enum { P_TEXT, P_NO, P_YES, P_COUNT };
+
+static _kernel_oserror *call(int number, _kernel_swi_regs *regs)
+{
+    return _kernel_swi(number, regs, regs);
+}
+
+static void format_address(const unsigned char *lsb_first, char *text)
+{
+    sprintf(text, "%02X:%02X:%02X:%02X:%02X:%02X", lsb_first[5], lsb_first[4],
+            lsb_first[3], lsb_first[2], lsb_first[1], lsb_first[0]);
+}
+
+static void parse_saved(unsigned char *lsb_first)
+{
+    unsigned char msb[6];
+    int index;
+    memset(lsb_first, 0, 6);
+    if (!bt_settings_parse_address(settings.address, msb)) return;
+    for (index = 0; index < 6; ++index) lsb_first[index] = msb[5 - index];
+}
+
+/* ---- pairing keys ------------------------------------------------ */
+
+static int key_entry_bytes(void)
+{
+    _kernel_swi_regs regs;
+    memset(&regs, 0, sizeof(regs));
+    regs.r[1] = 0;
+    regs.r[2] = 0;
+    regs.r[3] = 0;
+    if (call(SWI_KEYS, &regs) != NULL) return 0;
+    keys_generation = (unsigned int)regs.r[5];
+    return regs.r[4];
+}
+
+/* BluetoothVoice 0.70 and later keep the bonds themselves, in
+ * Choices:Bluetooth.Keys in their own format, saved whenever they change.
+ * The desktop's "BTKY" copy went to the same file: each side rejected the
+ * other's format and the two overwrote each other.  The module owns it now. */
+#define MODULE_OWNS_BONDS 1
+
+static void load_keys(void)
+{
+    if (MODULE_OWNS_BONDS) return;
+    static unsigned char data[KEYS_BYTES];
+    _kernel_swi_regs regs;
+    FILE *file = fopen("Choices:Bluetooth.Keys", "rb");
+    size_t bytes;
+    int entry;
+    if (file == NULL) return;
+    bytes = fread(data, 1, sizeof(data), file);
+    fclose(file);
+    if (bytes < 8 || memcmp(data, "BTKY", 4) != 0) return;
+    entry = key_entry_bytes();
+    /* Entries only load when the layout matches this module's. */
+    if (entry == 0 || entry != (data[4] | (data[5] << 8))) return;
+    memset(&regs, 0, sizeof(regs));
+    regs.r[1] = 1;
+    regs.r[2] = (int)(data + 8);
+    regs.r[3] = (int)(bytes - 8);
+    if (call(SWI_KEYS, &regs) == NULL)
+        keys_generation = (unsigned int)regs.r[5];
+}
+
+static void save_keys(void)
+{
+    if (MODULE_OWNS_BONDS) return;
+    static unsigned char data[KEYS_BYTES];
+    _kernel_swi_regs regs;
+    char path[256];
+    const char *root = getenv("Choices$Write");
+    FILE *file;
+    if (root == NULL || root[0] == '\0') return;
+    memset(&regs, 0, sizeof(regs));
+    regs.r[1] = 0;
+    regs.r[2] = (int)(data + 8);
+    regs.r[3] = sizeof(data) - 8;
+    if (call(SWI_KEYS, &regs) != NULL) return;
+    memcpy(data, "BTKY", 4);
+    data[4] = (unsigned char)regs.r[4];
+    data[5] = (unsigned char)(regs.r[4] >> 8);
+    data[6] = data[7] = 0;
+    keys_generation = (unsigned int)regs.r[5];
+    {
+        /* Only the directory is wanted here: writing the choices would
+         * overwrite anything Configure changed while this task ran. */
+        _kernel_swi_regs dir;
+        char folder[256];
+        snprintf(folder, sizeof(folder), "%s.Bluetooth", root);
+        memset(&dir, 0, sizeof(dir));
+        dir.r[0] = 8;                   /* OS_File: create directory */
+        dir.r[1] = (int)folder;
+        (void)_kernel_swi(OS_File, &dir, &dir);
+    }
+    snprintf(path, sizeof(path), "%s.Bluetooth.Keys", root);
+    file = fopen(path, "wb");
+    if (file == NULL) return;
+    (void)fwrite(data, 1, 8u + (size_t)regs.r[3], file);
+    fclose(file);
+    memset(&regs, 0, sizeof(regs));
+    regs.r[0] = 18;                     /* set type: Data */
+    regs.r[1] = (int)path;
+    regs.r[2] = 0xffd;
+    (void)call(OS_File, &regs);
+}
+
+/* ---- core ------------------------------------------------------- */
+
+static int ensure_modules(int ask)
+{
+    const char *directory = getenv("Bluetooth$Dir");
+    char problem[160];
+    int replace = !bt_usb_stack_ready();
+    int adapter;
+    if (directory == NULL || directory[0] == '\0')
+    {
+        strcpy(status_line, "Bluetooth$Dir is not set");
+        return 0;
+    }
+    /* The module first, without touching USB: it is what can say whether
+     * an adapter is plugged in.  Replacing the USB stack restarts every
+     * device on the machine, and doing that at start-up on a machine with
+     * no adapter is exactly the freeze there is no reason for. */
+    if (bt_module_version("BluetoothVoice") < VOICE_VERSION &&
+        !bt_stack_load(directory, 0, problem, sizeof(problem)))
+    {
+        snprintf(status_line, sizeof(status_line), "%.70s", problem);
+        return 0;
+    }
+    if (!replace) return 1;
+    adapter = bt_adapter_present(NULL);
+    if (adapter <= 0)
+    {
+        strcpy(status_line, "No Bluetooth adapter is plugged in");
+        return 0;
+    }
+    if (ask && !settings.load_usb_drivers &&
+        bt_ask("Bluetooth needs the isochronous USB drivers (USBDriver 1.35). "
+               "Loading them restarts every USB device (keyboard, mouse, USB "
+               "drives) for a few seconds. Configure can load them at "
+               "start-up instead.", "Load drivers,Not now") != 0)
+    {
+        strcpy(status_line, "The USB drivers are not loaded");
+        return 0;
+    }
+    if (!bt_stack_load(directory, 1, problem, sizeof(problem)))
+    {
+        snprintf(status_line, sizeof(status_line), "%.70s", problem);
+        return 0;
+    }
+    return 1;
+}
+
+static int start_core(int ask)
+{
+    _kernel_swi_regs regs;
+    _kernel_oserror *error;
+    if (!ensure_modules(ask)) return 0;
+    memset(&regs, 0, sizeof(regs));
+    regs.r[1] = 0;
+    error = call(SWI_CORE, &regs);
+    if (error != NULL)
+    {
+        snprintf(status_line, sizeof(status_line), "%.70s", error->errmess);
+        /* The module has reset the adapter's USB port, or the adapter is
+         * not there yet (the USB drivers were just swapped and every
+         * device is re-enumerating): start again in a few seconds. */
+        if (((error->errnum & 0xffffff) == 0xa79b0f ||
+             (error->errnum & 0xffffff) == 0xa79b02) && restarts < 8)
+        {
+            ++restarts;
+            core_wanted = 1;
+            restart_at = bt_monotonic() + 300;
+        }
+        return 0;
+    }
+    load_keys();
+    core_wanted = 1;
+    start_pending = 1;
+    auto_connect_pending = settings.connect_at_start;
+    strcpy(status_line, "Starting the adapter");
+    return 1;
+}
+
+static void stop_core(void)
+{
+    _kernel_swi_regs regs;
+    memset(&regs, 0, sizeof(regs));
+    regs.r[1] = 1;
+    (void)call(SWI_CORE, &regs);
+}
+
+/* Which devices are worth listing: anything connected or paired, every
+ * classic device, and LE devices that offer input or audio or have a
+ * name.  Anonymous LE beacons (lights, phones, tags) stay hidden. */
+static int worth_listing(unsigned int flags, const unsigned char *name)
+{
+    if (flags & (DEV_CONNECTED | DEV_PAIRED)) return 1;
+    if (!(flags & DEV_LE)) return 1;
+    if (flags & (DEV_HID | DEV_AUDIO_SINK | DEV_HANDSFREE)) return 1;
+    return name[0] != 0;
+}
+
+/* The list keeps its order: known devices are updated in place, new ones
+ * are added at the end, and devices the module no longer reports are
+ * removed.  Rows only move when a new scan starts (reorder_devices). */
+static void read_devices(void)
+{
+    static unsigned char buffer[8 + MAX_DEVICES * ENTRY_BYTES + 4];
+    static unsigned char seen[MAX_DEVICES];
+    unsigned char *aligned = buffer + ((4 - ((unsigned)(int)buffer & 3)) & 3);
+    _kernel_swi_regs regs;
+    unsigned int count, index;
+    int slot, kept;
+    memset(&regs, 0, sizeof(regs));
+    regs.r[2] = (int)aligned;
+    regs.r[3] = 8 + MAX_DEVICES * ENTRY_BYTES;
+    if (call(SWI_DEVICES, &regs) != NULL) return;
+    memcpy(&count, aligned, 4);
+    if (count > MAX_DEVICES) count = MAX_DEVICES;
+    memset(seen, 0, sizeof(seen));
+    for (index = 0; index < count; ++index)
+    {
+        const unsigned char *e = aligned + 8 + index * ENTRY_BYTES;
+        unsigned int flags = (unsigned int)(e[6] | (e[7] << 8));
+        device *d = 0;
+        for (slot = 0; slot < device_count; ++slot)
+            if (memcmp(devices[slot].address, e, 6) == 0)
+            {
+                d = devices + slot;
+                break;
+            }
+        if (d == 0)
+        {
+            if (!worth_listing(flags, e + 16) || device_count >= MAX_DEVICES)
+                continue;
+            slot = device_count++;
+            d = devices + slot;
+            memcpy(d->address, e, 6);
+        }
+        seen[slot] = 1;
+        d->flags = flags;
+        d->rssi = (signed char)e[8];
+        d->address_type = e[9];
+        d->link_state = e[13];
+        d->profile_state = e[14];
+        d->security = e[15];
+        /* Keep a good name if the module has not got one this time. */
+        if (e[16] != 0)
+        {
+            memcpy(d->name, e + 16, 63);
+            d->name[63] = '\0';
+        }
+    }
+    for (slot = 0, kept = 0; slot < device_count; ++slot)
+        if (seen[slot])
+        {
+            if (kept != slot) devices[kept] = devices[slot];
+            ++kept;
+        }
+    device_count = kept;
+}
+
+/* A new scan: connected devices first, then paired ones; others go. */
+static void reorder_devices(void)
+{
+    static device sorted[MAX_DEVICES];
+    int slot, count = 0, pass;
+    for (pass = 0; pass < 2; ++pass)
+        for (slot = 0; slot < device_count; ++slot)
+        {
+            unsigned int flags = devices[slot].flags;
+            int group = (flags & DEV_CONNECTED) ? 0 :
+                        (flags & DEV_PAIRED) ? 1 : 2;
+            if (group == pass) sorted[count++] = devices[slot];
+        }
+    memcpy(devices, sorted, (size_t)count * sizeof(devices[0]));
+    device_count = count;
+}
+
+static const char *type_text(unsigned int flags)
+{
+    if (flags & DEV_KEYBOARD)
+        return (flags & DEV_MOUSE) ? "keyboard and mouse" : "keyboard";
+    if (flags & DEV_MOUSE) return "mouse";
+    if (flags & DEV_HID) return "input device";
+    if (flags & DEV_HANDSFREE) return "headset";
+    if (flags & DEV_AUDIO_SINK) return "speaker";
+    return "device";
+}
+
+static const char *state_text(const device *d)
+{
+    switch (d->link_state)
+    {
+    case 1: return "connecting";
+    case 2:
+        if (d->flags & DEV_LE)
+            /* BTP_LE_READY: 9 since the core reads the Report Map. */
+            return d->profile_state == 9 ? "connected" : "setting up";
+        if (d->flags & DEV_HID)
+            return d->profile_state == 5 ? "connected" : "setting up";
+        if (d->profile_state == 9) return "playing";
+        if (d->profile_state == 10) return "paused";
+        return d->profile_state != 0 ? "setting up" : "connected";
+    case 3: return "disconnecting";
+    default: return (d->flags & DEV_PAIRED) ? "paired" : "";
+    }
+}
+
+/* The name to show.  A device connected straight from the saved choices
+ * was never asked its name, so the list entry is blank and the status
+ * line used to print a bare address while the menu beside it said
+ * "Connect DM-40BT" - the same speaker under two names.  Fall back to
+ * the saved name before falling back to the address. */
+static const char *device_name(const device *d, char *fallback)
+{
+    unsigned char saved[6];
+    if (d->name[0] != '\0') return d->name;
+    parse_saved(saved);
+    if (settings.name[0] != '\0' && memcmp(saved, d->address, 6) == 0)
+        return settings.name;
+    format_address(d->address, fallback);
+    return fallback;
+}
+
+/* -1 when the device never said what it is. */
+static int profile_for(const device *d)
+{
+    if (d->flags & DEV_LE) return PROFILE_LE_HID;
+    if (d->flags & DEV_HID) return PROFILE_HID;
+    if (d->flags & (DEV_AUDIO_SINK | DEV_HANDSFREE)) return PROFILE_A2DP;
+    return -1;
+}
+
+/* Problems after an automatic reconnect are not worth a box: the
+ * speaker is most likely just switched off. */
+static int quiet_problems_until;
+
+static void connect_device(const device *d, int automatic)
+{
+    _kernel_swi_regs regs;
+    _kernel_oserror *error;
+    int profile = profile_for(d);
+    if (profile < 0)
+    {
+        char question[160], fallback[20];
+        snprintf(question, sizeof(question),
+                 "What kind of device is %s?", device_name(d, fallback));
+        switch (bt_ask(question, "Speaker or headphones,Keyboard or mouse,Cancel"))
+        {
+        case 0: profile = PROFILE_A2DP; break;
+        case 1: profile = PROFILE_HID; break;
+        default: return;
+        }
+    }
+    quiet_problems_until = automatic ? bt_monotonic() + 3000 : 0;
+    memset(&regs, 0, sizeof(regs));
+    regs.r[1] = (int)d->address;
+    regs.r[2] = profile;
+    regs.r[3] = ((d->flags & DEV_LE) ? 1 : 0) | (d->address_type << 8);
+    error = call(SWI_CONNECT, &regs);
+    if (error != NULL)
+    {
+        if (!automatic) bt_report_os(error);
+        return;
+    }
+    /* A speaker becomes the one Bluetooth reconnects at start-up. */
+    if (profile == PROFILE_A2DP && !automatic)
+    {
+        char fallback[20], chosen[sizeof(settings.name)];
+        bt_settings_load(&settings);
+        /* Take the name before touching settings: device_name() may now
+         * return settings.name itself, and strncpy onto its own source
+         * is undefined. */
+        strncpy(chosen, device_name(d, fallback), sizeof(chosen) - 1);
+        chosen[sizeof(chosen) - 1] = '\0';
+        format_address(d->address, settings.address);
+        memcpy(settings.name, chosen, sizeof(chosen));
+        (void)bt_settings_save(&settings);
+    }
+}
+
+static void disconnect_device(const unsigned char *address)
+{
+    _kernel_swi_regs regs;
+    memset(&regs, 0, sizeof(regs));
+    regs.r[1] = (int)address;
+    (void)call(SWI_DISCONNECT, &regs);
+}
+
+static void forget_device(const unsigned char *address)
+{
+    _kernel_swi_regs regs;
+    unsigned char saved[6];
+    memset(&regs, 0, sizeof(regs));
+    regs.r[1] = 2;
+    regs.r[2] = (int)address;
+    (void)call(SWI_KEYS, &regs);
+    parse_saved(saved);
+    if (memcmp(saved, address, 6) == 0)
+    {
+        settings.address[0] = settings.name[0] = '\0';
+        (void)bt_settings_save(&settings);
+    }
+}
+
+static void problem_text(unsigned int code, char *text, size_t size)
+{
+    unsigned int kind = code >> 8, reason = code & 0xffu;
+    if ((kind == 2 || kind == 3) && reason == 0x04)
+        snprintf(text, size, "The device did not answer: is it switched on and nearby?");
+    else if (kind == 4)
+        snprintf(text, size, "The device could not be reached (&%02X).", reason);
+    else if (kind == 5 || kind == 7 || kind == 8)
+        snprintf(text, size, "Pairing failed (&%02X): put the device in pairing mode and try again.", reason);
+    else if (kind == 0x0b)
+        snprintf(text, size, "The input device could not be set up (&%02X).", reason);
+    else
+        snprintf(text, size, "Bluetooth problem &%04X.", code);
+}
+
+static void refresh_devices_window(void);
+
+static void update_icon(void)
+{
+    const char *sprite = "bt_idle";
+    int index, connected = 0, busy = scanning;
+    for (index = 0; index < device_count; ++index)
+    {
+        if (devices[index].link_state == 2) connected = 1;
+        else if (devices[index].link_state != 0) busy = 1;
+    }
+    if (connected) sprite = "bt_on";
+    else if (busy || (core_state != CORE_READY && core_state != CORE_OFF))
+        sprite = "bt_busy";
+    if (iconbar_icon >= 0) bt_iconbar_set_sprite(iconbar_icon, sprite);
+}
+
+/* The core's failure codes as something a person can act on.  The hex is
+ * kept on the end: it is what the diagnostics and the notes here go by. */
+static const char *core_error_text(unsigned int code)
+{
+    switch (code & 0x0fffu)
+    {
+    case 0x001: return "The Bluetooth adapter would not open";
+    case 0x100:
+    case 0x101: return "The adapter refused a transfer";
+    case 0x102:
+    case 0x103: return (code >> 12) == 15u ?
+                       "The Bluetooth adapter was unplugged" :
+                       "Lost contact with the Bluetooth adapter";
+    case 0x104: return (code >> 12) == 1u ?
+                       "The adapter is not responding - restart the machine" :
+                       "Lost contact with the Bluetooth adapter";
+    case 0x105:
+    case 0x106:
+    case 0x107: return "The Bluetooth adapter stopped responding";
+    default: break;
+    }
+    if ((code & 0xff00u) == 0x0400u) return "The adapter would not start up";
+    if ((code & 0xff00u) == 0x0200u) return "The adapter rejected a command";
+    return "Bluetooth stopped";
+}
+
+static void set_status(void)
+{
+    int index, connected = 0;
+    char name[20];
+    for (index = 0; index < device_count; ++index)
+        if (devices[index].link_state == 2) ++connected;
+    if (core_state == CORE_OFF)
+    {
+        if (core_error != 0)
+            snprintf(status_line, sizeof(status_line), "%.60s (&%X)",
+                     core_error_text((unsigned int)core_error), core_error);
+        else if (strcmp(status_line, "Starting") == 0 ||
+                 strcmp(status_line, "Starting the adapter") == 0)
+            strcpy(status_line, "Bluetooth is off - click Scan to start");
+    }
+    else if (core_state != CORE_READY)
+        strcpy(status_line, "Starting the adapter");
+    else if (scanning)
+        strcpy(status_line, "Searching - put devices in pairing mode");
+    else if (connected == 1)
+    {
+        for (index = 0; devices[index].link_state != 2; ++index) {}
+        snprintf(status_line, sizeof(status_line), "%.40s: %s",
+                 device_name(&devices[index], name),
+                 state_text(&devices[index]));
+    }
+    else if (connected > 1)
+        snprintf(status_line, sizeof(status_line), "%d devices connected",
+                 connected);
+    else if (sound_stale)
+        strcpy(status_line, "Restart the machine to use sound again");
+    else
+        strcpy(status_line, "Ready - click Scan to find devices");
+    if (problem_note[0] != '\0')
+    {
+        if (bt_monotonic() < problem_note_until)
+            snprintf(status_line, sizeof(status_line), "%s", problem_note);
+        else
+            problem_note[0] = '\0';
+    }
+    update_icon();
+    refresh_devices_window();
+}
+
+/* The core's pairing question (Core reason 2, R8/R9): BluetoothVoice 0.70
+ * and later ask "do these six digits match?" for numeric comparison.  The
+ * answer goes back with Core reason 7.  A question for typed digits
+ * (passkey entry on this side) cannot be answered from the icon bar yet:
+ * it is refused at once rather than left to time out. */
+static unsigned int prompt_seen = 0xffffffffu;
+
+/* Pairing questions and notes go in their own small window, never in a
+ * Wimp_ReportError box: that is modal, and a pairing request arriving
+ * with nobody at the machine stopped the whole desktop. */
+static int pair_window, pair_waiting;
+
+static void create_pair_window(void)
+{
+    bt_icon_spec icons[P_COUNT];
+    memset(icons, 0, sizeof(icons));
+    icons[P_TEXT] = (bt_icon_spec){ 16, -76, 1084, -16, bt_flags_label(),
+                                    "", NULL, 160 };
+    icons[P_NO] = (bt_icon_spec){ 664, -160, 864, -100, bt_flags_action(),
+                                  "No", "R5,3", 8 };
+    icons[P_YES] = (bt_icon_spec){ 876, -164, 1084, -96, bt_flags_action(),
+                                   "Yes", "R6,3", 8 };
+    pair_window = bt_window_create("Bluetooth pairing", 1100, 184, icons,
+                                   P_COUNT, 1);
+}
+
+static void pair_reply(int accept)
+{
+    _kernel_swi_regs regs;
+    if (!pair_waiting) return;
+    pair_waiting = 0;
+    memset(&regs, 0, sizeof(regs));
+    regs.r[1] = 7;
+    regs.r[2] = accept;
+    (void)call(SWI_CORE, &regs);
+}
+
+/* question != 0: Yes and No answer it; otherwise a note with OK. */
+static void pair_show(const char *text, int question)
+{
+    if (pair_window == 0) return;
+    bt_icon_set_text(pair_window, P_TEXT, text);
+    bt_icon_set_text(pair_window, P_YES, question ? "Yes" : "OK");
+    bt_icon_set_shaded(pair_window, P_NO, !question);
+    bt_window_open_centred(pair_window);
+}
+
+static void pair_click(const int *block)
+{
+    if (block[4] == P_YES) pair_reply(1);
+    else if (block[4] == P_NO) pair_reply(0);
+    else return;
+    bt_window_close(pair_window);
+}
+
+static void answer_prompt(unsigned int prompt, unsigned int value)
+{
+    unsigned int kind = prompt & 0xffu;
+    unsigned int generation = (prompt >> 8) & 0x7fffffu;
+    _kernel_swi_regs regs;
+    unsigned char address[6];
+    char question[200];
+    const char *who = "the device";
+    int slot, accept = 0;
+    if (kind == 0 && pair_waiting)
+    {
+        /* The core gave up waiting (the device went, or timed out). */
+        pair_waiting = 0;
+        bt_window_close(pair_window);
+    }
+    if (kind == 0 || generation == prompt_seen) return;
+    prompt_seen = generation;
+    memset(address, 0, sizeof(address));
+    memset(&regs, 0, sizeof(regs));
+    regs.r[1] = 8;
+    regs.r[2] = (int)address;
+    if (call(SWI_CORE, &regs) == NULL)
+        for (slot = 0; slot < device_count; ++slot)
+            if (memcmp(devices[slot].address, address, 6) == 0 &&
+                devices[slot].name[0] != '\0')
+                who = devices[slot].name;
+    if (kind == 1)
+    {
+        snprintf(question, sizeof(question),
+                 "Pairing with %.60s: does it show %06u?", who, value % 1000000u);
+        pair_reply(0);                      /* an older question lapses */
+        pair_waiting = 1;
+        pair_show(question, 1);
+        return;                             /* answered from the window */
+    }
+    snprintf(question, sizeof(question),
+             "%.60s wants its number typed here, which this version "
+             "cannot do yet.", who);
+    pair_show(question, 0);
+    memset(&regs, 0, sizeof(regs));
+    regs.r[1] = 7;
+    regs.r[2] = accept;
+    regs.r[3] = 0;
+    (void)call(SWI_CORE, &regs);
+}
+
+static void poll_core(void)
+{
+    _kernel_swi_regs regs;
+    unsigned int generation;
+    memset(&regs, 0, sizeof(regs));
+    regs.r[1] = 2;
+    if (call(SWI_CORE, &regs) != NULL)
+    {
+        core_state = CORE_OFF;
+        set_status();
+        return;
+    }
+    if (core_state != CORE_OFF && (unsigned int)regs.r[1] == CORE_OFF &&
+        core_wanted && !quitting && restarts < 8)
+    {
+        ++restarts;
+        restart_at = bt_monotonic() + 300;
+    }
+    /* A start that failed between two polls (the bring-up can fail in
+     * 20 ms, as it did at boot with the adapter still replaying the last
+     * session's events) is never seen leaving OFF: restart it too. */
+    if (core_state == CORE_OFF && (unsigned int)regs.r[1] == CORE_OFF &&
+        regs.r[2] != 0 && start_pending &&
+        core_wanted && !quitting && restarts < 8 && restart_at == 0)
+    {
+        start_pending = 0;
+        ++restarts;
+        restart_at = bt_monotonic() + 300;
+    }
+    core_state = (unsigned int)regs.r[1];
+    core_error = (unsigned int)regs.r[2];
+    if (core_state == CORE_READY) restarts = 0, start_pending = 0;
+    if (boot_tries != 0 && core_state == CORE_OFF && !core_wanted &&
+        !quitting && bt_monotonic() >= boot_retry_at)
+    {
+        --boot_tries;
+        boot_retry_at = bt_monotonic() + 300;
+        if (start_core(0)) boot_tries = 0;
+    }
+    else if (core_wanted) boot_tries = 0;
+    if (restart_at != 0 && core_state == CORE_OFF &&
+        bt_monotonic() >= restart_at)
+    {
+        restart_at = 0;
+        (void)start_core(0);
+    }
+    generation = (unsigned int)regs.r[3];
+    scanning = regs.r[7];
+    if (core_state == CORE_READY)
+        answer_prompt((unsigned int)regs.r[8], (unsigned int)regs.r[9]);
+    {
+        /* A device left behind by a crashed instance cannot be used, and
+         * the machine has to be restarted before sound works again. */
+        _kernel_swi_regs audio;
+        memset(&audio, 0, sizeof(audio));
+        if (call(SWI_AUDIO, &audio) == NULL && (audio.r[4] & 4) != 0)
+            sound_stale = 1;
+    }
+    last_problem = (unsigned int)regs.r[6];
+    if ((unsigned int)regs.r[4] != passkey_generation)
+    {
+        char text[120];
+        unsigned int passkey = (unsigned int)regs.r[5];
+        passkey_generation = (unsigned int)regs.r[4];
+        if (passkey_generation != 0)
+        {
+            if (passkey == 0)
+                snprintf(text, sizeof(text), "If the keyboard asks for a PIN, type 0000 on it and press Return.");
+            else
+                snprintf(text, sizeof(text), "To pair the keyboard, type %06u on it and press Return.", passkey);
+            pair_show(text, 0);
+        }
+    }
+    if (generation != last_generation)
+    {
+        last_generation = generation;
+        read_devices();
+        {
+            unsigned int before = keys_generation;
+            (void)key_entry_bytes();
+            if (keys_generation != before && core_state == CORE_READY)
+                save_keys();
+        }
+    }
+    if (last_problem != 0 && last_problem != shown_problem)
+    {
+        char text[120];
+        shown_problem = last_problem;
+        problem_text(last_problem, text, sizeof(text));
+        /* In the status line for a while, never in a box: Wimp_ReportError
+         * is modal, and a "will try again" or "did not answer" box left
+         * the whole desktop waiting for a click while nobody was there. */
+        if ((last_problem & 0xff00u) != 0x0d00u &&
+            (quiet_problems_until == 0 ||
+             bt_monotonic() >= quiet_problems_until))
+        {
+            snprintf(problem_note, sizeof(problem_note), "%.90s", text);
+            problem_note_until = bt_monotonic() + 1500;
+        }
+    }
+    if (core_state == CORE_READY && auto_connect_pending)
+    {
+        unsigned char saved[6];
+        device d;
+        auto_connect_pending = 0;
+        parse_saved(saved);
+        if (settings.address[0] != '\0')
+        {
+            memset(&d, 0, sizeof(d));
+            memcpy(d.address, saved, 6);
+            d.flags = DEV_AUDIO_SINK;
+            connect_device(&d, 1);
+        }
+    }
+    set_status();
+}
+
+/* ---- windows ------------------------------------------------------ */
+
+static void create_info_window(void)
+{
+    static const bt_icon_spec icons[] = {
+        { 16, -56, 180, -12, 0, "Name", NULL, 0 },
+        { 190, -56, 700, -12, 0, "Bluetooth", NULL, 0 },
+        { 16, -104, 180, -60, 0, "Purpose", NULL, 0 },
+        { 190, -104, 700, -60, 0, "Speakers, keyboards and mice", NULL, 0 },
+        { 16, -152, 180, -108, 0, "Author", NULL, 0 },
+        { 190, -152, 700, -108, 0, "BluetoothVoice project", NULL, 0 },
+        { 16, -200, 180, -156, 0, "Version", NULL, 0 },
+        { 190, -200, 700, -156, 0, VERSION_TEXT, NULL, 0 },
+        { 16, -248, 180, -204, 0, "Status", NULL, 0 },
+        { 190, -248, 1000, -204, 0, "", NULL, 96 },
+    };
+    bt_icon_spec copy[sizeof(icons) / sizeof(icons[0])];
+    size_t index;
+    for (index = 0; index < sizeof(icons) / sizeof(icons[0]); ++index)
+    {
+        copy[index] = icons[index];
+        copy[index].flags = index % 2 == 0 ? bt_flags_label() | 0x200u
+                                           : bt_flags_writable() & ~(15u << 12);
+    }
+    info_window = bt_window_create("About this program", 1016, 264, copy,
+                                   (int)(sizeof(copy) / sizeof(copy[0])), 0);
+}
+
+#define DEVICES_WIDTH 1300
+#define ROW_HEIGHT 48
+#define LIST_TOP -72
+
+static void create_devices_window(void)
+{
+    bt_icon_spec icons[D_COUNT];
+    int row, list_bottom = LIST_TOP - LIST_ROWS * ROW_HEIGHT;
+    int height = -list_bottom + 100;
+    unsigned int row_flags = 0x1u | 0x4u | 0x10u | 0x20u | 0x100u |
+                             (11u << 12) | (1u << 16) | (7u << 24);
+    memset(icons, 0, sizeof(icons));
+    icons[D_STATUS] = (bt_icon_spec){ 16, -60, DEVICES_WIDTH - 16, -12,
+        bt_flags_label(), "", NULL, 80 };
+    for (row = 0; row < LIST_ROWS; ++row)
+        icons[D_ROW0 + row] = (bt_icon_spec){
+            16, LIST_TOP - (row + 1) * ROW_HEIGHT + 4,
+            DEVICES_WIDTH - 16, LIST_TOP - row * ROW_HEIGHT,
+            row_flags | ICON_SHADED, "", NULL, 128 };
+    icons[D_SCAN] = (bt_icon_spec){ 16, list_bottom - 76, 216,
+        list_bottom - 16, bt_flags_action(), "Scan", "R5,3", 0 };
+    icons[D_FORGET] = (bt_icon_spec){ 228, list_bottom - 76, 428,
+        list_bottom - 16, bt_flags_action(), "Forget", "R5,3", 0 };
+    icons[D_DISCONNECT] = (bt_icon_spec){ 800, list_bottom - 76, 1060,
+        list_bottom - 16, bt_flags_action(), "Disconnect", "R5,3", 0 };
+    icons[D_CONNECT] = (bt_icon_spec){ 1072, list_bottom - 80,
+        DEVICES_WIDTH - 16, list_bottom - 12, bt_flags_action(), "Connect",
+        "R6,3", 0 };
+    devices_window = bt_window_create("Bluetooth devices", DEVICES_WIDTH,
+                                      height, icons, D_COUNT, 1);
+}
+
+static int selected_device(void)
+{
+    int row;
+    for (row = 0; row < LIST_ROWS; ++row)
+        if (row_device[row] >= 0 &&
+            bt_icon_selected(devices_window, D_ROW0 + row))
+            return row_device[row];
+    return -1;
+}
+
+static void refresh_devices_window(void)
+{
+    char text[128], name[20], address[18];
+    int row, chosen;
+    if (devices_window == 0) return;
+    bt_icon_set_text(devices_window, D_STATUS, status_line);
+    chosen = selected_device();
+    if (chosen >= 0)
+    {
+        memcpy(selected_address, devices[chosen].address, 6);
+        have_selection = 1;
+    }
+    for (row = 0; row < LIST_ROWS; ++row)
+    {
+        device *d;
+        if (row >= device_count)
+        {
+            row_device[row] = -1;
+            bt_icon_set_text(devices_window, D_ROW0 + row, "");
+            bt_icon_set_selected(devices_window, D_ROW0 + row, 0);
+            bt_icon_set_shaded(devices_window, D_ROW0 + row, 1);
+            continue;
+        }
+        d = devices + row;
+        row_device[row] = row;
+        format_address(d->address, address);
+        snprintf(text, sizeof(text), "%.36s   %s%s   %s   %s",
+                 device_name(d, name), (d->flags & DEV_LE) ? "LE " : "",
+                 type_text(d->flags), address, state_text(d));
+        bt_icon_set_text(devices_window, D_ROW0 + row, text);
+        bt_icon_set_shaded(devices_window, D_ROW0 + row, 0);
+        bt_icon_set_selected(devices_window, D_ROW0 + row,
+                             have_selection &&
+                             memcmp(selected_address, d->address, 6) == 0);
+    }
+    bt_icon_set_shaded(devices_window, D_SCAN, scanning);
+    /* Only the buttons that would do something are live. */
+    chosen = have_selection ? -1 : chosen;
+    for (row = 0; row < device_count; ++row)
+        if (have_selection &&
+            memcmp(selected_address, devices[row].address, 6) == 0)
+            chosen = row;
+    {
+        int connected = chosen >= 0 && devices[chosen].link_state != 0;
+        int paired = chosen >= 0 &&
+                     (devices[chosen].flags & DEV_PAIRED) != 0;
+        bt_icon_set_shaded(devices_window, D_CONNECT,
+                           chosen < 0 || connected || core_state != CORE_READY);
+        bt_icon_set_shaded(devices_window, D_DISCONNECT, !connected);
+        bt_icon_set_shaded(devices_window, D_FORGET, !paired);
+    }
+}
+
+static void start_scan(void)
+{
+    _kernel_swi_regs regs;
+    if (core_state == CORE_OFF)
+    {
+        (void)start_core(1);
+        return;          /* the scan starts once the adapter is ready */
+    }
+    reorder_devices();
+    memset(&regs, 0, sizeof(regs));
+    regs.r[1] = 10;
+    if (call(SWI_SCAN, &regs) == NULL) scanning = 1;
+    last_generation = 0xffffffffu;
+}
+
+static int scan_when_ready;
+
+static void open_devices(void)
+{
+    if (devices_window == 0) return;
+    refresh_devices_window();
+    bt_window_open_centred(devices_window);
+    if (!scanning) scan_when_ready = 1;
+    if (core_state == CORE_OFF) (void)start_core(1);
+}
+
+static void on_devices_click(const int *block)
+{
+    int icon = block[4], chosen = selected_device();
+    switch (icon)
+    {
+    case D_SCAN:
+        if (core_state == CORE_READY) start_scan();
+        else
+        {
+            scan_when_ready = 1;
+            if (core_state == CORE_OFF) (void)start_core(1);
+        }
+        break;
+    case D_CONNECT:
+        if (chosen < 0)
+        {
+            strcpy(problem_note, "Choose a device in the list first");
+            problem_note_until = bt_monotonic() + 500;
+        }
+        else connect_device(&devices[chosen], 0);
+        break;
+    case D_DISCONNECT:
+        if (chosen >= 0) disconnect_device(devices[chosen].address);
+        break;
+    case D_FORGET:
+        if (chosen >= 0 &&
+            bt_ask("Forget this device? It will need to pair again.",
+                   "Forget,Keep") == 0)
+            forget_device(devices[chosen].address);
+        break;
+    default:
+        break;
+    }
+    last_generation = 0xffffffffu;
+    poll_core();
+}
+
+static void refresh_info(void)
+{
+    if (info_window != 0) bt_icon_set_text(info_window, 9, status_line);
+}
+
+/* ---- icon bar ------------------------------------------------- */
+
+static int *current_menu;
+
+static void open_menu(int x)
+{
+    bt_menu_item items[M_COUNT];
+    static char status_item[64], connect_item[64];
+    bt_settings_load(&settings);
+    snprintf(status_item, sizeof(status_item), "%.44s", status_line);
+    if (settings.address[0] != '\0')
+        snprintf(connect_item, sizeof(connect_item), "Connect %.30s",
+                 settings.name[0] ? settings.name : settings.address);
+    else
+        strcpy(connect_item, "Connect speaker");
+    memset(items, 0, sizeof(items));
+    items[M_STATUS].text = status_item;
+    items[M_STATUS].shaded = 1;
+    items[M_STATUS].dotted = 1;
+    items[M_INFO].text = "Info";
+    items[M_INFO].submenu = info_window;
+    items[M_DEVICES].text = "Devices...";
+    items[M_CONNECT].text = connect_item;
+    items[M_CONNECT].shaded = settings.address[0] == '\0' ||
+                              core_state != CORE_READY;
+    items[M_DISCONNECT].text = "Disconnect all";
+    items[M_DISCONNECT].dotted = 1;
+    items[M_CONFIGURE].text = "Configure...";
+    items[M_HELP].text = "Help...";
+    items[M_QUIT].text = "Quit";
+    refresh_info();
+    current_menu = bt_menu_build("Bluetooth", items, M_COUNT);
+    bt_menu_open(current_menu, x - 64, 96 + 44 * M_COUNT);
+}
+
+static void open_configure(void)
+{
+    bt_start_task("Filer_Run BootResources:Configure.!BTSetup");
+}
+
+static void begin_quit(void)
+{
+    quitting = 1;
+    quit_started = bt_monotonic();
+    if (core_state != CORE_OFF) save_keys();
+    stop_core();
+}
+
+static void on_menu(const int *block)
+{
+    _kernel_swi_regs regs;
+    int pointer[5], index;
+    switch (block[0])
+    {
+    case M_DEVICES: open_devices(); break;
+    case M_CONNECT:
+    {
+        device d;
+        unsigned char saved[6];
+        parse_saved(saved);
+        memset(&d, 0, sizeof(d));
+        memcpy(d.address, saved, 6);
+        d.flags = DEV_AUDIO_SINK;
+        for (index = 0; index < device_count; ++index)
+            if (memcmp(devices[index].address, saved, 6) == 0)
+                d = devices[index];
+        d.flags |= DEV_AUDIO_SINK;
+        d.flags &= ~(unsigned int)(DEV_HID | DEV_LE);
+        connect_device(&d, 0);
+        break;
+    }
+    case M_DISCONNECT:
+        for (index = 0; index < device_count; ++index)
+            if (devices[index].link_state != 0)
+                disconnect_device(devices[index].address);
+        break;
+    case M_CONFIGURE: open_configure(); break;
+    case M_HELP: bt_start_task("Filer_Run <Bluetooth$Dir>.!Help"); break;
+    case M_QUIT: begin_quit(); break;
+    default: break;
+    }
+    memset(&regs, 0, sizeof(regs));
+    regs.r[1] = (int)pointer;
+    if (_kernel_swi(Wimp_GetPointerInfo, &regs, &regs) == NULL &&
+        (pointer[2] & BUTTON_ADJUST) && current_menu != NULL && !quitting)
+        open_menu(pointer[0]);
+}
+
+static void on_help(int *message)
+{
+    char reply_text[236];
+    int reply[64];
+    if (message[8] == -2 && message[9] == iconbar_icon)
+        snprintf(reply_text, sizeof(reply_text),
+                 "This is the Bluetooth icon.|MClick SELECT to see and connect "
+                 "devices, ADJUST to configure Bluetooth.|M%s", status_line);
+    else if (devices_window != 0 && message[8] == devices_window)
+    {
+        int icon = message[9];
+        const char *text =
+            icon == D_SCAN ? "Click to look for devices for 10 seconds. Put the device in pairing mode first." :
+            icon == D_CONNECT ? "Click to pair with the chosen device and connect it." :
+            icon == D_DISCONNECT ? "Click to disconnect the chosen device. It is not brought back until you connect it again." :
+            icon == D_FORGET ? "Click to remove the chosen device's pairing. It will have to pair again." :
+            icon >= D_ROW0 && icon < D_ROW0 + LIST_ROWS ? "Click to choose this device." :
+            "This window lists Bluetooth devices: paired ones first, then those found by Scan.";
+        snprintf(reply_text, sizeof(reply_text), "%s", text);
+    }
+    else if (pair_window != 0 && message[8] == pair_window)
+        snprintf(reply_text, sizeof(reply_text),
+                 "Answer Yes when the number on the device matches; No to refuse pairing.");
+    else
+        return;
+    memset(reply, 0, sizeof(reply));
+    strcpy((char *)(reply + 5), reply_text);
+    reply[0] = (int)((20 + strlen(reply_text) + 4) & ~3u);
+    reply[3] = message[2];
+    reply[4] = MESSAGE_HELP_REPLY;
+    bt_send_message(WIMP_MESSAGE, reply, message[1]);
+}
+
+static void on_click(const int *block)
+{
+    if (devices_window != 0 && block[3] == devices_window)
+    {
+        on_devices_click(block);
+        return;
+    }
+    if (pair_window != 0 && block[3] == pair_window)
+    {
+        pair_click(block);
+        return;
+    }
+    if (block[3] != -2) return;
+    if (block[2] == BUTTON_MENU) open_menu(block[0]);
+    else if (block[2] == BUTTON_SELECT) open_devices();
+    else if (block[2] == BUTTON_ADJUST) open_configure();
+}
+
+int main(int argc, char **argv)
+{
+    int block[64];
+    int done = 0, index;
+    (void)argc;
+    (void)argv;
+    if (!bt_wimp_initialise(TASK_NAME)) return 1;
+    for (index = 0; index < LIST_ROWS; ++index) row_device[index] = -1;
+    bt_settings_load(&settings);
+    iconbar_icon = bt_iconbar_create("bt_busy");
+    create_info_window();
+    create_devices_window();
+    create_pair_window();
+    /* Start straight away when the drivers are ready (or may be loaded
+     * without asking); otherwise wait until the user asks. */
+    if (bt_usb_stack_ready() || settings.load_usb_drivers)
+        if (!start_core(0))
+        {
+            /* At boot the adapter may still be enumerating: try again
+             * every 3 s for a minute rather than wait for a click. */
+            boot_tries = 20;
+            boot_retry_at = bt_monotonic() + 300;
+        }
+    poll_core();
+    while (!done)
+    {
+        int reason = bt_wimp_poll(quitting ? 5 : 25, block);
+        switch (reason)
+        {
+        case WIMP_NULL:
+            poll_core();
+            if (scan_when_ready && core_state == CORE_READY)
+            {
+                scan_when_ready = 0;
+                start_scan();
+            }
+            break;
+        case WIMP_OPEN: bt_window_reopen(block); break;
+        case WIMP_CLOSE:
+            if (pair_window != 0 && block[0] == pair_window) pair_reply(0);
+            bt_window_close(block[0]);
+            break;
+        case WIMP_CLICK: on_click(block); break;
+        case 8:   /* Key_Pressed: none of ours, so pass it on (hotkeys) */
+        {
+            _kernel_swi_regs key;
+            memset(&key, 0, sizeof(key));
+            key.r[0] = block[6];
+            (void)_kernel_swi(0x400DC, &key, &key);   /* Wimp_ProcessKey */
+            break;
+        }
+        case WIMP_MENU: on_menu(block); break;
+        case WIMP_MESSAGE:
+        case WIMP_MESSAGE_RECORDED:
+            if (block[4] == MESSAGE_TASK_INITIALISE)
+            {
+                /* A second copy would fight this one for the core: the
+                 * newcomer is asked to go away. */
+                const char *name = (const char *)(block + 7);
+                if (block[1] != bt_wimp_task() &&
+                    strcmp(name, TASK_NAME) == 0)
+                {
+                    int quit[5];
+                    memset(quit, 0, sizeof(quit));
+                    quit[0] = 20;
+                    quit[4] = MESSAGE_QUIT;
+                    bt_send_message(WIMP_MESSAGE, quit, block[1]);
+                }
+            }
+            else if (block[4] == MESSAGE_QUIT && !quitting) begin_quit();
+            else if (block[4] == MESSAGE_HELP_REQUEST) on_help(block);
+            break;
+        default: break;
+        }
+        if (quitting && (core_state == CORE_OFF ||
+                         bt_monotonic() - quit_started > 600))
+            done = 1;
+    }
+    bt_wimp_finalise();
+    return 0;
+}

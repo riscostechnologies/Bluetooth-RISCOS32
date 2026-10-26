@@ -1,0 +1,36 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#ifndef BTV_RFCOMM_CONNECT_H
+#define BTV_RFCOMM_CONNECT_H
+#include "sdp_session.h"
+#include "rfcomm_l2cap.h"
+enum btv_rfcomm_connect_state {
+    BTV_RC_IDLE, BTV_RC_OPENING, BTV_RC_RUNNING, BTV_RC_CLOSING, BTV_RC_DONE, BTV_RC_FAILED
+};
+typedef struct btv_rfcomm_connect {
+    btv_l2cap_dispatch *dispatch;
+    btv_rfcomm_l2cap binding;
+    btv_sdp_service service;
+    uint16_t local_cid;
+    unsigned int state, error, needs_acl_recovery, established, cleanup_timed;
+    uint32_t started, cleanup_started;
+} btv_rfcomm_connect;
+/* Start from successful SDP whose channel is closed, on that same ACL link.
+ * Caller must satisfy peer security policy BEFORE calling. Allocates a fresh
+ * dedicated PSM 3 channel, becoming RFCOMM multiplexer initiator. Object is
+ * not movable or reusable until terminal state AND all old IO is drained. */
+int btv_rfcomm_connect_start(btv_rfcomm_connect *connection, const btv_sdp_session *discovery,
+    uint16_t receive_mtu, uint32_t now);
+/* Parent services dispatcher signaling first on this same serialized owner.
+ * RUNNING includes RFCOMM negotiation: application readiness is the embedded
+ * session's READY state. error: 0 clean, 1 link, 2 RFCOMM, 3 setup timeout. */
+void btv_rfcomm_connect_tick(btv_rfcomm_connect *connection, uint32_t now);
+/* Data output/input only; parent separately routes CID-1 signaling and sends
+ * its output first. Same copied acceptance contract as rfcomm_l2cap. */
+size_t btv_rfcomm_connect_output(btv_rfcomm_connect *connection, uint8_t *pdu, size_t capacity, uint32_t now);
+int btv_rfcomm_connect_sent(btv_rfcomm_connect *connection, uint32_t now);
+int btv_rfcomm_connect_receive(btv_rfcomm_connect *connection, const uint8_t *pdu, size_t bytes, uint32_t now);
+/* Graceful RFCOMM close when running, or cancel L2CAP setup. Unknown remote
+ * CID during setup needs ACL recovery; it cannot be safely reclaimed locally. */
+int btv_rfcomm_connect_close(btv_rfcomm_connect *connection, uint32_t now);
+#endif

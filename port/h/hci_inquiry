@@ -1,0 +1,52 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#ifndef BTV_HCI_INQUIRY_H
+#define BTV_HCI_INQUIRY_H
+#include <stddef.h>
+#include <stdint.h>
+
+#define BTV_INQUIRY_RESULTS 16
+#define BTV_INQUIRY_NAME_BYTES 64
+
+enum btv_inquiry_state
+{
+    BTV_IQ_IDLE, BTV_IQ_QUEUED, BTV_IQ_WAIT, BTV_IQ_ACTIVE,
+    BTV_IQ_DONE, BTV_IQ_REJECTED, BTV_IQ_RECOVER
+};
+enum btv_inquiry_error
+{
+    BTV_IQ_NO_ERROR, BTV_IQ_TIMEOUT, BTV_IQ_USB_ERROR,
+    BTV_IQ_COMMAND_ERROR, BTV_IQ_EVENT_ERROR, BTV_IQ_BAD_EVENT,
+    BTV_IQ_HARDWARE_ERROR
+};
+typedef struct btv_inquiry_device
+{
+    uint8_t address[6], page_scan_rep_mode, device_class[3];
+    uint16_t clock_offset;
+    int8_t rssi;
+    uint8_t has_rssi, extended, audio_class, voice_service;
+    char name[BTV_INQUIRY_NAME_BYTES];
+} btv_inquiry_device;
+typedef struct btv_hci_inquiry
+{
+    btv_inquiry_device devices[BTV_INQUIRY_RESULTS];
+    uint32_t started;
+    unsigned int state, error, count, dropped;
+    uint8_t duration, maximum, submitted, usb_done, status_seen, status;
+    uint8_t complete_seen;
+} btv_hci_inquiry;
+
+void btv_hci_inquiry_init(btv_hci_inquiry *inquiry);
+int btv_hci_inquiry_start(btv_hci_inquiry *inquiry, uint8_t duration,
+                          uint8_t maximum, uint32_t now);
+size_t btv_hci_inquiry_command(btv_hci_inquiry *inquiry, uint8_t *output,
+                               size_t capacity, uint32_t now);
+int btv_hci_inquiry_sent(btv_hci_inquiry *inquiry, uint32_t now);
+int btv_hci_inquiry_usb_done(btv_hci_inquiry *inquiry, int success);
+int btv_hci_inquiry_event(btv_hci_inquiry *inquiry, const uint8_t *event,
+                          size_t bytes, uint32_t now);
+void btv_hci_inquiry_tick(btv_hci_inquiry *inquiry, uint32_t now);
+const btv_inquiry_device *btv_hci_inquiry_result(
+                          const btv_hci_inquiry *inquiry, unsigned int index);
+
+#endif

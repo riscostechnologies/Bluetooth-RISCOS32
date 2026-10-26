@@ -1,0 +1,99 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        bt_profiles
+ * Purpose:     The profile side of the Bluetooth core: A2DP source,
+ *              classic HID host and LE HID (with LE pairing).  The core
+ *              calls these hooks; profiles call back into bt_core.
+ ******************************************************************/
+#ifndef BTP_PROFILES_H
+#define BTP_PROFILES_H
+
+#include "bt_core.h"
+#include "bt_a2dp.h"
+#include "bt_hid.h"
+#include "bt_le.h"
+#include "avrcp.h"
+#include "bt_sdpc.h"
+
+typedef struct btc_profiles
+{
+    btp_a2dp a2dp;
+    btp_hid hid[BTC_LINKS];
+    btp_le le[BTC_LINKS];
+    btp_sc sc;
+    /* AVRCP rides beside A2DP, on the same link (bt_profiles.c). */
+    btv_avrcp avrcp;
+    int avrcp_channel;
+    uint8_t avrcp_link, avrcp_tried, avrcp_absolute_told;
+    uint32_t avrcp_wait_from;
+    /* One SDP query at a time (bt_hid.c reads a HID device's record). */
+    btp_sdpc sdpc;
+    uint8_t sdp_link;                /* the link it is for, 0xff when free */
+    int sdp_channel;
+    uint16_t sdp_transaction;
+    /* Volume keys of keyboards (consumer control), for the desktop. */
+    int16_t key_steps;
+    uint8_t key_mutes;
+    /* The last game controller report, for Core reason 27. */
+    btv_hid_extra_event pad_last;
+    uint32_t pad_reports;
+} btc_profiles;
+
+/* Consumer-control and game controller reports, from a classic or Low
+ * Energy HID device: volume keys to the desktop, a controller's keys to
+ * KeyV.  `last` is the usages that were down in the report before. */
+void btp_hid_extras_deliver(btc_core *core, uint8_t link,
+                            const btv_hid_extra_event *e, btv_hid_pad *pad,
+                            uint8_t *pad_attached,
+                            uint16_t last[BTV_XCONSUMER_MAX]);
+/* The controller is gone: its keys are let go. */
+void btp_hid_extras_detach(btc_core *core, btv_hid_pad *pad,
+                           uint8_t *pad_attached);
+/* Volume keys pressed since the last call (steps up positive) and mute
+ * presses; the AVRCP speaker buttons are counted with them by the module. */
+int btp_key_take_steps(btc_core *core);
+unsigned int btp_key_take_mutes(btc_core *core);
+
+/* How long a silent stream is kept going before it is suspended, in
+ * milliseconds; 0 never. */
+void btp_a2dp_set_idle(uint32_t ms);
+
+/* The volume exchange with the desktop (Core reason 26, module_core.c). */
+void btp_avrcp_host_volume(btc_core *core, unsigned int volume);
+int btp_avrcp_absolute(const btc_core *core);
+int btp_avrcp_speaker_volume(const btc_core *core);
+uint32_t btp_avrcp_generation(const btc_core *core);
+int btp_avrcp_take_steps(btc_core *core);
+unsigned int btp_avrcp_take_mutes(btc_core *core);
+
+void btp_init(btc_core *core);
+/* ACL (classic or LE) connected; not yet secured. */
+void btp_link_opened(btc_core *core, uint8_t link);
+/* Classic: authenticated and encrypted.  LE: encrypted. */
+void btp_link_secured(btc_core *core, uint8_t link);
+void btp_link_closed(btc_core *core, uint8_t link);
+/* An incoming L2CAP connection: return the owner to accept, or 0. */
+uint8_t btp_incoming_channel(btc_core *core, uint8_t link, uint16_t psm);
+void btp_channel_open(btc_core *core, int channel);
+void btp_channel_data(btc_core *core, int channel, const uint8_t *data,
+                      size_t bytes);
+void btp_channel_closed(btc_core *core, int channel);
+/* LE fixed channel data (ATT 0x0004, SMP 0x0006). */
+void btp_le_data(btc_core *core, uint8_t link, uint16_t cid,
+                 const uint8_t *data, size_t bytes);
+/* HCI results the LE pairing waits for. */
+void btp_le_encryption(btc_core *core, uint8_t link, uint8_t status);
+/* LE Rand results for pairing. */
+void btp_le_rand(btc_core *core, uint8_t link, uint8_t status,
+                 const uint8_t *data, size_t bytes);
+/* Periodic work: media pacing, timeouts. */
+void btp_pump(btc_core *core);
+/* 1 while a Low Energy link is being set up (connecting, pairing,
+ * encrypting, discovering): a BR/EDR page now could starve it. */
+int btp_le_busy(btc_core *core);
+/* LE advertisement from a device, for reconnecting bonded input devices. */
+void btp_le_advert(btc_core *core, const uint8_t address[6],
+                   uint8_t address_type);
+
+#endif

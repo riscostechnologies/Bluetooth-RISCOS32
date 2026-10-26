@@ -1,0 +1,228 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/* Bounded adaptation of NetBSD hci_event.c inquiry memo handling. */
+#include "hci_inquiry.h"
+#include "hci_frame.h"
+#include <limits.h>
+#include <string.h>
+
+#define INQUIRY_OPCODE 0x0401u
+
+static uint16_t read16(const uint8_t *p)
+{
+    return (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
+}
+
+static int recover(btv_hci_inquiry *inquiry, unsigned int error)
+{
+    inquiry->state = BTV_IQ_RECOVER;
+    inquiry->error = error;
+    return -1;
+}
+
+void btv_hci_inquiry_init(btv_hci_inquiry *inquiry)
+{
+    if (inquiry != 0) memset(inquiry, 0, sizeof(*inquiry));
+}
+
+int btv_hci_inquiry_start(btv_hci_inquiry *inquiry, uint8_t duration,
+                          uint8_t maximum, uint32_t now)
+{
+    if (inquiry == 0 || inquiry->state != BTV_IQ_IDLE || duration == 0 ||
+        duration > 0x30)
+        return 0;
+    inquiry->duration = duration;
+    inquiry->maximum = maximum;
+    inquiry->started = now;
+    inquiry->state = BTV_IQ_QUEUED;
+    return 1;
+}
+
+void btv_hci_inquiry_tick(btv_hci_inquiry *inquiry, uint32_t now)
+{
+    uint32_t limit;
+    if (inquiry == 0 || inquiry->state < BTV_IQ_QUEUED ||
+        inquiry->state > BTV_IQ_ACTIVE)
+        return;
+    limit = (uint32_t)inquiry->duration * 1280u + 5000u;
+    if ((uint32_t)(now - inquiry->started) >= limit)
+        recover(inquiry, BTV_IQ_TIMEOUT);
+}
+
+size_t btv_hci_inquiry_command(btv_hci_inquiry *inquiry, uint8_t *output,
+                               size_t capacity, uint32_t now)
+{
+    uint8_t parameters[5];
+    btv_hci_inquiry_tick(inquiry, now);
+    if (inquiry == 0 || inquiry->state != BTV_IQ_QUEUED)
+        return 0;
+    parameters[0] = 0x33; parameters[1] = 0x8b; parameters[2] = 0x9e;
+    parameters[3] = inquiry->duration; parameters[4] = inquiry->maximum;
+    return btv_hci_command(output, capacity, INQUIRY_OPCODE, parameters, 5);
+}
+
+int btv_hci_inquiry_sent(btv_hci_inquiry *inquiry, uint32_t now)
+{
+    btv_hci_inquiry_tick(inquiry, now);
+    if (inquiry == 0 || inquiry->state != BTV_IQ_QUEUED)
+        return 0;
+    inquiry->submitted = 1;
+    inquiry->state = BTV_IQ_WAIT;
+    return 1;
+}
+
+int btv_hci_inquiry_usb_done(btv_hci_inquiry *inquiry, int success)
+{
+    if (inquiry == 0 || !inquiry->submitted || inquiry->usb_done ||
+        inquiry->state < BTV_IQ_WAIT || inquiry->state > BTV_IQ_ACTIVE)
+        return 0;
+    inquiry->usb_done = 1;
+    if (!success) return recover(inquiry, BTV_IQ_USB_ERROR);
+    if (inquiry->complete_seen && inquiry->status == 0)
+        inquiry->state = BTV_IQ_DONE;
+    return 1;
+}
+
+static btv_inquiry_device *device(btv_hci_inquiry *inquiry,
+                                  const uint8_t address[6])
+{
+    unsigned int index;
+    for (index = 0; index < inquiry->count; ++index)
+        if (memcmp(inquiry->devices[index].address, address, 6) == 0)
+            return &inquiry->devices[index];
+    if (inquiry->count == BTV_INQUIRY_RESULTS)
+    {
+        if (inquiry->dropped != UINT_MAX) ++inquiry->dropped;
+        return 0;
+    }
+    index = inquiry->count++;
+    memset(&inquiry->devices[index], 0, sizeof(inquiry->devices[index]));
+    memcpy(inquiry->devices[index].address, address, 6);
+    return &inquiry->devices[index];
+}
+
+static void eir_fields(btv_inquiry_device *entry, const uint8_t *eir)
+{
+    unsigned int offset, length, type, available, copy, index;
+    uint16_t uuid;
+    offset = 0;
+    while (offset < 240 && eir[offset] != 0)
+    {
+        length = eir[offset];
+        if (length > 239u - offset) return;
+        type = eir[offset + 1];
+        available = length - 1;
+        if ((type == 0x08 || type == 0x09) && entry->name[0] == 0)
+        {
+            copy = available < BTV_INQUIRY_NAME_BYTES - 1 ? available :
+                   BTV_INQUIRY_NAME_BYTES - 1;
+            memcpy(entry->name, eir + offset + 2, copy);
+            entry->name[copy] = 0;
+        }
+        if (type == 0x02 || type == 0x03)
+            for (index = 0; index + 1 < available; index += 2)
+            {
+                uuid = read16(eir + offset + 2 + index);
+                if (uuid == 0x1108 || uuid == 0x111e)
+                    entry->voice_service = 1;
+            }
+        offset += length + 1;
+    }
+}
+
+static void store_result(btv_hci_inquiry *inquiry, const uint8_t *record,
+                         int format, const uint8_t *eir)
+{
+    btv_inquiry_device *entry = device(inquiry, record);
+    if (entry == 0) return;
+    entry->page_scan_rep_mode = record[6];
+    if (format == 0)
+    {
+        memcpy(entry->device_class, record + 9, 3);
+        entry->clock_offset = read16(record + 12);
+    }
+    else
+    {
+        memcpy(entry->device_class, record + 8, 3);
+        entry->clock_offset = read16(record + 11);
+        entry->rssi = (int8_t)record[13];
+        entry->has_rssi = 1;
+    }
+    entry->audio_class = (entry->device_class[1] & 0x1f) == 4;
+    if (eir != 0)
+    {
+        entry->extended = 1;
+        eir_fields(entry, eir);
+    }
+}
+
+int btv_hci_inquiry_event(btv_hci_inquiry *inquiry, const uint8_t *event,
+                          size_t bytes, uint32_t now)
+{
+    size_t expected, records;
+    unsigned int index, count;
+    uint16_t opcode;
+    btv_hci_inquiry_tick(inquiry, now);
+    if (inquiry == 0 || inquiry->state == BTV_IQ_RECOVER) return -1;
+    if (btv_hci_frame_size(BTV_HCI_EVENT, event, bytes, 255, &expected) !=
+        BTV_HCI_COMPLETE || expected != bytes)
+        return recover(inquiry, BTV_IQ_BAD_EVENT);
+    if (event[0] == 0x10)
+        return recover(inquiry, bytes == 3 ? BTV_IQ_HARDWARE_ERROR :
+                       BTV_IQ_BAD_EVENT);
+    if (event[0] == 0x0f)
+    {
+        if (bytes != 6) return recover(inquiry, BTV_IQ_BAD_EVENT);
+        opcode = read16(event + 4);
+        if (opcode != INQUIRY_OPCODE || !inquiry->submitted) return 0;
+        if (inquiry->status_seen) return 0;
+        inquiry->status_seen = 1;
+        inquiry->status = event[2];
+        inquiry->state = event[2] == 0 ? BTV_IQ_ACTIVE : BTV_IQ_REJECTED;
+        inquiry->error = event[2] == 0 ? BTV_IQ_NO_ERROR : BTV_IQ_COMMAND_ERROR;
+        return 1;
+    }
+    if (event[0] == 0x01)
+    {
+        if (bytes != 3 || !inquiry->status_seen || inquiry->state != BTV_IQ_ACTIVE)
+            return recover(inquiry, BTV_IQ_BAD_EVENT);
+        inquiry->status = event[2];
+        inquiry->complete_seen = 1;
+        if (event[2] != 0)
+        {
+            inquiry->state = BTV_IQ_REJECTED;
+            inquiry->error = BTV_IQ_EVENT_ERROR;
+        }
+        else if (inquiry->usb_done)
+            inquiry->state = BTV_IQ_DONE;
+        return 1;
+    }
+    if (inquiry->state != BTV_IQ_ACTIVE) return 0;
+    if (event[0] == 0x02 || event[0] == 0x22)
+    {
+        if (bytes < 3) return recover(inquiry, BTV_IQ_BAD_EVENT);
+        count = event[2];
+        records = event[0] == 0x02 ? 14u : 14u;
+        if (count == 0 || bytes != 3u + (size_t)count * records)
+            return recover(inquiry, BTV_IQ_BAD_EVENT);
+        for (index = 0; index < count; ++index)
+            store_result(inquiry, event + 3 + index * records,
+                         event[0] == 0x02 ? 0 : 1, 0);
+        return 1;
+    }
+    if (event[0] == 0x2f)
+    {
+        if (bytes != 257 || event[2] != 1)
+            return recover(inquiry, BTV_IQ_BAD_EVENT);
+        store_result(inquiry, event + 3, 1, event + 17);
+        return 1;
+    }
+    return 0;
+}
+
+const btv_inquiry_device *btv_hci_inquiry_result(
+                          const btv_hci_inquiry *inquiry, unsigned int index)
+{
+    return inquiry != 0 && inquiry->state == BTV_IQ_DONE &&
+           index < inquiry->count ? &inquiry->devices[index] : 0;
+}

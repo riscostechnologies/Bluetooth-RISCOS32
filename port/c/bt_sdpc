@@ -1,0 +1,102 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        bt_sdpc
+ * Purpose:     See bt_sdpc.h.
+ * Licence:     BSD-2-Clause (see LICENSE).
+ ******************************************************************/
+#include "bt_sdpc.h"
+#include <string.h>
+
+void btp_sdpc_start(btp_sdpc *c, uint16_t uuid, const uint16_t *attributes,
+                    unsigned int count, uint16_t transaction)
+{
+    memset(c, 0, sizeof *c);
+    if (count > BTP_SDPC_ATTRIBUTES) count = BTP_SDPC_ATTRIBUTES;
+    memcpy(c->attributes, attributes, count * sizeof attributes[0]);
+    c->attribute_count = (uint8_t)count;
+    c->uuid = uuid;
+    c->transaction = transaction;
+    c->state = BTP_SDPC_SEND;
+}
+
+size_t btp_sdpc_request(btp_sdpc *c, uint8_t *out, size_t room, uint32_t now)
+{
+    size_t n = 5, i;
+    size_t needed = 5 + 5 + 2 + 2 + 3u * BTP_SDPC_ATTRIBUTES + 1 + 16;
+    if (c->state != BTP_SDPC_SEND || room < needed) return 0;
+    out[0] = 0x06;                                    /* ServiceSearchAttribute */
+    out[1] = (uint8_t)(c->transaction >> 8);
+    out[2] = (uint8_t)c->transaction;
+    out[n++] = 0x35; out[n++] = 3;                    /* the pattern: one UUID */
+    out[n++] = 0x19; out[n++] = (uint8_t)(c->uuid >> 8);
+    out[n++] = (uint8_t)c->uuid;
+    out[n++] = (uint8_t)(BTP_SDPC_BYTES >> 8);        /* maximum attribute bytes */
+    out[n++] = (uint8_t)BTP_SDPC_BYTES;
+    out[n++] = 0x35; out[n++] = (uint8_t)(3u * c->attribute_count);
+    for (i = 0; i < c->attribute_count; ++i)
+    {
+        out[n++] = 0x09;
+        out[n++] = (uint8_t)(c->attributes[i] >> 8);
+        out[n++] = (uint8_t)c->attributes[i];
+    }
+    out[n++] = c->continuation_bytes;
+    memcpy(out + n, c->continuation, c->continuation_bytes);
+    n += c->continuation_bytes;
+    out[3] = (uint8_t)((n - 5) >> 8);
+    out[4] = (uint8_t)(n - 5);
+    c->state = BTP_SDPC_WAIT;
+    c->sent_at = now;
+    /* The next transaction identifier, for a continuation. */
+    return n;
+}
+
+int btp_sdpc_response(btp_sdpc *c, const uint8_t *pdu, size_t bytes)
+{
+    size_t count, cont;
+    if (c->state != BTP_SDPC_WAIT || bytes < 5) return 0;
+    if (((unsigned)pdu[1] << 8 | pdu[2]) != c->transaction) return 0;
+    if (pdu[0] == 0x01)                               /* error response */
+    {
+        c->state = BTP_SDPC_FAILED;
+        return -1;
+    }
+    if (pdu[0] != 0x07 || bytes < 8) return 0;
+    count = (size_t)(pdu[5] << 8 | pdu[6]);
+    if (7 + count + 1 > bytes || c->used + count > sizeof c->data)
+    {
+        c->state = BTP_SDPC_FAILED;
+        return -1;
+    }
+    memcpy(c->data + c->used, pdu + 7, count);
+    c->used = (uint16_t)(c->used + count);
+    cont = pdu[7 + count];
+    if (7 + count + 1 + cont > bytes || cont > sizeof c->continuation)
+    {
+        c->state = BTP_SDPC_FAILED;
+        return -1;
+    }
+    if (cont == 0)
+    {
+        c->state = BTP_SDPC_DONE;
+        return 1;
+    }
+    memcpy(c->continuation, pdu + 7 + count + 1, cont);
+    c->continuation_bytes = (uint8_t)cont;
+    ++c->transaction;
+    c->state = BTP_SDPC_SEND;
+    return 0;
+}
+
+void btp_sdpc_tick(btp_sdpc *c, uint32_t now, uint32_t timeout_ms)
+{
+    if (c->state == BTP_SDPC_WAIT && now - c->sent_at >= timeout_ms)
+        c->state = BTP_SDPC_FAILED;
+}
+
+const uint8_t *btp_sdpc_result(const btp_sdpc *c, size_t *bytes)
+{
+    if (c->state != BTP_SDPC_DONE) return 0;
+    *bytes = c->used;
+    return c->data;
+}

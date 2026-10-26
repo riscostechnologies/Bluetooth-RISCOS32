@@ -1,0 +1,263 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        hid_input
+ * Purpose:     Turns HID boot-protocol keyboard and mouse reports into
+ *              RISC OS low-level key numbers and pointer movement, the
+ *              way RISC OS 5's USBDriver (usbkboard, usbmouse) does.
+ *              Pure: no SWIs, no statics; the RISC OS side is hid_riscos.
+ ******************************************************************/
+#ifndef BTV_HID_INPUT_H
+#define BTV_HID_INPUT_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+/* Low-level key numbers (KeyV reasons 1/2), from hdr:Keyboard
+ * (RiscOS/Sources/Programmer/HdrSrc/hdr/Keyboard). Only those the
+ * boot-protocol table and the tests name are listed. */
+#define BTV_KEY_Escape          0x00u
+#define BTV_KEY_Function1       0x01u
+#define BTV_KEY_Function2       0x02u
+#define BTV_KEY_Function3       0x03u
+#define BTV_KEY_Function4       0x04u
+#define BTV_KEY_Function5       0x05u
+#define BTV_KEY_Function6       0x06u
+#define BTV_KEY_Function7       0x07u
+#define BTV_KEY_Function8       0x08u
+#define BTV_KEY_Function9       0x09u
+#define BTV_KEY_Function10      0x0Au
+#define BTV_KEY_Function11      0x0Bu
+#define BTV_KEY_Function12      0x0Cu
+#define BTV_KEY_Print           0x0Du
+#define BTV_KEY_ScrollLock      0x0Eu
+#define BTV_KEY_Break           0x0Fu
+#define BTV_KEY_BackTick        0x10u
+#define BTV_KEY_Digit1          0x11u
+#define BTV_KEY_Digit2          0x12u
+#define BTV_KEY_Digit3          0x13u
+#define BTV_KEY_Digit4          0x14u
+#define BTV_KEY_Digit5          0x15u
+#define BTV_KEY_Digit6          0x16u
+#define BTV_KEY_Digit7          0x17u
+#define BTV_KEY_Digit8          0x18u
+#define BTV_KEY_Digit9          0x19u
+#define BTV_KEY_Digit0          0x1Au
+#define BTV_KEY_Minus           0x1Bu
+#define BTV_KEY_Equals          0x1Cu
+#define BTV_KEY_Pound           0x1Du
+#define BTV_KEY_BackSpace       0x1Eu
+#define BTV_KEY_Insert          0x1Fu
+#define BTV_KEY_Home            0x20u
+#define BTV_KEY_PageUp          0x21u
+#define BTV_KEY_NumLock         0x22u
+#define BTV_KEY_NumPadSlash     0x23u
+#define BTV_KEY_NumPadStar      0x24u
+#define BTV_KEY_NumPadHash      0x25u
+#define BTV_KEY_Tab             0x26u
+#define BTV_KEY_LetterQ         0x27u
+#define BTV_KEY_LetterW         0x28u
+#define BTV_KEY_LetterE         0x29u
+#define BTV_KEY_LetterR         0x2Au
+#define BTV_KEY_LetterT         0x2Bu
+#define BTV_KEY_LetterY         0x2Cu
+#define BTV_KEY_LetterU         0x2Du
+#define BTV_KEY_LetterI         0x2Eu
+#define BTV_KEY_LetterO         0x2Fu
+#define BTV_KEY_LetterP         0x30u
+#define BTV_KEY_OpenSquare      0x31u
+#define BTV_KEY_CloseSquare     0x32u
+#define BTV_KEY_BackSlash       0x33u
+#define BTV_KEY_Delete          0x34u
+#define BTV_KEY_Copy            0x35u /* End */
+#define BTV_KEY_PageDown        0x36u
+#define BTV_KEY_NumPad7         0x37u
+#define BTV_KEY_NumPad8         0x38u
+#define BTV_KEY_NumPad9         0x39u
+#define BTV_KEY_NumPadMinus     0x3Au
+#define BTV_KEY_CtrlLeft        0x3Bu
+#define BTV_KEY_LetterA         0x3Cu
+#define BTV_KEY_LetterS         0x3Du
+#define BTV_KEY_LetterD         0x3Eu
+#define BTV_KEY_LetterF         0x3Fu
+#define BTV_KEY_LetterG         0x40u
+#define BTV_KEY_LetterH         0x41u
+#define BTV_KEY_LetterJ         0x42u
+#define BTV_KEY_LetterK         0x43u
+#define BTV_KEY_LetterL         0x44u
+#define BTV_KEY_SemiColon       0x45u
+#define BTV_KEY_Tick            0x46u
+#define BTV_KEY_Return          0x47u
+#define BTV_KEY_NumPad4         0x48u
+#define BTV_KEY_NumPad5         0x49u
+#define BTV_KEY_NumPad6         0x4Au
+#define BTV_KEY_NumPadPlus      0x4Bu
+#define BTV_KEY_ShiftLeft       0x4Cu
+#define BTV_KEY_NotFittedLeft   0x4Du
+#define BTV_KEY_LetterZ         0x4Eu
+#define BTV_KEY_LetterX         0x4Fu
+#define BTV_KEY_LetterC         0x50u
+#define BTV_KEY_LetterV         0x51u
+#define BTV_KEY_LetterB         0x52u
+#define BTV_KEY_LetterN         0x53u
+#define BTV_KEY_LetterM         0x54u
+#define BTV_KEY_Comma           0x55u
+#define BTV_KEY_Dot             0x56u
+#define BTV_KEY_Slash           0x57u
+#define BTV_KEY_ShiftRight      0x58u
+#define BTV_KEY_CursorUp        0x59u
+#define BTV_KEY_NumPad1         0x5Au
+#define BTV_KEY_NumPad2         0x5Bu
+#define BTV_KEY_NumPad3         0x5Cu
+#define BTV_KEY_CapsLock        0x5Du
+#define BTV_KEY_AltLeft         0x5Eu
+#define BTV_KEY_Space           0x5Fu
+#define BTV_KEY_AltRight        0x60u
+#define BTV_KEY_CtrlRight       0x61u
+#define BTV_KEY_CursorLeft      0x62u
+#define BTV_KEY_CursorDown      0x63u
+#define BTV_KEY_CursorRight     0x64u
+#define BTV_KEY_NumPad0         0x65u
+#define BTV_KEY_NumPadDot       0x66u
+#define BTV_KEY_NumPadEnter     0x67u
+#define BTV_KEY_AcornLeft       0x68u
+#define BTV_KEY_AcornRight      0x69u
+#define BTV_KEY_Menu            0x6Au
+#define BTV_KEY_NoConvert       0x6Bu
+#define BTV_KEY_Convert         0x6Cu
+#define BTV_KEY_Kana            0x6Du
+#define BTV_KEY_NotFittedRight  0x6Eu
+#define BTV_KEY_LeftMouse       0x70u /* Select */
+#define BTV_KEY_CentreMouse     0x71u /* Menu */
+#define BTV_KEY_RightMouse      0x72u /* Adjust */
+
+/* KeyV_NotifyLEDState R1 flags (hdr:Keyboard). */
+#define BTV_RISCOS_LED_CAPS     1u
+#define BTV_RISCOS_LED_NUM      2u
+#define BTV_RISCOS_LED_SCROLL   4u
+/* Boot keyboard output report bits (HID 1.11 appendix B). */
+#define BTV_HID_LED_NUM         1u
+#define BTV_HID_LED_CAPS        2u
+#define BTV_HID_LED_SCROLL      4u
+
+/* Classic HID (Bluetooth HID profile 1.1) transaction headers and boot
+ * report IDs as they appear on the interrupt channel in boot mode. */
+#define BTV_HID_DATA_INPUT      0xA1u
+#define BTV_HID_DATA_OUTPUT     0xA2u
+#define BTV_HID_BOOT_KEYBOARD   1u
+#define BTV_HID_BOOT_MOUSE      2u
+
+/* Where the events go.  The same shape serves the keyboard (key only) and
+ * the mouse (key for buttons, pointer, wheel); unused members may be NULL.
+ * key:     KeyV KeyDown (down != 0) or KeyUp, with a BTV_KEY_* number.
+ * pointer: relative move in RISC OS sense (x right, y UP), unscaled, as
+ *          for PointerReason_Report.
+ * wheel:   PointerReason_WheelChange: dz negative = up/away (kernel
+ *          convention), dw positive = right, extra = buttons 4-8 as
+ *          bits 0-4 (PointerReason_WheelChange R2). */
+typedef struct btv_hid_sink
+{
+    void *context;
+    void (*key)(void *context, int down, unsigned int riscos_key);
+    void (*pointer)(void *context, int dx, int dy);
+    void (*wheel)(void *context, int dz, int dw, unsigned int extra);
+    /* A mapped extra button went down (button number, 4 and up). Only
+     * called for buttons set in the mouse's `mapped` mask. */
+    void (*launch)(void *context, unsigned int button);
+} btv_hid_sink;
+
+typedef struct btv_hid_keyboard
+{
+    uint8_t last[8];  /* previous accepted report (modifiers, 0, keys) */
+    uint8_t down[16]; /* non-modifier key numbers < 128 reported down */
+} btv_hid_keyboard;
+
+#define BTV_HID_MOUSE_PAN_BYTE4 1u /* report byte 4 is AC Pan */
+
+/* How a report-mode mouse's motion and wheel are turned into RISC OS
+ * pointer movement. The kernel applies the configured mouse speed
+ * (Configure > Mouse, CMOS MouseStep, OS_Word 21,1) to every PointerV
+ * report, USB and Bluetooth alike, so that is not done here; what is done
+ * here is the part a high-resolution mouse needs: a scale for its counts,
+ * a gentle acceleration, and the fractions of a pixel kept between reports
+ * so that slow movement is not lost. */
+typedef struct btv_hid_mouse_options
+{
+    int32_t scale_q8;   /* 256 = 1.0: counts to RISC OS units */
+    uint8_t accel;      /* gentle acceleration on */
+    uint8_t natural;    /* wheel direction reversed */
+    uint8_t hscroll;    /* horizontal scroll (AC Pan) on */
+    uint8_t pad;
+    int32_t wheel_unit; /* wheel counts to a notch (1: already notches) */
+    uint32_t mapped;    /* bit n: button n+1 (4 and up) starts an application
+                           and is not passed on as a click */
+} btv_hid_mouse_options;
+
+typedef struct btv_hid_mouse
+{
+    uint8_t buttons;  /* byte 0 of the previous report */
+    uint8_t flags;    /* BTV_HID_MOUSE_* ; init leaves 0 */
+    btv_hid_mouse_options opt;
+    int32_t rem_x, rem_y, rem_wheel, rem_pan;   /* what has not been sent */
+    uint32_t down_mapped;                       /* mapped buttons held */
+    uint32_t options_epoch;  /* which reading of the variables `opt` holds */
+} btv_hid_mouse;
+
+/* The gain (256 = 1.0) for a report of this size: 1.0 up to 3 counts, rising
+ * to 2.0 at 19 and beyond. */
+int32_t btv_hid_accel_q8(int32_t counts);
+/* d * gain (q8) plus the remainder so far, in whole units; the rest stays in
+ * *rem. Truncates towards zero, so a remainder keeps its sign. */
+int32_t btv_hid_scale(int32_t d, int32_t gain_q8, int32_t *rem);
+/* Counts into whole steps of `unit`, the remainder kept. */
+int32_t btv_hid_steps(int32_t counts, int32_t unit, int32_t *rem);
+
+void btv_hid_keyboard_init(btv_hid_keyboard *k);
+/* report = boot keyboard input report: modifiers, reserved, 6 keycodes.
+ * Shorter reports are ignored; extra bytes are ignored.  A report with
+ * keycode[0] == 0x01 (ErrorRollOver) is ignored, as usbkboard does.
+ * Emits modifier changes, then new keys down, then keys up. */
+void btv_hid_keyboard_report(btv_hid_keyboard *k, const uint8_t *report,
+                             size_t bytes, const btv_hid_sink *sink);
+/* Key up for everything held, modifiers included (disconnect). */
+void btv_hid_keyboard_release_all(btv_hid_keyboard *k,
+                                  const btv_hid_sink *sink);
+/* Forget what RISC OS was told without emitting anything, so the next
+ * report re-sends every held key: use after KeyV_EnableDrivers, which the
+ * kernel issues once it has cleared its own key-down table. */
+void btv_hid_keyboard_forget(btv_hid_keyboard *k);
+/* RISC OS LED flags (KeyV_NotifyLEDState R1) -> boot output report byte. */
+uint8_t btv_hid_keyboard_leds(unsigned int riscos_led_flags);
+/* HID usage (keyboard page) -> BTV_KEY_*, or -1 when it has none. */
+int btv_hid_key_number(unsigned int usage);
+
+void btv_hid_mouse_init(btv_hid_mouse *m);
+/* Boot mouse report: buttons, dx, dy[, wheel[, pan]] (3+ bytes; shorter
+ * reports are ignored).  Button bit 0 (left) -> LeftMouse = Select,
+ * bit 1 (right) -> RightMouse = Adjust, bit 2 (middle) -> CentreMouse =
+ * Menu, bits 3-7 -> wheel `extra`.  dy is negated (HID y is down); the
+ * wheel is negated (HID wheel positive is away).  Pan is read from byte 4
+ * only with BTV_HID_MOUSE_PAN_BYTE4, since boot mode defines no pan. */
+void btv_hid_mouse_report(btv_hid_mouse *m, const uint8_t *report,
+                          size_t bytes, const btv_hid_sink *sink);
+/* The same for a report already decoded (hid_report): HID's sense, y down
+ * and wheel positive away; buttons bit n is button n+1, of which the first
+ * three become Select, Adjust and Menu and bits 3-7 travel with the wheel. */
+void btv_hid_mouse_event(btv_hid_mouse *m, uint32_t buttons, int32_t dx,
+                         int32_t dy, int32_t wheel, int32_t pan,
+                         const btv_hid_sink *sink);
+/* Button up for everything held (disconnect). */
+void btv_hid_mouse_release_all(btv_hid_mouse *m, const btv_hid_sink *sink);
+
+/* Classic HID interrupt-channel frame "A1 id payload...": returns the boot
+ * report id (1 keyboard, 2 mouse, or any other id) and the payload, or 0
+ * when the frame is not an input DATA frame with a report id.  BLE boot
+ * report characteristics (0x2A22, 0x2A33) carry the payload alone. */
+unsigned int btv_hid_classic_input(const uint8_t *frame, size_t bytes,
+                                   const uint8_t **payload,
+                                   size_t *payload_bytes);
+/* Writes "A2 01 leds" (interrupt-channel output report); returns 3.  BLE
+ * writes the single LED byte to Boot Keyboard Output Report (0x2A32). */
+size_t btv_hid_classic_led_frame(uint8_t *frame, uint8_t leds);
+
+#endif

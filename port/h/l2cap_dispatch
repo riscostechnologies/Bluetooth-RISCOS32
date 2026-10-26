@@ -1,0 +1,43 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#ifndef BTV_L2CAP_DISPATCH_H
+#define BTV_L2CAP_DISPATCH_H
+#include "l2cap_channel.h"
+#define BTV_L2CAP_CHANNELS 8
+#define BTV_L2CAP_SIGNAL_MTU 672
+
+typedef struct btv_l2cap_dispatch
+{
+    btv_l2cap_channel channels[BTV_L2CAP_CHANNELS];
+    unsigned int next_identifier, next_channel, failed;
+    uint8_t input[BTV_L2CAP_SIGNAL_MTU + 4];
+    uint8_t response[BTV_L2CAP_SIGNAL_MTU + 4];
+    size_t input_bytes, input_offset, response_bytes;
+} btv_l2cap_dispatch;
+
+/* One dispatcher per established classic ACL link, serialized by its owner.
+ * Initialize only after all prior traffic/callbacks for that link are drained.
+ * Eight channel lifetimes and 255 request identifiers, with no reuse on this
+ * link. Exhaustion requires a new ACL connection; no wrapping into stale IDs. */
+void btv_l2cap_dispatch_init(btv_l2cap_dispatch *dispatch);
+uint16_t btv_l2cap_dispatch_connect(btv_l2cap_dispatch *dispatch,
+                                   uint16_t psm, uint16_t receive_mtu, uint32_t now);
+int btv_l2cap_dispatch_disconnect(btv_l2cap_dispatch *dispatch,
+                                 uint16_t local_cid, uint32_t now);
+const btv_l2cap_channel *btv_l2cap_dispatch_channel(const btv_l2cap_dispatch *dispatch,
+                                                  uint16_t local_cid);
+/* Whole, reassembled L2CAP PDU. 1 copied/consumed, 2 input slot busy (retry),
+ * 0 different CID, -1 malformed or failed link. Fully validates batches before
+ * dispatch. Input may be released after 1 even if commands await output space.
+ * On oversize input a Reject is queued, provided a complete valid PDU is given. */
+int btv_l2cap_dispatch_receive(btv_l2cap_dispatch *dispatch,
+                              const uint8_t *pdu, size_t bytes, uint32_t now);
+/* Copies one signaling PDU. Call sent immediately after the parent's ordered
+ * ACL TX accepts its copy, before any other dispatcher operation. token is a
+ * queue selection, not a USB ticket. BUSY at ACL TX means retry without sent. */
+size_t btv_l2cap_dispatch_output(btv_l2cap_dispatch *dispatch, uint8_t *output,
+                                size_t capacity, unsigned int *token, uint32_t now);
+int btv_l2cap_dispatch_sent(btv_l2cap_dispatch *dispatch, unsigned int token);
+void btv_l2cap_dispatch_tick(btv_l2cap_dispatch *dispatch, uint32_t now);
+void btv_l2cap_dispatch_abort(btv_l2cap_dispatch *dispatch);
+#endif

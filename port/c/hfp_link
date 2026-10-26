@@ -1,0 +1,42 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#include "hfp_link.h"
+#include <string.h>
+int btv_hfp_link_start(btv_hfp_link *link, btv_rfcomm_session *session, const uint8_t indicators[7])
+{
+    if (link == NULL || session == NULL || session->state != BTV_RS_READY) return 0;
+    memset(link, 0, sizeof(*link));
+    if (!btv_hfp_ag_init(&link->gateway, indicators)) return 0;
+    link->session = session;
+    return 1;
+}
+int btv_hfp_link_pump(btv_hfp_link *link, uint32_t now)
+{
+    unsigned int i;
+    size_t bytes;
+    uint8_t byte;
+    if (link == NULL || link->session == NULL || link->failed) return -1;
+    btv_rfcomm_session_tick(link->session, now);
+    if (link->session->state >= BTV_RS_CLOSING)
+    { link->failed = 1; return -1; }
+    if (link->session->state != BTV_RS_READY) return 0;
+    for (i = 0; !link->gateway.response_bytes && i < 256; ++i)
+    {
+        if (!btv_rfcomm_session_read(link->session, &byte, 1)) break;
+        if (btv_hfp_ag_feed(&link->gateway, &byte, 1) != 1 || link->gateway.input.failed)
+        {
+            link->failed = 1;
+            btv_rfcomm_session_abort(link->session);
+            return -1;
+        }
+    }
+    bytes = btv_hfp_ag_output(&link->gateway, link->reply, sizeof(link->reply));
+    if (!bytes || !btv_rfcomm_session_write(link->session, link->reply, bytes)) return 0;
+    if (!btv_hfp_ag_sent(&link->gateway))
+    {
+        link->failed = 1;
+        btv_rfcomm_session_abort(link->session);
+        return -1;
+    }
+    return 1;
+}

@@ -1,0 +1,215 @@
+/*-
+ * Copyright (c) 2009 The NetBSD Foundation, Inc.
+ * All rights reserved.
+ *
+ * This code is derived from software contributed to The NetBSD Foundation
+ * by Iain Hibbert.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE NETBSD FOUNDATION, INC. AND CONTRIBUTORS
+ * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE FOUNDATION OR CONTRIBUTORS
+ * BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+/* SDP attribute interpretation using the pinned NetBSD UUID matching model
+ * and SDP definitions. Explicit slices replace UUID and cursor dependencies. */
+#include "sdp_record.h"
+#include <string.h>
+
+static uint16_t read16(const uint8_t *p)
+{
+    return (uint16_t)(((unsigned int)p[0] << 8) | p[1]);
+}
+
+static int next(btv_sdp_element *container, btv_sdp_element *element)
+{
+    if (!btv_sdp_element_read(container->data, container->bytes, element))
+        return 0;
+    container->data += element->total;
+    container->bytes -= element->total;
+    return 1;
+}
+
+static int sequence(const btv_sdp_element *element)
+{
+    return (element->descriptor & 0xf8) == 0x30;
+}
+
+static int uuid(const btv_sdp_element *element, uint16_t value)
+{
+    static const uint8_t suffix[12] = {
+        0, 0, 0x10, 0, 0x80, 0, 0, 0x80, 0x5f, 0x9b, 0x34, 0xfb
+    };
+    if (element->descriptor == 0x19)
+        return read16(element->data) == value;
+    if (element->descriptor == 0x1a || element->descriptor == 0x1c)
+    {
+        if (element->data[0] != 0 || element->data[1] != 0 ||
+            read16(element->data + 2) != value)
+            return 0;
+        return element->descriptor == 0x1a || memcmp(element->data + 4, suffix, 12) == 0;
+    }
+    return 0;
+}
+
+static int classes(btv_sdp_element list, uint16_t service)
+{
+    btv_sdp_element item;
+    int matched;
+    if (!sequence(&list))
+        return -1;
+    matched = 0;
+    while (list.bytes != 0)
+    {
+        if (!next(&list, &item) || (item.descriptor & 0xf8) != 0x18)
+            return -1;
+        if (uuid(&item, service))
+            matched = 1;
+    }
+    return matched;
+}
+
+static int protocols(btv_sdp_element list, uint8_t *channel)
+{
+    btv_sdp_element layer, item;
+    unsigned int index;
+    int supported;
+    if (!sequence(&list))
+        return -1;
+    index = 0;
+    supported = 1;
+    while (list.bytes != 0)
+    {
+        if (!next(&list, &layer) || !sequence(&layer) || !next(&layer, &item) ||
+            (item.descriptor & 0xf8) != 0x18)
+            return -1;
+        if (index == 0 && uuid(&item, 0x0100))
+        {
+            if (layer.bytes != 0)
+            {
+                if (!next(&layer, &item) || item.descriptor != 0x09 || layer.bytes != 0)
+                    return -1;
+                if (read16(item.data) != 3)
+                    supported = 0;
+            }
+        }
+        else if (index == 1 && uuid(&item, 3))
+        {
+            if (!next(&layer, &item) || item.descriptor != 0x08 || layer.bytes != 0 ||
+                item.data[0] < 1 || item.data[0] > 30)
+                return -1;
+            *channel = item.data[0];
+        }
+        else
+            supported = 0;
+        ++index;
+    }
+    return supported && index == 2;
+}
+
+static int profiles(btv_sdp_element list, uint16_t service, btv_sdp_service *result)
+{
+    btv_sdp_element entry, name, version;
+    if (!sequence(&list))
+        return 0;
+    while (list.bytes != 0)
+    {
+        if (!next(&list, &entry) || !sequence(&entry) || !next(&entry, &name) ||
+            (name.descriptor & 0xf8) != 0x18 || !next(&entry, &version) ||
+            version.descriptor != 0x09 || entry.bytes != 0)
+            return 0;
+        if (uuid(&name, service))
+        {
+            if (result->has_profile_version)
+                return 0;
+            result->has_profile_version = 1;
+            result->profile_version = read16(version.data);
+        }
+    }
+    return 1;
+}
+
+int btv_sdp_record_find(const uint8_t *data, size_t bytes, uint16_t service,
+                        btv_sdp_service *result)
+{
+    btv_sdp_element outer, record, key, value;
+    btv_sdp_service candidate, selected;
+    unsigned int count, last, attribute, have_last;
+    int class_match, protocol_match, status;
+    if (result == NULL || service == 0 || !btv_sdp_data_valid(data, bytes) ||
+        !btv_sdp_element_read(data, bytes, &outer) || !sequence(&outer))
+        return -1;
+    count = 0;
+    memset(&selected, 0, sizeof(selected));
+    while (outer.bytes != 0)
+    {
+        if (!next(&outer, &record) || !sequence(&record))
+            return -1;
+        memset(&candidate, 0, sizeof(candidate));
+        candidate.service = service;
+        class_match = protocol_match = 0;
+        last = have_last = 0;
+        while (record.bytes != 0)
+        {
+            if (!next(&record, &key) || key.descriptor != 0x09 || !next(&record, &value))
+                return -1;
+            attribute = read16(key.data);
+            if (have_last && attribute <= last)
+                return -1;
+            last = attribute;
+            have_last = 1;
+            switch (attribute)
+            {
+                case 1:
+                    class_match = classes(value, service);
+                    if (class_match < 0)
+                        return -1;
+                    break;
+                case 4:
+                    protocol_match = protocols(value, &candidate.rfcomm_channel);
+                    if (protocol_match < 0)
+                        return -1;
+                    break;
+                case 9:
+                    status = profiles(value, service, &candidate);
+                    if (!status)
+                        return -1;
+                    break;
+                case 0x0311:
+                    if (value.descriptor != 0x09)
+                        return -1;
+                    candidate.has_features = 1;
+                    candidate.features = read16(value.data);
+                    break;
+                default:
+                    break;
+            }
+        }
+        if (class_match && protocol_match)
+        {
+            selected = candidate;
+            ++count;
+        }
+    }
+    if (count > 1)
+        return -2;
+    if (count == 0)
+        return 0;
+    *result = selected;
+    return 1;
+}

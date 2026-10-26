@@ -1,0 +1,21 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/* Recovery: make BluetoothVoice hand its audio device back to SoundDMA.
+ * A device left registered by a dead instance aborts SoundDMA (&FC052230)
+ * and can lock the machine, so this is worth running before the module is
+ * replaced by hand. */
+#include <kernel.h>
+#include <stdio.h>
+#include <string.h>
+int main(void)
+{
+    _kernel_swi_regs r;
+    _kernel_oserror *e;
+    memset(&r, 0, sizeof(r));
+    r.r[1] = 6;
+    e = _kernel_swi(0x000D7BC8, &r, &r);
+    if (e != NULL) { printf("failed: %s\n", e->errmess); return 1; }
+    printf("sound device: was &%X now &%X (bit 0 registered, 1 running, "
+           "2 stale)\n", r.r[1], r.r[2]);
+    return (r.r[2] & 1) ? 1 : 0;
+}

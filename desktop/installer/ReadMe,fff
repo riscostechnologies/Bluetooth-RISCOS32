@@ -1,0 +1,38 @@
+Bluetooth for RISC OS - VERSION
+===============================
+
+What it does
+  Plays the computer's sound through Bluetooth speakers and headphones
+  (A2DP), and works with Bluetooth mice and keyboards, classic and Low
+  Energy, through a USB Bluetooth adapter.
+
+What you need
+  RISC OS 5 on a Raspberry Pi (tested on a CM4 with RISC OS 5.31).
+  Other RISC OS 5 machines with working USB 2 host drivers, such as a
+  Pinebook Pro, should work with a USB adapter; on them the Pi USB
+  drivers in the package are left alone.
+  A USB Bluetooth adapter with a CSR8510 chip, such as the TP-Link UB400.
+  SharedUnixLibrary 1.16 or later (a copy is included).
+
+Installing
+  1. Plug in the adapter.
+  2. Double-click !Install and click Install.
+  The application goes into !Boot.Resources, the settings plug-in into
+  Configure, and two start-up entries are added: one loads the drivers
+  before the desktop starts, one starts the icon bar task. Bluetooth is
+  running as soon as Install finishes.
+
+Using it
+  Click the Bluetooth icon on the icon bar, put your device in pairing
+  mode, click Scan, choose the device and click Connect. Paired devices
+  come back by themselves after a restart; a sleeping mouse or keyboard
+  comes back when it wakes. See !Help inside !Bluetooth for more.
+
+Removing
+  Double-click !Install and click Remove. Your pairings stay in
+  Choices:Bluetooth in case you install again.
+
+Known limits
+  Audio uses SBC at a modest bitrate; quality depends on the radio link,
+  so keep the adapter clear of the computer (a short USB extension lead
+  helps). Headset microphones (HFP) are not supported in this version.

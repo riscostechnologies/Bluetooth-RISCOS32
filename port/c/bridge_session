@@ -1,0 +1,276 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/* One native controller session from initialization through CVSD voice. */
+#include "bridge_session.h"
+#include <string.h>
+
+static int fail(btv_bridge_session *session, unsigned int error)
+{
+    session->error = error;
+    session->state = BTV_BX_FAILED;
+    return -1;
+}
+
+int btv_bridge_session_start(btv_bridge_session *session, int capture,
+                             uint32_t now)
+{
+    static const uint8_t pin[] = {'0','0','0','0'};
+    btv_bridge_session_options options;
+    if (capture != 0 && capture != 1) return 0;
+    memset(&options, 0, sizeof(options));
+    options.capture = (uint8_t)capture;
+    memcpy(options.pin, pin, sizeof(pin));
+    options.pin_bytes = sizeof(pin);
+    return btv_bridge_session_start_with_options(session, &options, now);
+}
+
+int btv_bridge_session_start_with_options(btv_bridge_session *session,
+                             const btv_bridge_session_options *options,
+                             uint32_t now)
+{
+    if (session == 0 || options == 0 || options->capture > 1 ||
+        options->address_valid > 1 || options->pin_bytes > 16 ||
+        options->scan_only > 1) return 0;
+    memset(session, 0, sizeof(*session));
+    if (!btv_bridge_controller_start(&session->controller, now))
+    {
+        session->error = session->controller.error;
+        session->state = BTV_BX_FAILED;
+        return 0;
+    }
+    session->capture = options->capture;
+    session->address_valid = options->address_valid;
+    session->scan_only = options->scan_only;
+    memcpy(session->address, options->address, sizeof(session->address));
+    memcpy(session->pin, options->pin, options->pin_bytes);
+    session->pin_bytes = options->pin_bytes;
+    session->state = BTV_BX_BOOTING;
+    return 1;
+}
+
+static int choose(const btv_bridge_session *session, unsigned int *selected)
+{
+    const btv_inquiry_device *device;
+    const btv_hci_inquiry *inquiry;
+    unsigned int index, fallback;
+    inquiry = &session->controller.inquiry;
+    fallback = BTV_INQUIRY_RESULTS;
+    for (index = 0; index < inquiry->count; ++index)
+    {
+        device = btv_hci_inquiry_result(inquiry, index);
+        if (device == 0) continue;
+        if (session->address_valid)
+        {
+            if (memcmp(device->address, session->address, 6) == 0)
+            {
+                *selected = index;
+                return 1;
+            }
+            continue;
+        }
+        if (device->voice_service)
+        {
+            *selected = index;
+            return 1;
+        }
+        if (device->audio_class && fallback == BTV_INQUIRY_RESULTS)
+            fallback = index;
+    }
+    if (fallback == BTV_INQUIRY_RESULTS) return 0;
+    *selected = fallback;
+    return 1;
+}
+
+static int start_audio(btv_bridge_session *session, uint32_t now)
+{
+    btv_sco_parameters parameters;
+    uint16_t handle;
+    if (!btv_acl_link_handle(&session->controller.link, &handle)) return 0;
+    memset(&parameters, 0, sizeof(parameters));
+    parameters.handle = handle;
+    parameters.transmit_bandwidth = 8000;
+    parameters.receive_bandwidth = 8000;
+    parameters.latency = 7;
+    parameters.voice = 0x0060;
+    parameters.retransmission = 2;
+    parameters.packet_types = 8;
+    /* CSR alternate 2 supplies 17 bytes per millisecond in each direction.
+     * Sixteen frames make one bounded 272-byte bridge transfer. */
+    return btv_bridge_voice_start_audio(&session->voice, &parameters,
+        2, session->controller.info.sco_bytes, 272, 16, 272, 16, now);
+}
+
+int btv_bridge_session_pump(btv_bridge_session *session, uint32_t now)
+{
+    static const uint8_t indicators[7] = {0,0,0,0,5,0,5};
+    int result;
+    if (session == 0 || session->state == BTV_BX_IDLE ||
+        session->state == BTV_BX_DISCONNECTED ||
+        session->state == BTV_BX_FAILED ||
+        session->state == BTV_BX_SCANNED) return 0;
+    if (session->state == BTV_BX_CLOSING)
+    {
+        if (!session->abandon && session->voice.state != BTV_BV_IDLE)
+        {
+            result = btv_bridge_voice_pump(&session->voice, now);
+            /* A failed teardown (for example an HCI Disconnect that never
+             * completes) must not strand the open USB streams. */
+            if (result < 0 || session->voice.state == BTV_BV_FAILED)
+            {
+                session->abandon = 1;
+                return 1;
+            }
+            if (session->voice.state != BTV_BV_DONE) return result;
+        }
+        else
+        {
+            result = btv_bridge_controller_stop(&session->controller);
+            if (result < 0) return fail(session, 11);
+            if (result == 0) return 0;
+        }
+        session->state = BTV_BX_DISCONNECTED;
+        return 1;
+    }
+    if (session->state <= BTV_BX_SECURING)
+    {
+        result = btv_bridge_controller_pump(&session->controller, now);
+        if (result < 0) return fail(session, 1);
+        if (session->state == BTV_BX_BOOTING &&
+            session->controller.state == BTV_BC_READY)
+        {
+            if (session->address_valid && !session->scan_only)
+            {
+                if (!btv_bridge_controller_connect_address(
+                        &session->controller, session->address, now))
+                    return fail(session, 3);
+                session->state = BTV_BX_CONNECTING;
+                return 1;
+            }
+            /* A scan for the user listens longer: 8 x 1.28 s. */
+            if (!btv_bridge_controller_inquire(&session->controller,
+                    session->scan_only ? 8 : 4, 0, now))
+                return fail(session, 2);
+            session->state = BTV_BX_INQUIRING;
+            return 1;
+        }
+        if (session->state == BTV_BX_INQUIRING &&
+            session->controller.state == BTV_BC_READY && session->scan_only)
+        {
+            /* Then ask the unnamed devices for their names. */
+            if (!session->naming)
+            {
+                session->naming = 1;
+                if (btv_bridge_controller_request_names(&session->controller,
+                                                        now))
+                    return 1;
+                /* Names are a nicety: list the devices without them. */
+            }
+            session->state = BTV_BX_SCANNED;
+            return 1;
+        }
+        if (session->state == BTV_BX_INQUIRING &&
+            session->controller.state == BTV_BC_READY)
+        {
+            if (!choose(session, &session->selected) ||
+                !btv_bridge_controller_connect(&session->controller,
+                                                session->selected, now))
+                return fail(session, 3);
+            session->state = BTV_BX_CONNECTING;
+            return 1;
+        }
+        if (session->state == BTV_BX_CONNECTING &&
+            session->controller.state == BTV_BC_LINK_READY)
+        {
+            if (!btv_bridge_controller_secure(&session->controller,
+                    session->pin, session->pin_bytes, 0, 0, 1, now))
+                return fail(session, 4);
+            session->state = BTV_BX_SECURING;
+            return 1;
+        }
+        if (session->state == BTV_BX_CONNECTING &&
+            session->controller.state == BTV_BC_READY &&
+            session->controller.link.state == BTV_LINK_REJECTED)
+            return fail(session, 0xc000u |
+                        ((session->controller.link.error & 0xffu) << 8) |
+                        session->controller.link.event_status);
+        if (session->state == BTV_BX_SECURING &&
+            session->controller.state == BTV_BC_SECURED)
+        {
+            if (!btv_bridge_voice_start(&session->voice,
+                    &session->controller, indicators, now))
+                return fail(session, 5);
+            session->state = BTV_BX_NEGOTIATING;
+            return 1;
+        }
+        if (session->state == BTV_BX_SECURING &&
+            session->controller.state == BTV_BC_LINK_READY &&
+            session->controller.security.state == BTV_SEC_REJECTED)
+            return fail(session, 0xd000u |
+                        ((session->controller.security.error & 0xffu) << 8) |
+                        session->controller.security.event_status);
+        return result;
+    }
+    result = btv_bridge_voice_pump(&session->voice, now);
+    if (result < 0) return fail(session, 6);
+    if (session->state == BTV_BX_NEGOTIATING &&
+        session->voice.state == BTV_BV_READY)
+    {
+        if (!start_audio(session, now)) return fail(session, 7);
+        session->state = BTV_BX_AUDIO_SETUP;
+        return 1;
+    }
+    if (session->state == BTV_BX_AUDIO_SETUP &&
+        session->voice.state == BTV_BV_AUDIO_RUNNING)
+    {
+        if (!btv_bridge_pcm_init(&session->pcm, &session->voice,
+                session->controller.info.sco_bytes, session->capture))
+            return fail(session, 8);
+        session->state = BTV_BX_READY;
+        return 1;
+    }
+    if (session->state == BTV_BX_READY &&
+        btv_bridge_pcm_pump(&session->pcm) < 0)
+        return fail(session, 9);
+    return result;
+}
+
+int btv_bridge_session_close(btv_bridge_session *session, uint32_t now)
+{
+    if (session == 0 || session->state == BTV_BX_IDLE ||
+        session->state == BTV_BX_DISCONNECTED) return 0;
+    if (session->state == BTV_BX_CLOSING) return 1;
+    if (session->state == BTV_BX_FAILED ||
+        session->voice.state == BTV_BV_FAILED)
+    {
+        session->abandon = 1;
+        session->state = BTV_BX_CLOSING;
+        return 1;
+    }
+    if (session->voice.state != BTV_BV_IDLE)
+    {
+        if (!btv_bridge_voice_close(&session->voice, now)) return 0;
+    }
+    session->state = BTV_BX_CLOSING;
+    return 1;
+}
+
+int btv_bridge_session_write(btv_bridge_session *session,
+                             const uint8_t *audio, size_t bytes)
+{
+    if (session == 0 || session->state != BTV_BX_READY ||
+        (bytes != 0 && audio == 0) || (bytes & 1)) return -1;
+    return (int)btv_bridge_pcm_write(&session->pcm, audio, bytes);
+}
+
+int btv_bridge_session_read(btv_bridge_session *session, uint8_t *audio,
+                            size_t capacity, btv_sco_packet_info *info)
+{
+    size_t bytes;
+    if (session == 0 || session->state != BTV_BX_READY ||
+        !session->capture || info == 0 || (capacity != 0 && audio == 0) ||
+        (capacity & 1)) return -1;
+    bytes = btv_bridge_pcm_read(&session->pcm, audio, capacity);
+    memset(info, 0, sizeof(*info));
+    info->bytes = (uint16_t)bytes;
+    return bytes != 0 ? 1 : 0;
+}

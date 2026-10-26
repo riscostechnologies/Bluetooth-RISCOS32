@@ -1,0 +1,111 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        bridge_controller
+ * Purpose:     Own one raw host bridge controller during HCI bootstrap.
+ ******************************************************************/
+#ifndef BTV_BRIDGE_CONTROLLER_H
+#define BTV_BRIDGE_CONTROLLER_H
+#include "hci_bootstrap.h"
+#include "hci_inquiry.h"
+#include "host_bridge.h"
+#include "acl_link.h"
+#include "hci_security.h"
+#include "hci_pairing.h"
+#include "hci_commands.h"
+
+enum btv_bridge_controller_state
+{
+    BTV_BC_IDLE,
+    BTV_BC_BOOTING,
+    BTV_BC_READY,
+    BTV_BC_INQUIRING,
+    BTV_BC_CONNECTING,
+    BTV_BC_LINK_READY,
+    BTV_BC_SECURING,
+    BTV_BC_SECURED,
+    BTV_BC_DISCONNECTING,
+    BTV_BC_FAILED,
+    BTV_BC_CLOSING,
+    BTV_BC_CLOSED,
+    /* After bootstrap: enable Secure Simple Pairing when supported. */
+    BTV_BC_CONFIGURING,
+    /* After a scan: Remote Name Request for devices that sent no name. */
+    BTV_BC_NAMING
+};
+
+typedef struct btv_bridge_controller
+{
+    btv_hci_bootstrap bootstrap;
+    btv_hci_inquiry inquiry;
+    btv_acl_link link;
+    btv_hci_security security;
+    btv_hci_pairing pairing;
+    btv_hci_commands commands;
+    btv_controller_info info;
+    btv_host_bridge_completion event_completion;
+    btv_host_bridge_completion command_completion;
+    uint32_t event_ticket, command_ticket, windows_error;
+    uint32_t scheduled_host_ticket, scheduled_core_ticket;
+    uint32_t submitted_ticket;
+    uint16_t pairing_opcode;
+    uint8_t pairing_command[26], pairing_command_bytes;
+    uint8_t pairing_usb_inflight, pairing_hci_pending;
+    uint8_t command_credits, commands_initialized;
+    uint8_t pending_event[260];
+    size_t pending_event_bytes;
+    uint8_t config_step, config_awaiting;
+    uint16_t config_opcode;
+    uint32_t config_started;
+    uint8_t name_index, name_awaiting, name_status_seen;
+    uint32_t name_started;
+    unsigned int state, error;
+} btv_bridge_controller;
+
+/* start opens an already inspected raw controller and starts the exclusive
+ * HCI Reset/discovery sequence. pump performs bounded nonblocking work. */
+int btv_bridge_controller_start(btv_bridge_controller *controller,
+                                uint32_t now);
+int btv_bridge_controller_pump(btv_bridge_controller *controller,
+                               uint32_t now);
+int btv_bridge_controller_inquire(btv_bridge_controller *controller,
+                                  uint8_t duration, uint8_t maximum,
+                                  uint32_t now);
+/* From READY after an inquiry: ask each result without a name for its
+ * name, one at a time, then return to READY.  Names land in the inquiry
+ * results as they arrive; devices that do not answer are skipped. */
+int btv_bridge_controller_request_names(btv_bridge_controller *controller,
+                                        uint32_t now);
+int btv_bridge_controller_connect(btv_bridge_controller *controller,
+                                  unsigned int inquiry_index, uint32_t now);
+/* Connect a known address without requiring it to appear in the current
+ * inquiry results.  The controller performs a normal page with conservative
+ * R1 scan repetition and no cached clock offset. */
+int btv_bridge_controller_connect_address(btv_bridge_controller *controller,
+                                  const uint8_t address[6], uint32_t now);
+int btv_bridge_controller_disconnect(btv_bridge_controller *controller,
+                                     uint32_t now);
+int btv_bridge_controller_secure(btv_bridge_controller *controller,
+                                 const uint8_t *pin, size_t pin_bytes,
+                                 const uint8_t *link_key,
+                                 uint8_t link_key_type,
+                                 int allow_just_works, uint32_t now);
+int btv_bridge_controller_stop(btv_bridge_controller *controller);
+const btv_controller_info *btv_bridge_controller_info(
+                                const btv_bridge_controller *controller);
+/* Once SECURED, the controller retains the interrupt endpoint and exposes
+ * complete HCI events to the link owner. The borrowed event remains stable
+ * until take_event; another interrupt read is not posted in the meantime. */
+const uint8_t *btv_bridge_controller_event(
+                                const btv_bridge_controller *controller,
+                                size_t *bytes);
+int btv_bridge_controller_take_event(btv_bridge_controller *controller);
+/* General command scheduling becomes available only after SECURED. Producers
+ * queue through this object. take_submitted reports when its selected command
+ * was accepted by the host bridge, for protocol-specific lifetime tracking. */
+btv_hci_commands *btv_bridge_controller_commands(
+                                btv_bridge_controller *controller);
+uint32_t btv_bridge_controller_take_submitted(
+                                btv_bridge_controller *controller);
+
+#endif

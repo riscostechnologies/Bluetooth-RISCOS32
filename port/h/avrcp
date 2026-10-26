@@ -1,0 +1,84 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        avrcp
+ * Purpose:     The pure half of AVRCP (Audio/Video Remote Control Profile)
+ *              over AVCTP, for an A2DP source: as the controller it asks
+ *              the speaker for its volume events and sets its absolute
+ *              volume; as the target it answers the speaker's unit and
+ *              subunit queries and takes its volume buttons (pass-through
+ *              VOLUME UP, DOWN and MUTE).  No SWIs, no statics, no
+ *              allocation: bt_avrcp.c (in bt_profiles.c) carries the bytes
+ *              to and from the L2CAP channel (PSM 0x0017).
+ * Reference:   AVCTP 1.4 (message header), AV/C Digital Interface Command
+ *              Set General Specification 4.1 (UNIT INFO, SUBUNIT INFO, PASS
+ *              THROUGH), AVRCP 1.4 to 1.6 (vendor dependent PDUs 0x10
+ *              GetCapabilities, 0x31 RegisterNotification, 0x50
+ *              SetAbsoluteVolume; EVENT_VOLUME_CHANGED 0x0D; volume 0 to
+ *              127).  These were not available as files here: the field
+ *              layouts are from the author's knowledge of the
+ *              specifications and are marked unverified in the audit
+ *              (docs/bluetooth-modern-20261013.md).
+ * Licence:     BSD-2-Clause (see LICENSE).
+ ******************************************************************/
+#ifndef BTV_AVRCP_H
+#define BTV_AVRCP_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#define BTV_AVRCP_PSM 0x0017u
+#define BTV_AVRCP_PROFILE 0x110eu       /* AVCTP profile identifier */
+#define BTV_AVRCP_MAX_VOLUME 127u
+
+enum btv_avrcp_state
+{
+    BTV_AVRCP_IDLE,
+    BTV_AVRCP_CAPABILITIES,    /* asked which events the speaker has */
+    BTV_AVRCP_REGISTERING,     /* asked to be told of volume changes */
+    BTV_AVRCP_ACTIVE,          /* absolute volume works both ways */
+    BTV_AVRCP_PASSTHROUGH      /* the speaker has no absolute volume: its
+                                  buttons still come as pass-through */
+};
+
+typedef struct btv_avrcp
+{
+    uint8_t state, label;
+    uint8_t outstanding;               /* the command waiting for an answer */
+    uint8_t outstanding_label;
+    uint8_t send_capabilities, send_register, send_volume;
+    uint8_t want_valid, want_volume;   /* what the host wants it to be */
+    int16_t speaker_volume;            /* -1 unknown */
+    uint8_t in_flight;                 /* the volume of a Set Absolute Volume */
+    uint32_t sent_at;
+    uint32_t generation;               /* bumped when the speaker changes it */
+    int8_t steps;                      /* pass-through volume steps owed */
+    uint8_t mute_toggles;
+    uint32_t commands, responses, notifications, passthrough_seen;
+} btv_avrcp;
+
+void btv_avrcp_init(btv_avrcp *a);
+/* The AVCTP channel is open: start asking the speaker what it can do. */
+void btv_avrcp_open(btv_avrcp *a, uint32_t now);
+/* The channel has gone. */
+void btv_avrcp_close(btv_avrcp *a);
+/* The host's volume (0 to 127): sent to the speaker once absolute volume
+ * is active, and at once if it is. */
+void btv_avrcp_set_volume(btv_avrcp *a, unsigned int volume);
+/* One AVCTP message received on the channel.  Returns the length of a
+ * reply to send (0 for none), written to `out`. */
+size_t btv_avrcp_receive(btv_avrcp *a, const uint8_t *data, size_t bytes,
+                         uint32_t now, uint8_t *out, size_t room);
+/* The next command to send, if any (one at a time); also gives up on a
+ * command that was never answered.  Returns its length, or 0. */
+size_t btv_avrcp_poll(btv_avrcp *a, uint32_t now, uint8_t *out, size_t room);
+
+int btv_avrcp_absolute(const btv_avrcp *a);          /* 1 when active */
+/* The speaker's own volume, 0 to 127, or -1. */
+int btv_avrcp_speaker_volume(const btv_avrcp *a);
+/* The pass-through volume steps since the last call (positive: up) and the
+ * number of mute presses. */
+int btv_avrcp_take_steps(btv_avrcp *a);
+unsigned int btv_avrcp_take_mutes(btv_avrcp *a);
+
+#endif

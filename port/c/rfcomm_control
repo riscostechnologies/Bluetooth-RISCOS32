@@ -1,0 +1,146 @@
+/*	$NetBSD: rfcomm_session.c,v 1.28 2021/12/05 04:35:38 msaitoh Exp $	*/
+
+/*-
+ * Copyright (c) 2006 Itronix Inc.
+ * All rights reserved.
+ *
+ * Written by Iain Hibbert for Itronix Inc.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. The name of Itronix Inc. may not be used to endorse
+ *    or promote products derived from this software without specific
+ *    prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY ITRONIX INC. ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL ITRONIX INC. BE LIABLE FOR ANY
+ * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
+/* Bounded generic MCC owner; protocol behaviour follows pinned NetBSD
+ * rfcomm_session_recv_mcc_test/fcon/fcoff/nsc/rpn/rls. */
+#include "rfcomm_control.h"
+#include <string.h>
+
+int btv_rfcomm_control_init(btv_rfcomm_control *control, uint8_t *storage, size_t capacity)
+{
+    if (control == NULL || storage == NULL || capacity < 3 || capacity > 32767)
+        return 0;
+    memset(control, 0, sizeof(*control));
+    control->storage = storage;
+    control->capacity = capacity;
+    control->peer_flow_enabled = 1;
+    return 1;
+}
+
+int btv_rfcomm_control_receive(btv_rfcomm_control *control, const uint8_t *data, size_t bytes)
+{
+    btv_rfcomm_mcc mcc;
+    uint8_t rejected, parameters[8];
+    unsigned int requested, accepted;
+    size_t encoded;
+    if (control == NULL || control->storage == NULL || control->failed)
+        return -1;
+    if (btv_rfcomm_mcc_decode(data, bytes, &mcc) != 1)
+    {
+        control->failed = 1;
+        return -1;
+    }
+    switch (mcc.type)
+    {
+        case 0x20: case 0x38:
+            return 0;
+        case 0x04:
+            control->rejected_type = mcc.data[0];
+            control->failed = 1;
+            return -1;
+        default:
+            break;
+    }
+    if (!mcc.command)
+        return 1;
+    if (control->pending != 0)
+        return 2;
+    if (mcc.type == 0x08 || mcc.type == 0x28 || mcc.type == 0x18)
+        encoded = btv_rfcomm_mcc_encode(control->storage, control->capacity,
+            mcc.type, 0, mcc.data, mcc.bytes);
+    else if (mcc.type == 0x24)
+    {
+        parameters[0] = mcc.data[0];
+        parameters[1] = 3; /* nominal 9600 baud */
+        parameters[2] = 3; /* eight bits, no parity, one stop bit */
+        parameters[3] = 0;
+        parameters[4] = 0x11;
+        parameters[5] = 0x13;
+        requested = 0x3f7f;
+        if (mcc.bytes == 8)
+        {
+            memcpy(parameters, mcc.data, 8);
+            requested = parameters[6] | ((unsigned int)parameters[7] << 8);
+        }
+        accepted = requested & 1;
+        if ((parameters[2] & 3) == 3) accepted |= requested & 2;
+        if (!(parameters[2] & 4)) accepted |= requested & 4;
+        if (!(parameters[2] & 8)) accepted |= requested & 8;
+        if (parameters[4] == 0x11) accepted |= requested & 0x20;
+        if (parameters[5] == 0x13) accepted |= requested & 0x40;
+        if (parameters[3] == 0) accepted |= requested & 0x3f00;
+        parameters[6] = (uint8_t)accepted;
+        parameters[7] = (uint8_t)(accepted >> 8);
+        encoded = btv_rfcomm_mcc_encode(control->storage, control->capacity,
+            mcc.type, 0, parameters, 8);
+    }
+    else if (mcc.type == 0x14)
+    {
+        parameters[0] = mcc.data[0] | 3;
+        parameters[1] = mcc.data[1] & 15;
+        encoded = btv_rfcomm_mcc_encode(control->storage, control->capacity,
+            mcc.type, 0, parameters, 2);
+    }
+    else
+    {
+        rejected = (uint8_t)((mcc.type << 2) | 3);
+        encoded = btv_rfcomm_mcc_encode(control->storage, control->capacity,
+            0x04, 0, &rejected, 1);
+    }
+    if (encoded == 0)
+    {
+        control->failed = 1;
+        return -1;
+    }
+    control->pending = encoded;
+    if (mcc.type == 0x28 || mcc.type == 0x18)
+        control->peer_flow_enabled = mcc.type == 0x28;
+    return 1;
+}
+
+size_t btv_rfcomm_control_output(const btv_rfcomm_control *control, uint8_t *output, size_t capacity)
+{
+    if (control == NULL || control->storage == NULL || control->failed || output == NULL ||
+        control->pending == 0 || capacity < control->pending)
+        return 0;
+    memcpy(output, control->storage, control->pending);
+    return control->pending;
+}
+
+int btv_rfcomm_control_sent(btv_rfcomm_control *control)
+{
+    if (control == NULL || control->storage == NULL || control->failed || control->pending == 0)
+        return 0;
+    control->pending = 0;
+    return 1;
+}

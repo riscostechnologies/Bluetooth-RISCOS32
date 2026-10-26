@@ -1,0 +1,38 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        btsettings
+ * Purpose:     Bluetooth desktop choices shared by the icon bar task and
+ *              its Configure plug-in (Choices:Bluetooth.Settings).
+ ******************************************************************/
+#ifndef BT_SETTINGS_H
+#define BT_SETTINGS_H
+
+typedef struct bt_settings
+{
+    char address[18];      /* "XX:XX:XX:XX:XX:XX", or empty: none chosen */
+    char name[64];         /* the chosen headset's name, for display */
+    char pin[17];          /* legacy pairing PIN */
+    int system_sound;      /* route SoundDMA output to the headset */
+    int connect_at_start;  /* connect as soon as the icon bar task starts */
+    int load_usb_drivers;  /* audio USB stack at start-up (PreDesk) */
+} bt_settings;
+
+void bt_settings_default(bt_settings *settings);
+/* Missing or unreadable choices leave the defaults in place. */
+void bt_settings_load(bt_settings *settings);
+int bt_settings_save(const bt_settings *settings);
+/* 1 when the address is empty or well formed. */
+int bt_settings_address_valid(const char *address);
+/* Parses a well-formed, non-empty address into bytes, first octet first. */
+int bt_settings_parse_address(const char *address, unsigned char bytes[6]);
+
+/* The desktop start-up entry, <Choices$Write>.Boot.Tasks.Bluetooth. */
+int bt_settings_start_with_desktop(void);
+int bt_settings_set_start_with_desktop(int enabled);
+
+/* The start-up driver entry, <Choices$Write>.Boot.PreDesk.Bluetooth. */
+int bt_settings_load_usb_at_start(void);
+int bt_settings_set_load_usb_at_start(int enabled);
+
+#endif

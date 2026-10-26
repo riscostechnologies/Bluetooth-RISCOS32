@@ -1,0 +1,33 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#ifndef BTV_RFCOMM_MSC_H
+#define BTV_RFCOMM_MSC_H
+#include "rfcomm_mcc.h"
+typedef struct btv_rfcomm_msc
+{
+    uint8_t dlci, local_modem, peer_modem, peer_break;
+    uint8_t active, failed, own_sent, own_acked, peer_acked;
+    uint8_t request[4], response[5];
+    size_t request_bytes, response_bytes;
+    uint32_t started;
+} btv_rfcomm_msc;
+/* On an OPEN DLC, after PN/security/SABM. Modem bits exclude EA; allowed bits
+ * are FC, RTC, RTR, IC, DV (mask CE). Frame role/CID checks belong to parent. */
+void btv_rfcomm_msc_init(btv_rfcomm_msc *msc);
+int btv_rfcomm_msc_start(btv_rfcomm_msc *msc, uint8_t dlci, uint8_t modem, uint32_t now);
+int btv_rfcomm_msc_update(btv_rfcomm_msc *msc, uint8_t modem, uint32_t now);
+/* MCC output for parent to wrap in DLCI-0 UIH. Responses take priority.
+ * sent follows ordered TX acceptance of copied bytes immediately. */
+size_t btv_rfcomm_msc_output(btv_rfcomm_msc *msc, uint8_t *output,
+                             size_t capacity, unsigned int *token, uint32_t now);
+int btv_rfcomm_msc_sent(btv_rfcomm_msc *msc, unsigned int token);
+/* Validated MCC input: 1 handled, 0 unowned/stale ack, 2 response busy (retry),
+ * -1 invalid/failed. Matching peer commands are echoed including optional break.
+ * Peer status updates upon acceptance; readiness waits for reply acceptance. */
+int btv_rfcomm_msc_receive(btv_rfcomm_msc *msc, const btv_rfcomm_mcc *mcc, uint32_t now);
+int btv_rfcomm_msc_ready(const btv_rfcomm_msc *msc);
+void btv_rfcomm_msc_tick(btv_rfcomm_msc *msc, uint32_t now);
+/* Ready means both MSC directions exchanged, not HFP connected. Non-credit
+ * data owner must obey peer FC and session flow control. Credit mode uses its
+ * negotiated accountant instead. Parent must stop this state on DLC close. */
+#endif

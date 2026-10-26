@@ -1,0 +1,23 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#ifndef BTV_SCO_FRAME_H
+#define BTV_SCO_FRAME_H
+#include "hci_frame.h"
+enum btv_sco_status { BTV_SCO_GOOD, BTV_SCO_POSSIBLE_ERROR, BTV_SCO_LOST, BTV_SCO_PARTIAL_LOSS };
+typedef struct btv_sco_frame {
+    uint16_t handle;
+    uint8_t status;
+    const uint8_t *data;
+    size_t bytes;
+} btv_sco_frame;
+/* Exact complete USB HCI synchronous packet, without H4 prefix. Payload is
+ * borrowed; preserves controller packet status for the audio owner. RFU bits
+ * are ignored on receive. Invalid input leaves result unchanged. Does not
+ * check active handle, codec, expected audio length or perform concealment. */
+int btv_sco_frame_decode(const uint8_t *packet, size_t bytes, btv_sco_frame *frame);
+/* Host-to-controller packet: status/RFU always zero, 0..255 payload bytes.
+ * Controller buffer limits and USB scheduling belong to parent. Invalid input
+ * leaves output untouched; payload may overlap output (copied before header). */
+size_t btv_sco_frame_encode(uint8_t *output, size_t capacity, uint16_t handle,
+    const uint8_t *data, size_t bytes);
+#endif

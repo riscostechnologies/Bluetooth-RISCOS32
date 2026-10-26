@@ -1,0 +1,182 @@
+<?xml version="1.0"?>
+<!DOCTYPE riscos-prm PUBLIC "-//Gerph//DTD PRM documentation 1.03//EN"
+                            "http://gerph.org/dtd/103/prm.dtd">
+<riscos-prm>
+<chapter title="BluetoothVoice draft interface">
+<section title="Introduction">
+<p>BluetoothVoice provides asynchronous connection control and bidirectional
+PCM audio for a Bluetooth headset. This document is a draft interface proposal
+approved for implementation. The development module implements this contract
+for the native emulator transport: automatic discovery, HFP selection, security,
+CVSD voice setup and copied PCM playback/capture. It reports no endpoint while
+Windows owns the physical adapter. SWI and error numbers have not been publicly
+allocated.</p>
+</section>
+<section title="Overview">
+<p>A session connects one endpoint to playback and capture queues. A native
+backend uses BluetoothUSB and BluetoothCore for controller access and headset
+protocols. An emulator audio backend may provide host-managed endpoints using
+the same PCM interface. Applications identify the backend through capabilities
+and status; a host-managed endpoint does not imply native Bluetooth support.</p>
+<p>An endpoint token identifies a device without exposing a memory pointer.
+A session handle identifies an open connection. Tokens and handles are opaque
+32-bit values; applications must not persist them across module reloads.</p>
+</section>
+<section title="Technical Details">
+<subsection title="Registers and memory ownership">
+<p>R0 contains flags for every call. All flags are reserved and must be zero.
+Registers not listed as outputs are preserved on success. On error, the V flag
+is set and R0 points to a standard RISC OS error block. Registers other than
+R0 are preserved on error except for the documented Buffer Overflow result.</p>
+<p>Input buffers are borrowed only for the duration of the SWI. Accepted PCM
+data is copied before return. Output buffers belong to the caller. No SWI
+retains a caller buffer pointer. Output structures contain little-endian
+32-bit words and must be word-aligned.</p>
+<p>Enumerate and Status support a size query with R2=0 and R3=0. They return
+the required byte count in R3 without consuming an enumeration item. A buffer
+that is too small returns Buffer Overflow and the negative required byte count
+in R3. No partial descriptor is written and the input cursor is preserved.</p>
+</subsection>
+<subsection title="Version and capabilities">
+<p>The draft ABI version is &amp;00010000. Capability bits are: bit 0 playback,
+bit 1 capture, bit 2 native Bluetooth transport, bit 3 host-managed audio,
+bit 4 HSP gateway and bit 5 HFP gateway. Other bits are reserved. A capability
+is reported only when the backend implements it; it does not assert that every
+endpoint supports the capability.</p>
+</subsection>
+<subsection title="Endpoint descriptor">
+<p>The fixed descriptor is 96 bytes. Word offsets are: +0 structure size (96),
++4 structure version (1), +8 endpoint token, +12 capabilities, +16 backend
+(1 native USB, 2 emulator host audio). Bytes +20 to +95 contain a zero-terminated
+UTF-8 display name, padded with zeros. A name is truncated only at a complete
+UTF-8 character boundary. Display names need not be unique.</p>
+<p>Enumeration starts with cursor 0. A successful descriptor read returns its
+next cursor in R1; -1 means that descriptor was the last. An empty enumeration
+returns R1=-1 and R3=0 without writing a descriptor. A size query preserves R1
+even for an empty enumeration; R3=0 indicates no item. Device changes may
+invalidate a cursor; restart enumeration on InvalidHandle. A descriptor token
+remains valid until the endpoint is removed or the module is reloaded.</p>
+</subsection>
+<subsection title="Connection and microphone configuration">
+<p>Connect accepts the original 16-byte configuration block: +0 size (16), +4 version (1),
++8 profile (0 automatic, 1 HSP gateway, 2 HFP gateway, 3 host audio), +12 capture
+enable (0 disabled, 1 enabled). Other values are invalid. The module copies this
+block before return. Capture is disabled unless explicitly enabled here. A new
+connection is required to change this setting. Automatic selects a supported
+profile and reports the actual profile through Status.</p>
+<p>Configuration version 2 is 64 bytes. Its first four words have the same
+meaning, with size 64 and version 2. Word +16 selects the discovered device: 0
+chooses the first voice-capable result and 1 matches the Bluetooth address at
+bytes +24 to +29. The address uses HCI byte order. Word +20 is a PIN length from
+0 to 16 and bytes +32 to +47 contain the copied legacy PIN. Bytes +30 and +31
+and words +48 to +60 are reserved and must be zero. A zero-length PIN rejects a
+legacy PIN request. This configuration does not persist credentials.</p>
+<p>Connect returns after queueing connection work. Status is polled until the
+session is ready or failed. A failed session remains queryable until closed.
+Read and Write before ready return NotReady. A removed device produces a
+disconnected state and DeviceRemoved on subsequent PCM operations.</p>
+</subsection>
+<subsection title="Status descriptor and PCM">
+<p>The status descriptor is 64 bytes. Word offsets are: +0 size (64), +4 version
+(1), +8 state, +12 backend, +16 profile, +20 sample rate in Hz, +24 encoding,
++28 channels, +32 bytes per PCM frame, +36 queued playback frames, +40 queued
+capture frames, +44 playback underruns, +48 capture overruns, +52 last error
+code, +56 capture enabled, +60 diagnostic phases.</p>
+<p>The diagnostic word contains four-bit session, controller, ACL link, ACL
+error, security, security error, voice and voice error values from least to
+most significant nibble. These values diagnose development hardware and are
+not stable application states; applications use the public state at +8.</p>
+<p>States are 1 connecting, 2 negotiating, 3 ready, 4 disconnected, 5 failed
+and 6 closing. Before ready, PCM format fields are zero. Encoding 1 is signed
+16-bit little-endian PCM. The first version exposes mono voice; sample rate is
+reported after negotiation. Applications must use the reported format rather
+than infer a rate from the selected profile. Queue counts use whole PCM frames;
+counter values saturate at &amp;FFFFFFFF rather than wrap.</p>
+<p>Development errors &amp;Cxyy and &amp;Dxyy identify ACL connection and security
+rejection respectively: xx is the component error class and yy is the raw HCI
+event status.</p>
+<p>Read and Write accept byte counts that are whole multiples of the negotiated
+frame size. They never wait for hardware. Zero bytes transferred means an empty
+capture queue or full playback queue. Read with capture disabled returns
+CaptureDisabled. A zero-length PCM request permits a null buffer but still
+validates the session and its state. Module queues are bounded.</p>
+</subsection>
+<subsection title="Closing and reset">
+<p>Disconnect starts cancellation and moves the session to closing. Poll Status
+until state disconnected, then call Disconnect again to release the handle.
+Disconnect on a failed session starts the same ordered cleanup; release it with
+a second call after Status reports disconnected. Disconnect on an already
+disconnected session releases it immediately.
+Disconnect on a closing session is harmless. After release, use of the handle
+returns InvalidHandle. Device removal also retains a disconnected status until
+the caller releases the session.</p>
+<p>Reset and module finalisation cancel outstanding I/O before releasing its
+buffers. Module removal returns Busy while a backend still owns outstanding
+transfers. The caller must close its sessions before application exit.</p>
+</subsection>
+</section>
+<section title="SWI Calls">
+<swi-definition name="BluetoothVoice_Version" description="Reads the interface version and backend capabilities">
+<entry><register-use number="0">Flags, zero</register-use></entry>
+<exit><register-use number="1">ABI version</register-use><register-use number="2">Capability bits</register-use></exit>
+<use><p>Read this information before enumerating devices. Unavailable backends
+contribute no capabilities.</p></use>
+</swi-definition>
+<swi-definition name="BluetoothVoice_Enumerate" description="Reads the next endpoint descriptor">
+<entry><register-use number="0">Flags, zero</register-use><register-use number="1">Cursor, 0 starts enumeration</register-use><register-use number="2">Output buffer address, or 0 for size query</register-use><register-use number="3">Buffer capacity in bytes</register-use></entry>
+<exit><register-use number="1">Next cursor, preserved for size query</register-use><register-use number="3">Required byte count, or 0 if no item</register-use></exit>
+<use><p>Returns the endpoint descriptor described in Technical Details.
+Buffer Overflow returns the negative required byte count in R3.</p></use>
+</swi-definition>
+<swi-definition name="BluetoothVoice_Connect" description="Starts a headset connection">
+<entry><register-use number="0">Flags, zero</register-use><register-use number="1">Endpoint token</register-use><register-use number="2">Address of connection configuration block</register-use></entry>
+<exit><register-use number="1">Session handle</register-use></exit>
+<use><p>Allocates bounded session resources and starts connection work. Immediate
+validation or allocation failure returns an error and no session. Later
+connection failure is reported through Status. The first implementation permits
+one live session and returns Busy for another.</p></use>
+</swi-definition>
+<swi-definition name="BluetoothVoice_Status" description="Reads session state and audio format">
+<entry><register-use number="0">Flags, zero</register-use><register-use number="1">Session handle</register-use><register-use number="2">Output buffer address, or 0 for size query</register-use><register-use number="3">Buffer capacity in bytes</register-use></entry>
+<exit><register-use number="3">Required byte count</register-use></exit>
+<use><p>Returns the status descriptor described in Technical Details.
+Buffer Overflow returns the negative required byte count in R3.</p></use>
+</swi-definition>
+<swi-definition name="BluetoothVoice_Write" description="Queues PCM playback data">
+<entry><register-use number="0">Flags, zero</register-use><register-use number="1">Ready session handle</register-use><register-use number="2">PCM input buffer address</register-use><register-use number="3">Requested byte count</register-use></entry>
+<exit><register-use number="3">Accepted byte count</register-use></exit>
+<use><p>Copies as many whole PCM frames as fit in the playback queue. The caller
+retains responsibility for bytes beyond the returned accepted count.</p></use>
+</swi-definition>
+<swi-definition name="BluetoothVoice_Read" description="Reads captured microphone PCM">
+<entry><register-use number="0">Flags, zero</register-use><register-use number="1">Ready session handle</register-use><register-use number="2">PCM output buffer address</register-use><register-use number="3">Buffer capacity in bytes</register-use></entry>
+<exit><register-use number="3">Copied byte count</register-use></exit>
+<use><p>Copies available whole PCM frames and removes those frames from the
+capture queue. Capture must have been enabled at connection time.</p></use>
+</swi-definition>
+<swi-definition name="BluetoothVoice_Disconnect" description="Cancels and releases a session">
+<entry><register-use number="0">Flags, zero</register-use><register-use number="1">Session handle</register-use></entry>
+<exit><register-use number="0-9">Preserved</register-use></exit>
+<use><p>Starts cancellation or releases a terminal session as described in
+Technical Details. It never waits for cancellation within the SWI.</p></use>
+</swi-definition>
+</section>
+<section title="Error Messages">
+<p>Proposed symbolic errors are InvalidArgument, InvalidHandle,
+BackendUnavailable, UnsupportedProfile, UnsupportedFormat, AuthenticationFailed,
+ConnectionTimeout, DeviceRemoved, Busy, NoMemory, NotReady and CaptureDisabled.
+Numeric allocations remain pending. Buffer Overflow uses the standard RISC OS
+error. Queue backpressure is a successful zero or partial transfer, not an error.</p>
+</section>
+<section title="Examples">
+<p>Call Version, Enumerate and Connect. Poll Status until ready. Alternate Write
+and Read with normal application event processing. On shutdown, call Disconnect,
+poll Status until disconnected and call Disconnect again to release the handle.
+If connection fails, query Status for the failure and then release the session.</p>
+</section>
+</chapter>
+<meta>
+<disclaimer><p>Development interface with unallocated SWI and error numbers; physical headset interoperability is not implied.</p></disclaimer>
+<history><revision number="0.3" author="BluetoothVoice project" date="09 Sep 2026" title="Headset configuration"><change>Add the version 2 address-selection and copied legacy-PIN connection block.</change></revision><revision number="0.2" author="BluetoothVoice project" date="09 Sep 2026" title="Development implementation"><change>Record the implemented asynchronous native HFP and copied CVSD PCM lifecycle.</change></revision><revision number="0.1" author="BluetoothVoice project" date="08 Sep 2026" title="Initial draft"><change>Define endpoint enumeration, asynchronous session lifecycle and copied PCM buffers.</change></revision></history>
+</meta>
+</riscos-prm>

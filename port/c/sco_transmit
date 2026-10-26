@@ -1,0 +1,60 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#include "sco_transmit.h"
+#include <string.h>
+static int active(btv_sco_transmit *tx)
+{
+    const btv_sco_complete *link;
+    if (tx == NULL || tx->failed || tx->link == NULL) return 0;
+    link = btv_sco_link_result(tx->link);
+    if (link == NULL || link->handle != tx->handle)
+    { tx->failed = 1; return 0; }
+    return 1;
+}
+int btv_sco_transmit_init(btv_sco_transmit *tx, const btv_sco_link *link,
+                          uint16_t mtu, size_t block)
+{
+    const btv_sco_complete *result = btv_sco_link_result(link);
+    if (tx == NULL || result == NULL || mtu == 0 || mtu > 255 ||
+        block == 0 || block > sizeof(tx->data)) return 0;
+    memset(tx, 0, sizeof(*tx));
+    tx->link = link; tx->handle = result->handle;
+    tx->mtu = mtu; tx->block = block;
+    return 1;
+}
+int btv_sco_transmit_queue(btv_sco_transmit *tx, const uint8_t *audio, size_t bytes)
+{
+    uint8_t packet[258];
+    size_t n, i;
+    if (!active(tx) || bytes == 0 || bytes > tx->mtu || audio == NULL) return -1;
+    if (bytes + 3 > sizeof(tx->data) - tx->used) return 0;
+    n = btv_sco_frame_encode(packet, sizeof(packet), tx->handle, audio, bytes);
+    if (n == 0) return -1;
+    for (i = 0; i < n; ++i)
+        tx->data[(tx->head + tx->used + i) % sizeof(tx->data)] = packet[i];
+    tx->used += n;
+    return 1;
+}
+size_t btv_sco_transmit_peek(btv_sco_transmit *tx, uint8_t *output, size_t capacity)
+{
+    size_t i;
+    if (!active(tx)) return 0;
+    tx->prepared = 0;
+    if (output == NULL || capacity < tx->block || tx->used < tx->block) return 0;
+    for (i = 0; i < tx->block; ++i)
+        output[i] = tx->data[(tx->head + i) % sizeof(tx->data)];
+    tx->prepared = 1;
+    return tx->block;
+}
+int btv_sco_transmit_sent(btv_sco_transmit *tx)
+{
+    if (!active(tx) || !tx->prepared) return 0;
+    tx->head = (tx->head + tx->block) % sizeof(tx->data);
+    tx->used -= tx->block;
+    tx->prepared = 0;
+    return 1;
+}
+void btv_sco_transmit_abort(btv_sco_transmit *tx)
+{
+    if (tx != NULL) { tx->failed = 1; tx->prepared = 0; }
+}

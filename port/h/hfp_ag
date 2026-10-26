@@ -1,0 +1,38 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#ifndef BTV_HFP_AG_H
+#define BTV_HFP_AG_H
+#include "at_stream.h"
+enum btv_hfp_ag_stage { BTV_AG_FEATURES, BTV_AG_MAPPING, BTV_AG_VALUES, BTV_AG_EVENTS, BTV_AG_READY };
+typedef struct btv_hfp_ag {
+    btv_at_stream input;
+    char response[256];
+    size_t response_bytes;
+    uint32_t hf_features, pending_features;
+    unsigned int stage, next_stage, reporting, next_reporting;
+    uint8_t indicators[7];
+    uint8_t events[16][2];
+    unsigned int event_head, event_count, selected;
+    uint8_t microphone_gain, speaker_gain, gain_known;
+    uint8_t next_microphone_gain, next_speaker_gain, next_gain_known;
+    uint8_t indicator_mask, next_indicator_mask;
+} btv_hfp_ag;
+/* Baseline AG service-level exchange, optional BRSF features=0. Caller supplies
+ * actual service,call,callsetup,callheld,signal,roam,battchg values in that order.
+ * Does not advertise codecs/three-way/HF indicators or establish audio.
+ * Requires RFCOMM READY; parent stops it on disconnect. One serialized owner. */
+int btv_hfp_ag_init(btv_hfp_ag *ag, const uint8_t indicators[7]);
+/* Returns consumed bytes; pending response retains the command and applies
+ * backpressure. Unknown/malformed/out-of-order commands receive ERROR.
+ * Collector failure requires parent connection teardown. */
+size_t btv_hfp_ag_feed(btv_hfp_ag *ag, const uint8_t *data, size_t bytes);
+size_t btv_hfp_ag_output(btv_hfp_ag *ag, uint8_t *output, size_t capacity);
+/* Atomic snapshot update. 1 accepted, 0 invalid/queue full (retain and retry
+ * whole snapshot). When reporting, queues every changed value without merging
+ * transitions; call precedes callsetup. When disabled, stores values silently.
+ * No changes are applied if all required events cannot fit the 16-entry queue. */
+int btv_hfp_ag_update(btv_hfp_ag *ag, const uint8_t indicators[7]);
+/* Commit immediately after RFCOMM copies the complete response, never on BUSY.
+ * READY then means baseline service-level exchange only, not audio delivery. */
+int btv_hfp_ag_sent(btv_hfp_ag *ag);
+#endif

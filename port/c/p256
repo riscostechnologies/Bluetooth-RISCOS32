@@ -1,0 +1,355 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        p256
+ * Purpose:     NIST P-256 key generation and ECDH. See p256.h.
+ * Licence:     BSD-2-Clause (see LICENSE).
+ ******************************************************************/
+#include "p256.h"
+#include <string.h>
+
+typedef uint32_t fe[8];          /* little-endian limbs */
+
+/* p = 2^256 - 2^224 + 2^192 + 2^96 - 1; n = the group order (FIPS 186-4
+ * D.1.2.3), limb 0 first. */
+static const fe P = { 0xffffffffu, 0xffffffffu, 0xffffffffu, 0, 0, 0,
+                      0x00000001u, 0xffffffffu };
+static const fe N = { 0xfc632551u, 0xf3b9cac2u, 0xa7179e84u, 0xbce6faadu,
+                      0xffffffffu, 0xffffffffu, 0, 0xffffffffu };
+static const fe B = { 0x27d2604bu, 0x3bce3c3eu, 0xcc53b0f6u, 0x651d06b0u,
+                      0x769886bcu, 0xb3ebbd55u, 0xaa3a93e7u, 0x5ac635d8u };
+static const fe GX = { 0xd898c296u, 0xf4a13945u, 0x2deb33a0u, 0x77037d81u,
+                       0x63a440f2u, 0xf8bce6e5u, 0xe12c4247u, 0x6b17d1f2u };
+static const fe GY = { 0x37bf51f5u, 0xcbb64068u, 0x6b315eceu, 0x2bce3357u,
+                       0x7c0f9e16u, 0x8ee7eb4au, 0xfe1a7f9bu, 0x4fe342e2u };
+
+/* R mod p and R^2 mod p, R = 2^256, made on first use. */
+static fe one_m, rr_m;
+static int constants_ready;
+
+static int geq(const fe a, const fe b)
+{
+    int i;
+    for (i = 7; i >= 0; --i)
+    {
+        if (a[i] != b[i]) return a[i] > b[i];
+    }
+    return 1;
+}
+
+static int is_zero(const fe a)
+{
+    uint32_t v = 0;
+    int i;
+    for (i = 0; i < 8; ++i) v |= a[i];
+    return v == 0;
+}
+
+static int equal(const fe a, const fe b)
+{
+    uint32_t v = 0;
+    int i;
+    for (i = 0; i < 8; ++i) v |= a[i] ^ b[i];
+    return v == 0;
+}
+
+static uint32_t add_raw(fe r, const fe a, const fe b)
+{
+    uint64_t carry = 0;
+    int i;
+    for (i = 0; i < 8; ++i)
+    {
+        carry += (uint64_t)a[i] + b[i];
+        r[i] = (uint32_t)carry;
+        carry >>= 32;
+    }
+    return (uint32_t)carry;
+}
+
+static uint32_t sub_raw(fe r, const fe a, const fe b)
+{
+    uint64_t borrow = 0;
+    int i;
+    for (i = 0; i < 8; ++i)
+    {
+        uint64_t d = (uint64_t)a[i] - b[i] - borrow;
+        r[i] = (uint32_t)d;
+        borrow = (d >> 32) & 1u;
+    }
+    return (uint32_t)borrow;
+}
+
+static void fe_add(fe r, const fe a, const fe b)
+{
+    uint32_t carry = add_raw(r, a, b);
+    if (carry || geq(r, P)) (void)sub_raw(r, r, P);
+}
+
+static void fe_sub(fe r, const fe a, const fe b)
+{
+    if (sub_raw(r, a, b)) (void)add_raw(r, r, P);
+}
+
+/* Montgomery product a*b/R mod p (word-wise CIOS). -p^-1 mod 2^32 is 1
+ * for this prime, so the quotient digit is just the low limb. */
+static void mul(fe r, const fe a, const fe b)
+{
+    uint32_t t[10];
+    int i, j;
+    memset(t, 0, sizeof(t));
+    for (i = 0; i < 8; ++i)
+    {
+        uint64_t x, carry = 0;
+        uint32_t m;
+        for (j = 0; j < 8; ++j)
+        {
+            x = (uint64_t)t[j] + (uint64_t)a[j] * b[i] + carry;
+            t[j] = (uint32_t)x;
+            carry = x >> 32;
+        }
+        x = (uint64_t)t[8] + carry;
+        t[8] = (uint32_t)x;
+        t[9] = (uint32_t)(x >> 32);
+        m = t[0];
+        x = (uint64_t)t[0] + (uint64_t)m * P[0];
+        carry = x >> 32;
+        for (j = 1; j < 8; ++j)
+        {
+            x = (uint64_t)t[j] + (uint64_t)m * P[j] + carry;
+            t[j - 1] = (uint32_t)x;
+            carry = x >> 32;
+        }
+        x = (uint64_t)t[8] + carry;
+        t[7] = (uint32_t)x;
+        t[8] = t[9] + (uint32_t)(x >> 32);
+    }
+    memcpy(r, t, 32);
+    if (t[8] || geq(r, P)) (void)sub_raw(r, r, P);
+}
+
+static void sqr(fe r, const fe a) { mul(r, a, a); }
+
+static void constants(void)
+{
+    fe x;
+    int i;
+    if (constants_ready) return;
+    memset(x, 0, sizeof(x));
+    x[0] = 1;
+    for (i = 0; i < 256; ++i) fe_add(x, x, x);
+    memcpy(one_m, x, sizeof(fe));
+    for (i = 0; i < 256; ++i) fe_add(x, x, x);
+    memcpy(rr_m, x, sizeof(fe));
+    constants_ready = 1;
+}
+
+static void to_mont(fe r, const fe a) { mul(r, a, rr_m); }
+
+static void from_mont(fe r, const fe a)
+{
+    fe one;
+    memset(one, 0, sizeof(one));
+    one[0] = 1;
+    mul(r, a, one);
+}
+
+/* a^-1 mod p (Montgomery form in and out) as a^(p-2). */
+static void invert(fe r, const fe a)
+{
+    fe exponent, result;
+    int i;
+    memcpy(exponent, P, sizeof(fe));
+    exponent[0] -= 2u;               /* P[0] is 0xffffffff: no borrow */
+    memcpy(result, one_m, sizeof(fe));
+    for (i = 255; i >= 0; --i)
+    {
+        sqr(result, result);
+        if ((exponent[i >> 5] >> (i & 31)) & 1u) mul(result, result, a);
+    }
+    memcpy(r, result, sizeof(fe));
+}
+
+/* ---- points ------------------------------------------------------ */
+
+typedef struct { fe x, y, z; int infinity; } jac;
+
+static void jac_double(jac *r)
+{
+    fe delta, gamma, beta, alpha, t1, t2, x3, y3, z3;
+    if (r->infinity) return;
+    if (is_zero(r->y)) { r->infinity = 1; return; }
+    sqr(delta, r->z);
+    sqr(gamma, r->y);
+    mul(beta, r->x, gamma);
+    fe_sub(t1, r->x, delta);
+    fe_add(t2, r->x, delta);
+    mul(alpha, t1, t2);              /* 3 (X - delta)(X + delta) */
+    fe_add(t1, alpha, alpha);
+    fe_add(alpha, t1, alpha);
+    sqr(x3, alpha);                  /* alpha^2 - 8 beta */
+    fe_add(t1, beta, beta);
+    fe_add(t1, t1, t1);              /* 4 beta */
+    fe_add(t2, t1, t1);              /* 8 beta */
+    fe_sub(x3, x3, t2);
+    fe_add(z3, r->y, r->z);          /* (Y + Z)^2 - gamma - delta */
+    sqr(z3, z3);
+    fe_sub(z3, z3, gamma);
+    fe_sub(z3, z3, delta);
+    fe_sub(t1, t1, x3);              /* alpha (4 beta - X3) - 8 gamma^2 */
+    mul(y3, alpha, t1);
+    sqr(t2, gamma);
+    fe_add(t2, t2, t2);
+    fe_add(t2, t2, t2);
+    fe_add(t2, t2, t2);
+    fe_sub(y3, y3, t2);
+    memcpy(r->x, x3, sizeof(fe));
+    memcpy(r->y, y3, sizeof(fe));
+    memcpy(r->z, z3, sizeof(fe));
+}
+
+/* r += (qx, qy), an affine point in Montgomery form. */
+static void jac_add_affine(jac *r, const fe qx, const fe qy)
+{
+    fe z1z1, u2, s2, h, hh, i4, j, rr, v, t, x3, y3, z3;
+    if (r->infinity)
+    {
+        memcpy(r->x, qx, sizeof(fe));
+        memcpy(r->y, qy, sizeof(fe));
+        memcpy(r->z, one_m, sizeof(fe));
+        r->infinity = 0;
+        return;
+    }
+    sqr(z1z1, r->z);
+    mul(u2, qx, z1z1);
+    mul(s2, qy, r->z);
+    mul(s2, s2, z1z1);
+    fe_sub(h, u2, r->x);
+    fe_sub(rr, s2, r->y);
+    if (is_zero(h))
+    {
+        if (is_zero(rr)) { jac_double(r); return; }
+        r->infinity = 1;             /* P + (-P) */
+        return;
+    }
+    fe_add(rr, rr, rr);              /* r = 2 (S2 - Y1) */
+    sqr(hh, h);
+    fe_add(i4, hh, hh);
+    fe_add(i4, i4, i4);              /* I = 4 HH */
+    mul(j, h, i4);
+    mul(v, r->x, i4);
+    sqr(x3, rr);                     /* r^2 - J - 2 V */
+    fe_sub(x3, x3, j);
+    fe_sub(x3, x3, v);
+    fe_sub(x3, x3, v);
+    fe_sub(t, v, x3);                /* r (V - X3) - 2 Y1 J */
+    mul(y3, rr, t);
+    mul(t, r->y, j);
+    fe_add(t, t, t);
+    fe_sub(y3, y3, t);
+    fe_add(z3, r->z, h);             /* (Z1 + H)^2 - Z1Z1 - HH */
+    sqr(z3, z3);
+    fe_sub(z3, z3, z1z1);
+    fe_sub(z3, z3, hh);
+    memcpy(r->x, x3, sizeof(fe));
+    memcpy(r->y, y3, sizeof(fe));
+    memcpy(r->z, z3, sizeof(fe));
+}
+
+/* k * (qx, qy) to affine, ordinary (non-Montgomery) form. Returns 0 for
+ * the point at infinity. */
+static int multiply(const fe k, const fe qx, const fe qy, fe ox, fe oy)
+{
+    jac acc;
+    fe mx, my, zi, zi2, x, y;
+    int i;
+    to_mont(mx, qx);
+    to_mont(my, qy);
+    memset(&acc, 0, sizeof(acc));
+    acc.infinity = 1;
+    for (i = 255; i >= 0; --i)
+    {
+        jac_double(&acc);
+        if ((k[i >> 5] >> (i & 31)) & 1u) jac_add_affine(&acc, mx, my);
+    }
+    if (acc.infinity) return 0;
+    invert(zi, acc.z);
+    sqr(zi2, zi);
+    mul(x, acc.x, zi2);
+    mul(y, acc.y, zi2);
+    mul(y, y, zi);
+    from_mont(ox, x);
+    from_mont(oy, y);
+    return 1;
+}
+
+static void load(fe r, const uint8_t b[32])
+{
+    int i;
+    for (i = 0; i < 8; ++i)
+        r[i] = (uint32_t)b[4 * i] | (uint32_t)b[4 * i + 1] << 8 |
+               (uint32_t)b[4 * i + 2] << 16 | (uint32_t)b[4 * i + 3] << 24;
+}
+
+static void store(uint8_t b[32], const fe a)
+{
+    int i;
+    for (i = 0; i < 8; ++i)
+    {
+        b[4 * i] = (uint8_t)a[i];
+        b[4 * i + 1] = (uint8_t)(a[i] >> 8);
+        b[4 * i + 2] = (uint8_t)(a[i] >> 16);
+        b[4 * i + 3] = (uint8_t)(a[i] >> 24);
+    }
+}
+
+int btv_p256_private_ok(const uint8_t key[32])
+{
+    fe k;
+    load(k, key);
+    return !is_zero(k) && !geq(k, N);
+}
+
+int btv_p256_public(const uint8_t key[32], uint8_t pub[64])
+{
+    fe k, x, y;
+    if (!btv_p256_private_ok(key)) return 0;
+    constants();
+    load(k, key);
+    if (!multiply(k, GX, GY, x, y)) return 0;
+    store(pub, x);
+    store(pub + 32, y);
+    return 1;
+}
+
+int btv_p256_valid(const uint8_t pub[64])
+{
+    fe x, y, mx, my, lhs, rhs, t;
+    constants();
+    load(x, pub);
+    load(y, pub + 32);
+    if (geq(x, P) || geq(y, P)) return 0;
+    to_mont(mx, x);
+    to_mont(my, y);
+    sqr(lhs, my);
+    sqr(rhs, mx);                    /* x^3 - 3x + b */
+    mul(rhs, rhs, mx);
+    fe_add(t, mx, mx);
+    fe_add(t, t, mx);
+    fe_sub(rhs, rhs, t);
+    to_mont(t, B);
+    fe_add(rhs, rhs, t);
+    return equal(lhs, rhs);
+}
+
+int btv_p256_shared(const uint8_t key[32], const uint8_t peer[64],
+                    uint8_t secret[32])
+{
+    fe k, qx, qy, x, y;
+    if (!btv_p256_private_ok(key) || !btv_p256_valid(peer)) return 0;
+    load(k, key);
+    load(qx, peer);
+    load(qy, peer + 32);
+    if (!multiply(k, qx, qy, x, y)) return 0;
+    store(secret, x);
+    return 1;
+}

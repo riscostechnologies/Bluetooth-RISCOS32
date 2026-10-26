@@ -1,0 +1,1891 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        bt_le
+ * Purpose:     Low Energy input devices over the Bluetooth core.
+ *              Security Manager as initiator: LE Secure Connections
+ *              (P-256 ECDH, f4/f5/f6; just works, or passkey entry where we
+ *              show the number) and LE legacy pairing, then encryption with
+ *              the stored key on every reconnect.  GATT client: find the
+ *              HID service; read its Report Map and subscribe to the input
+ *              reports (report mode), or, for a device with no usable map,
+ *              switch to boot protocol and subscribe to the boot keyboard
+ *              and mouse reports.
+ * Reference:   Bluetooth Core Spec Vol 3 Part H 2.3 (pairing phases),
+ *              2.3.5.6 (Secure Connections), 3.5 (PDU formats); Vol 3
+ *              Part F (ATT); HID over GATT Profile 1.0.
+ ******************************************************************/
+#include "bt_profiles.h"
+#include "hid_riscos.h"
+#include "le_crypto.h"
+#include "p256.h"
+#include <string.h>
+
+#define CID_ATT 0x0004u
+#define CID_SMP 0x0006u
+#define STEP_TIMEOUT_MS 30000u
+#define DROP_DELAY_MS 100u
+#define KEYS_GRACE_MS 2000u
+#define STALE_LIMIT 6          /* failures in a row, not key refusals */
+
+/* SMP codes. */
+#define SMP_PAIRING_REQUEST 0x01
+#define SMP_PAIRING_RESPONSE 0x02
+#define SMP_PAIRING_CONFIRM 0x03
+#define SMP_PAIRING_RANDOM 0x04
+#define SMP_PAIRING_FAILED 0x05
+#define SMP_ENCRYPTION_INFO 0x06
+#define SMP_MASTER_ID 0x07
+#define SMP_IDENTITY_INFO 0x08
+#define SMP_IDENTITY_ADDRESS 0x09
+#define SMP_SIGNING_INFO 0x0a
+#define SMP_SECURITY_REQUEST 0x0b
+#define SMP_PUBLIC_KEY 0x0c
+#define SMP_DHKEY_CHECK 0x0d
+#define SMP_KEYPRESS 0x0e
+
+#define SMP_AUTH_BOND 0x01u
+#define SMP_AUTH_MITM 0x04u
+#define SMP_AUTH_SC 0x08u
+#define SMP_ERR_CONFIRM 0x04
+#define SMP_ERR_KEY_SIZE 0x06
+#define SMP_ERR_UNSPECIFIED 0x08
+#define SMP_ERR_REPEATED 0x09
+#define SMP_ERR_INVALID 0x0a
+#define SMP_ERR_DHKEY 0x0b
+#define PASSKEY_ROUNDS 20
+
+#define KEY_ENC 1u
+#define KEY_ID 2u
+#define KEY_SIGN 4u
+
+/* ATT opcodes. */
+#define ATT_ERROR 0x01
+#define ATT_MTU_REQUEST 0x02
+#define ATT_MTU_RESPONSE 0x03
+#define ATT_FIND_INFO_REQUEST 0x04
+#define ATT_FIND_INFO_RESPONSE 0x05
+#define ATT_FIND_BY_VALUE_REQUEST 0x06
+#define ATT_FIND_BY_VALUE_RESPONSE 0x07
+#define ATT_READ_BY_TYPE_REQUEST 0x08
+#define ATT_READ_BY_TYPE_RESPONSE 0x09
+#define ATT_READ_REQUEST 0x0a
+#define ATT_READ_RESPONSE 0x0b
+#define ATT_READ_BLOB_REQUEST 0x0c
+#define ATT_READ_BLOB_RESPONSE 0x0d
+#define ATT_WRITE_REQUEST 0x12
+#define ATT_WRITE_RESPONSE 0x13
+#define ATT_NOTIFY 0x1b
+#define ATT_INDICATE 0x1d
+#define ATT_CONFIRM 0x1e
+#define ATT_WRITE_COMMAND 0x52
+
+#define UUID_PROTOCOL_MODE 0x2a4eu
+#define UUID_REPORT 0x2a4du
+#define UUID_REPORT_MAP 0x2a4bu
+#define UUID_CCCD 0x2902u
+#define UUID_REPORT_REFERENCE 0x2908u
+
+/* A Report Map is read in 22-octet pieces (the default ATT MTU is 23); no
+ * descriptor of a mouse or keyboard comes near this. */
+#define MAP_LIMIT 1536u
+#define ATT_DEFAULT_MTU 23u
+#define UUID_BOOT_KEYBOARD_IN 0x2a22u
+#define UUID_BOOT_KEYBOARD_OUT 0x2a32u
+#define UUID_BOOT_MOUSE_IN 0x2a33u
+#define UUID_BATTERY_SERVICE 0x180fu
+#define UUID_BATTERY_LEVEL 0x2a19u
+#define BATTERY_DELAY_MS 400u        /* after the input reports are on */
+
+extern btv_hid_riscos btp_hid_riscos;
+extern uint32_t btc_passkey, btc_passkey_generation;
+
+static uint16_t read16(const uint8_t *p)
+{
+    return (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
+}
+
+static void write16(uint8_t *p, uint16_t value)
+{
+    p[0] = (uint8_t)value;
+    p[1] = (uint8_t)(value >> 8);
+}
+
+static btp_le *for_link(btc_core *core, uint8_t link)
+{
+    return link < BTC_LINKS ? &core->profiles->le[link] : 0;
+}
+
+static void step(btp_le *l, uint8_t next, uint32_t now)
+{
+    if (l->state != next)
+        btc_note("LE link state, link|state", (uint32_t)l->link << 8 | next);
+    if (l->state != next) ++btc_profile_generation;
+    l->state = next;
+    l->step_started = now;
+}
+
+static void detach(btp_le *l)
+{
+    if (l->keyboard)
+        btv_hid_riscos_keyboard_detach(&btp_hid_riscos, &l->kb);
+    if (l->mouse)
+        btv_hid_riscos_mouse_detach(&btp_hid_riscos, &l->pointer);
+    l->keyboard = l->mouse = 0;
+}
+
+/* detach, and the controller (which needs the core). */
+static void detach_all(btc_core *core, btp_le *l)
+{
+    detach(l);
+    btp_hid_extras_detach(core, &l->pad, &l->pad_attached);
+}
+
+static btp_sc *sc_of(btc_core *core, const btp_le *l)
+{
+    btp_sc *sc = &core->profiles->sc;
+    return sc->owner == l->link + 1u ? sc : 0;
+}
+
+/* The private key and DHKey must not outlive the pairing. */
+static void sc_release(btc_core *core, const btp_le *l)
+{
+    btp_sc *sc = sc_of(core, l);
+    if (sc != 0) memset(sc, 0, sizeof(*sc));
+}
+
+static void fail(btc_core *core, btp_le *l, uint32_t error)
+{
+    sc_release(core, l);
+    l->error = error;
+    detach_all(core, l);
+    step(l, BTP_LE_FAILED, core->now);
+    /* Area 0x0b: the code is this file's (0x20 and up); 0x0c: an HCI status
+     * from LE Start Encryption (error 0x100 | status). */
+    core->last_problem = error >= 0x100u ? (0x0c00u | (error & 0xffu))
+                                         : (0x0b00u | error);
+    memcpy(core->problem_address, core->links[l->link].address, 6);
+    /* The link is dropped a moment later, so that a Pairing Failed PDU
+     * sent just before reaches the device (btp_le_pump). */
+    l->drop = 1;
+    l->drop_at = core->now + DROP_DELAY_MS;
+}
+
+/* A stored key for this link: by address, or by resolving a random
+ * private address with a stored identity key. */
+static btc_key *key_for(btc_core *core, const uint8_t address[6])
+{
+    unsigned int index;
+    btc_key *key = btc_key_find(core, address);
+    if (key != 0 && key->le) return key;
+    if ((address[5] & 0xc0) != 0x40) return 0;   /* not resolvable */
+    for (index = 0; index < BTC_KEYS; ++index)
+    {
+        btc_key *k = &core->keys[index];
+        uint8_t hash[3];
+        if (!k->used || !k->le || !k->has_irk) continue;
+        btv_smp_ah(k->irk, address + 3, hash);
+        if (memcmp(hash, address, 3) == 0) return k;
+    }
+    return 0;
+}
+
+/* Every SMP PDU, in and out, goes to the trace: its code and length, and
+ * for the pairing PDUs what they negotiate. */
+static void smp_log(const char *direction, const uint8_t *p, size_t bytes)
+{
+    if (bytes == 0) return;
+    btc_note(direction, (uint32_t)p[0] << 8 | (uint32_t)(bytes & 0xffu));
+    if ((p[0] == SMP_PAIRING_REQUEST || p[0] == SMP_PAIRING_RESPONSE) &&
+        bytes >= 7)
+    {
+        btc_note("  io|oob|auth|keysize", (uint32_t)p[1] << 24 |
+                 (uint32_t)p[2] << 16 | (uint32_t)p[3] << 8 | p[4]);
+        btc_note("  initiator keys|responder keys", (uint32_t)p[5] << 8 | p[6]);
+    }
+    else if (p[0] == SMP_PAIRING_FAILED && bytes >= 2)
+        btc_note("  pairing failed, reason", p[1]);
+}
+
+static int smp_send(btc_core *core, btp_le *l, const uint8_t *data,
+                    size_t bytes)
+{
+    smp_log("SMP out, code|length", data, bytes);
+    return btc_le_send(core, l->link, CID_SMP, data, bytes);
+}
+
+static void att_send(btc_core *core, btp_le *l, const uint8_t *data,
+                     size_t bytes)
+{
+    if (data[0] != ATT_WRITE_COMMAND && data[0] != ATT_CONFIRM &&
+        (data[0] & 1u) == 0)
+        l->waiting_opcode = data[0];
+    (void)btc_le_send(core, l->link, CID_ATT, data, bytes);
+}
+
+/* ---- connection parameters ---------------------------------------- */
+
+/* Connecting and pairing use 30 to 50 ms (bt_core.c). Once the device is
+ * set up, a mouse wants 7.5 to 15 ms, no latency and a 4 s supervision
+ * timeout: 133 to 66 reports a second, as USB mice give. HCI LE Connection
+ * Update (0x2013); the controller's answer is traced (LE Connection Update
+ * Complete) so the log shows what the device accepted. */
+static void update_link(btc_core *core, btp_le *l, uint16_t min, uint16_t max,
+                        uint16_t latency, uint16_t timeout)
+{
+    uint8_t p[14];
+    write16(p, core->links[l->link].handle);
+    write16(p + 2, min);
+    write16(p + 4, max);
+    write16(p + 6, latency);
+    write16(p + 8, timeout);
+    write16(p + 10, 0);
+    write16(p + 12, 0);
+    btc_note("asking for connection interval min|max", (uint32_t)min << 16 | max);
+    (void)btc_command_queue(core, 0x2013, p, 14, BTC_R_IGNORE, l->link);
+}
+
+/* ---- Security Manager --------------------------------------------- */
+
+static void start_pairing(btc_core *core, btp_le *l)
+{
+    uint8_t *p = l->preq;
+    p[0] = SMP_PAIRING_REQUEST;
+    p[1] = 0x00;            /* DisplayOnly: a keyboard types our passkey */
+    p[2] = 0x00;            /* no OOB */
+    p[3] = SMP_AUTH_BOND | SMP_AUTH_SC;   /* bonding, Secure Connections */
+    p[4] = 16;              /* maximum key size */
+    p[5] = KEY_ENC | KEY_ID;   /* we send our identity (devices such as
+                                  Logitech's want the central's keys too) */
+    p[6] = KEY_ENC | KEY_ID;
+    l->smp_step = BTP_SMP_RESPONSE;
+    l->rand_have = 0;
+    l->received_keys = 0;
+    l->sc = 0;
+    sc_release(core, l);
+    step(l, BTP_LE_PAIRING, core->now);
+    (void)smp_send(core, l, p, 7);
+}
+
+static void start_encryption(btc_core *core, btp_le *l, const uint8_t *ltk,
+                             const uint8_t *rand, const uint8_t *ediv)
+{
+    uint8_t p[28];
+    /* Where the key came from: a bond we hold, or one just made. */
+    btc_note(l->state == BTP_LE_ENCRYPTING ?
+             "LE encryption with the STORED key, ediv|rand0" :
+             "LE encryption with the key just made, ediv|rand0",
+             (uint32_t)ediv[0] << 24 | (uint32_t)ediv[1] << 16 |
+             (uint32_t)rand[0] << 8 | rand[1]);
+    btc_note("  key first octets", (uint32_t)ltk[0] << 24 |
+             (uint32_t)ltk[1] << 16 | (uint32_t)ltk[2] << 8 | ltk[3]);
+    write16(p, core->links[l->link].handle);
+    memcpy(p + 2, rand, 8);
+    memcpy(p + 10, ediv, 2);
+    memcpy(p + 12, ltk, 16);
+    (void)btc_command_queue(core, 0x2019, p, 28, BTC_R_LE_ENCRYPT, l->link);
+}
+
+static void request_random(btc_core *core, btp_le *l)
+{
+    (void)btc_command_queue(core, 0x2018, 0, 0, BTC_R_LE_RAND, l->link);
+}
+
+static void pairing_failed(btc_core *core, btp_le *l, uint8_t reason)
+{
+    uint8_t p[2];
+    p[0] = SMP_PAIRING_FAILED;
+    p[1] = reason;
+    (void)smp_send(core, l, p, 2);
+    fail(core, l, 0x40u | reason);
+}
+
+static void send_confirm(btc_core *core, btp_le *l)
+{
+    btc_link *link = &core->links[l->link];
+    uint8_t p[17];
+    btv_smp_c1(l->tk, l->mrand, l->preq, l->pres, 0, core->info.address,
+               link->address_type, link->address, l->mconfirm);
+    p[0] = SMP_PAIRING_CONFIRM;
+    memcpy(p + 1, l->mconfirm, 16);
+    l->smp_step = BTP_SMP_CONFIRM;
+    (void)smp_send(core, l, p, 17);
+}
+
+/* ---- LE Secure Connections ------------------------------------------
+ *
+ * Core Spec Vol 3 Part H 2.3.5.6.  We are the initiator and the device
+ * the responder.  Public key exchange; then authentication stage 1 (just
+ * works: confirm, nonces, no number to compare as we only show; passkey
+ * entry: twenty rounds, one bit of the passkey each); then stage 2, the
+ * DHKey checks Ea and Eb made with f5's MacKey; then LE Start Encryption
+ * with the LTK f5 made (EDIV and Rand are zero for Secure Connections).
+ * Nonces are made from the controller's random numbers: 16 octets of seed
+ * and AES-CMAC under it with a label and the round number. */
+
+static void sc_nonce(const btp_sc *sc, uint8_t round, uint8_t out[16])
+{
+    uint8_t label[2];
+    label[0] = 'N';
+    label[1] = round;
+    btv_aes_cmac(sc->rnd + 32, label, 2, out);
+}
+
+/* The six-digit passkey we show, from the seed. */
+static uint32_t sc_passkey(const btp_sc *sc)
+{
+    uint8_t label = 'P', tag[16];
+    uint32_t value;
+    btv_aes_cmac(sc->rnd + 32, &label, 1, tag);
+    value = ((uint32_t)tag[0] | ((uint32_t)tag[1] << 8) |
+             ((uint32_t)tag[2] << 16)) & 0xfffffu;
+    if (value >= 1000000u) value -= 1000000u;
+    return value;
+}
+
+/* The z byte of f4 for a passkey round: 0x80 | the bit being proved. */
+static uint8_t sc_z(const btp_sc *sc)
+{
+    return (uint8_t)(0x80u | ((sc->passkey >> sc->round) & 1u));
+}
+
+static void sc_start(btc_core *core, btp_le *l)
+{
+    btp_sc *sc = &core->profiles->sc;
+    if (sc->owner != 0 && sc->owner != l->link + 1u)
+    {
+        pairing_failed(core, l, SMP_ERR_REPEATED);   /* one pairing at a time */
+        return;
+    }
+    memset(sc, 0, sizeof(*sc));
+    sc->owner = (uint8_t)(l->link + 1u);
+    sc->passkey_entry = l->passkey_entry;
+    l->smp_step = BTP_SMP_SC_RANDOM;
+    request_random(core, l);
+}
+
+static void sc_random(btc_core *core, btp_le *l, uint8_t status,
+                      const uint8_t *data, size_t bytes)
+{
+    btp_sc *sc = sc_of(core, l);
+    uint8_t p[65];
+    if (sc == 0) return;
+    if (status != 0 || bytes < 8)
+    {
+        pairing_failed(core, l, SMP_ERR_UNSPECIFIED);
+        return;
+    }
+    memcpy(sc->rnd + sc->rand_have, data, 8);
+    sc->rand_have = (uint8_t)(sc->rand_have + 8);
+    if (sc->rand_have < sizeof(sc->rnd))
+    {
+        request_random(core, l);
+        return;
+    }
+    if (!btv_p256_public(sc->rnd, sc->pka))
+    {
+        /* Not below the group order (or zero): draw another key. */
+        if (++sc->round > 4)
+        {
+            pairing_failed(core, l, SMP_ERR_UNSPECIFIED);
+            return;
+        }
+        sc->rand_have = 0;
+        request_random(core, l);
+        return;
+    }
+    sc->round = 0;
+    p[0] = SMP_PUBLIC_KEY;
+    memcpy(p + 1, sc->pka, 64);
+    l->smp_step = BTP_SMP_SC_KEY;
+    (void)smp_send(core, l, p, 65);
+}
+
+static void sc_send_confirm(btc_core *core, btp_le *l, btp_sc *sc)
+{
+    uint8_t p[17];
+    p[0] = SMP_PAIRING_CONFIRM;
+    /* Ca = f4(PKa, PKb, Na, z): passkey entry sends one per round. */
+    btv_smp_f4(sc->pka, sc->pkb, sc->na, sc_z(sc), p + 1);
+    (void)smp_send(core, l, p, 17);
+}
+
+static void sc_send_nonce(btc_core *core, btp_le *l, const btp_sc *sc)
+{
+    uint8_t p[17];
+    p[0] = SMP_PAIRING_RANDOM;
+    memcpy(p + 1, sc->na, 16);
+    (void)smp_send(core, l, p, 17);
+}
+
+static void sc_public_key(btc_core *core, btp_le *l, btp_sc *sc,
+                          const uint8_t *p, size_t bytes)
+{
+    if (l->smp_step != BTP_SMP_SC_KEY || bytes < 65) return;
+    memcpy(sc->pkb, p + 1, 64);
+    /* An invalid point (or our own key reflected back) ends the pairing
+     * before the private key is used with it. */
+    if (!btv_p256_valid(sc->pkb) || memcmp(sc->pka, sc->pkb, 64) == 0 ||
+        !btv_p256_shared(sc->rnd, sc->pkb, sc->dhkey))
+    {
+        pairing_failed(core, l, SMP_ERR_INVALID);
+        return;
+    }
+    if (sc->passkey_entry)
+    {
+        sc->passkey = sc_passkey(sc);
+        btc_passkey = sc->passkey;
+        ++btc_passkey_generation;
+        memcpy(core->problem_address, core->links[l->link].address, 6);
+        sc->round = 0;
+        sc_nonce(sc, 0, sc->na);
+        sc_send_confirm(core, l, sc);
+        l->smp_step = BTP_SMP_SC_ROUND_CONFIRM;
+    }
+    else
+        l->smp_step = BTP_SMP_SC_CONFIRM;
+}
+
+/* Stage 1 is done (Na and Nb are final): MacKey and LTK, then our check. */
+static void sc_stage_two(btc_core *core, btp_le *l, btp_sc *sc)
+{
+    btc_link *link = &core->links[l->link];
+    uint8_t r[16], p[17];
+    memset(r, 0, sizeof(r));
+    if (sc->passkey_entry)
+    {
+        r[0] = (uint8_t)sc->passkey;
+        r[1] = (uint8_t)(sc->passkey >> 8);
+        r[2] = (uint8_t)(sc->passkey >> 16);
+    }
+    btv_smp_f5(sc->dhkey, sc->na, sc->nb, 0, core->info.address,
+               link->address_type, link->address, sc->mackey, l->ltk);
+    p[0] = SMP_DHKEY_CHECK;
+    btv_smp_f6(sc->mackey, sc->na, sc->nb, r, l->preq + 1, 0,
+               core->info.address, link->address_type, link->address, p + 1);
+    l->smp_step = BTP_SMP_SC_CHECK;
+    (void)smp_send(core, l, p, 17);
+}
+
+static void sc_data(btc_core *core, btp_le *l, btp_sc *sc, const uint8_t *p,
+                    size_t bytes)
+{
+    btc_link *link = &core->links[l->link];
+    uint8_t check[16];
+    switch (p[0])
+    {
+    case SMP_PUBLIC_KEY:
+        sc_public_key(core, l, sc, p, bytes);
+        break;
+    case SMP_PAIRING_CONFIRM:
+        if (bytes < 17) break;
+        if (l->smp_step == BTP_SMP_SC_CONFIRM)
+        {
+            memcpy(sc->cb, p + 1, 16);
+            sc_nonce(sc, 0, sc->na);
+            sc_send_nonce(core, l, sc);
+            l->smp_step = BTP_SMP_SC_NONCE;
+        }
+        else if (l->smp_step == BTP_SMP_SC_ROUND_CONFIRM)
+        {
+            memcpy(sc->cb, p + 1, 16);
+            sc_send_nonce(core, l, sc);
+            l->smp_step = BTP_SMP_SC_ROUND_NONCE;
+        }
+        break;
+    case SMP_PAIRING_RANDOM:
+        if (bytes < 17) break;
+        if (l->smp_step != BTP_SMP_SC_NONCE &&
+            l->smp_step != BTP_SMP_SC_ROUND_NONCE)
+            break;
+        memcpy(sc->nb, p + 1, 16);
+        /* Cb = f4(PKb, PKa, Nb, z): z is 0 for just works. */
+        btv_smp_f4(sc->pkb, sc->pka, sc->nb,
+                   l->smp_step == BTP_SMP_SC_NONCE ? 0 : sc_z(sc), check);
+        if (memcmp(check, sc->cb, 16) != 0)
+        {
+            pairing_failed(core, l, SMP_ERR_CONFIRM);
+            break;
+        }
+        if (l->smp_step == BTP_SMP_SC_ROUND_NONCE &&
+            ++sc->round < PASSKEY_ROUNDS)
+        {
+            sc_nonce(sc, sc->round, sc->na);
+            sc_send_confirm(core, l, sc);
+            l->smp_step = BTP_SMP_SC_ROUND_CONFIRM;
+            break;
+        }
+        sc_stage_two(core, l, sc);
+        break;
+    case SMP_DHKEY_CHECK:
+    {
+        uint8_t r[16];
+        static const uint8_t zero[8] = { 0 };
+        if (l->smp_step != BTP_SMP_SC_CHECK || bytes < 17) break;
+        memset(r, 0, sizeof(r));
+        if (sc->passkey_entry)
+        {
+            r[0] = (uint8_t)sc->passkey;
+            r[1] = (uint8_t)(sc->passkey >> 8);
+            r[2] = (uint8_t)(sc->passkey >> 16);
+        }
+        /* Eb = f6(MacKey, Nb, Na, ra, IOcapB, B, A). */
+        btv_smp_f6(sc->mackey, sc->nb, sc->na, r, l->pres + 1,
+                   link->address_type, link->address, 0, core->info.address,
+                   check);
+        if (memcmp(check, p + 1, 16) != 0)
+        {
+            pairing_failed(core, l, SMP_ERR_DHKEY);
+            break;
+        }
+        sc_release(core, l);
+        l->smp_step = BTP_SMP_ENCRYPT;
+        start_encryption(core, l, l->ltk, zero, zero);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+/* LE Rand results: 16 bytes of pairing random, plus passkey bits. */
+void btp_le_rand(btc_core *core, uint8_t link, uint8_t status,
+                 const uint8_t *data, size_t bytes)
+{
+    btp_le *l = for_link(core, link);
+    if (l != 0 && l->smp_step == BTP_SMP_SC_RANDOM)
+    {
+        sc_random(core, l, status, data, bytes);
+        return;
+    }
+    if (l == 0 || l->smp_step != BTP_SMP_RANDOM) return;
+    if (status != 0 || bytes < 8)
+    {
+        pairing_failed(core, l, 0x08);   /* unspecified reason */
+        return;
+    }
+    memcpy(l->mrand + l->rand_have, data, 8);
+    l->rand_have = (uint8_t)(l->rand_have + 8);
+    if (l->rand_have < 16)
+    {
+        request_random(core, l);
+        return;
+    }
+    memset(l->tk, 0, sizeof(l->tk));
+    if (l->passkey_entry)
+    {
+        uint32_t passkey = ((uint32_t)l->mrand[13] |
+                            ((uint32_t)l->mrand[14] << 8) |
+                            ((uint32_t)l->mrand[15] << 16)) & 0xfffffu;
+        if (passkey >= 1000000u) passkey -= 1000000u;
+        l->tk[0] = (uint8_t)passkey;
+        l->tk[1] = (uint8_t)(passkey >> 8);
+        l->tk[2] = (uint8_t)(passkey >> 16);
+        btc_passkey = passkey;
+        ++btc_passkey_generation;
+        memcpy(core->problem_address, core->links[link].address, 6);
+    }
+    send_confirm(core, l);
+}
+
+static void pairing_response(btc_core *core, btp_le *l, const uint8_t *p,
+                             size_t bytes)
+{
+    uint8_t io, mitm;
+    if (l->smp_step != BTP_SMP_RESPONSE || bytes < 7) return;
+    memcpy(l->pres, p, 7);
+    io = p[1];
+    mitm = (uint8_t)((l->preq[3] | p[3]) & SMP_AUTH_MITM);
+    /* Both asked for Secure Connections: that is the pairing. */
+    l->sc = (uint8_t)((p[3] & l->preq[3] & SMP_AUTH_SC) != 0);
+    l->key_size = l->sc ? 16 : (p[4] < 16 ? p[4] : 16);
+    if (l->key_size < 7)
+    {
+        pairing_failed(core, l, SMP_ERR_KEY_SIZE);
+        return;
+    }
+    /* With Secure Connections the LTK is made here, not sent (EncKey is
+     * ignored); the identity key may still come. */
+    l->expected_keys = (uint8_t)(p[6] & (l->sc ? KEY_ID : (KEY_ENC | KEY_ID)));
+    /* We display, the device types: passkey entry when it has keys and
+     * someone asked for MITM protection; otherwise just works. */
+    l->passkey_entry = (uint8_t)(mitm && (io == 0x02 || io == 0x04));
+    if (l->sc)
+    {
+        sc_start(core, l);
+        return;
+    }
+    l->smp_step = BTP_SMP_RANDOM;
+    l->rand_have = 0;
+    request_random(core, l);
+}
+
+static void keys_check(btc_core *core, btp_le *l);
+
+static void smp_data(btc_core *core, btp_le *l, const uint8_t *p,
+                     size_t bytes)
+{
+    btc_key *key;
+    uint8_t check[16];
+    if (bytes == 0) return;
+    if (l->sc)
+    {
+        btp_sc *sc = sc_of(core, l);
+        if (p[0] == SMP_PUBLIC_KEY || p[0] == SMP_PAIRING_CONFIRM ||
+            p[0] == SMP_PAIRING_RANDOM || p[0] == SMP_DHKEY_CHECK)
+        {
+            if (sc != 0) sc_data(core, l, sc, p, bytes);
+            return;
+        }
+        /* The LTK came from f5, not from the device. */
+        if (p[0] == SMP_ENCRYPTION_INFO || p[0] == SMP_MASTER_ID) return;
+    }
+    switch (p[0])
+    {
+    case SMP_SECURITY_REQUEST:
+        if (l->state != BTP_LE_IDLE && l->state != BTP_LE_READY &&
+            l->state != BTP_LE_SERVICE)
+            break;
+        key = key_for(core, core->links[l->link].address);
+        if (key != 0)
+        {
+            step(l, BTP_LE_ENCRYPTING, core->now);
+            start_encryption(core, l, key->key, key->rand, key->ediv);
+        }
+        else
+            start_pairing(core, l);
+        break;
+    case SMP_PAIRING_RESPONSE:
+        pairing_response(core, l, p, bytes);
+        break;
+    case SMP_PAIRING_CONFIRM:
+        if (l->smp_step != BTP_SMP_CONFIRM || bytes < 17) break;
+        memcpy(l->sconfirm, p + 1, 16);
+        {
+            uint8_t r[17];
+            r[0] = SMP_PAIRING_RANDOM;
+            memcpy(r + 1, l->mrand, 16);
+            l->smp_step = BTP_SMP_PEER_RANDOM;
+            (void)smp_send(core, l, r, 17);
+        }
+        break;
+    case SMP_PAIRING_RANDOM:
+    {
+        btc_link *link = &core->links[l->link];
+        uint8_t stk[16];
+        if (l->smp_step != BTP_SMP_PEER_RANDOM || bytes < 17) break;
+        memcpy(l->srand, p + 1, 16);
+        btv_smp_c1(l->tk, l->srand, l->preq, l->pres, 0, core->info.address,
+                   link->address_type, link->address, check);
+        if (memcmp(check, l->sconfirm, 16) != 0)
+        {
+            pairing_failed(core, l, 0x04);   /* confirm value failed */
+            break;
+        }
+        /* STK = s1(TK, Srand, Mrand): the responder's random first (Core spec
+         * Vol 3 Part H 2.2.5; this was the other way round). */
+        btv_smp_s1(l->tk, l->srand, l->mrand, stk);
+        if (l->key_size < 16)
+            memset(stk + l->key_size, 0, 16u - l->key_size);
+        l->smp_step = BTP_SMP_ENCRYPT;
+        {
+            static const uint8_t zero[8] = { 0 };
+            start_encryption(core, l, stk, zero, zero);
+        }
+        break;
+    }
+    case SMP_PAIRING_FAILED:
+        fail(core, l, 0x80u | (bytes > 1 ? p[1] : 0));
+        break;
+    case SMP_ENCRYPTION_INFO:
+        if (bytes >= 17)
+        {
+            memcpy(l->ltk, p + 1, 16);
+            l->received_keys |= 0x10;
+        }
+        break;
+    case SMP_MASTER_ID:
+        if (bytes >= 11)
+        {
+            memcpy(l->ediv, p + 1, 2);
+            memcpy(l->rand, p + 3, 8);
+            l->received_keys |= KEY_ENC;
+        }
+        break;
+    case SMP_IDENTITY_INFO:
+        if (bytes >= 17)
+        {
+            memcpy(l->irk, p + 1, 16);
+            l->received_keys |= 0x20;
+        }
+        break;
+    case SMP_IDENTITY_ADDRESS:
+        if (bytes >= 8)
+        {
+            memcpy(l->identity, p + 1, 7);
+            l->received_keys |= KEY_ID;
+        }
+        break;
+    default:
+        break;
+    }
+    if (p[0] >= SMP_ENCRYPTION_INFO && p[0] <= SMP_SIGNING_INFO)
+        keys_check(core, l);
+}
+
+static void begin_gatt(btc_core *core, btp_le *l);
+
+/* Encryption with a stored key that fails for a reason other than the
+ * device refusing it (a link timeout, say) says nothing about the key once,
+ * but twice in a row it is not worth keeping: the bond is dropped and the
+ * next connection pairs afresh. */
+static struct { uint8_t address[6]; uint8_t count; } stale[4];
+static unsigned int stale_next;
+
+static uint8_t *stale_count(const uint8_t address[6], int create)
+{
+    unsigned int i;
+    for (i = 0; i < 4u; ++i)
+        if (stale[i].count != 0 && memcmp(stale[i].address, address, 6) == 0)
+            return &stale[i].count;
+    if (!create) return 0;
+    i = stale_next++ & 3u;
+    memcpy(stale[i].address, address, 6);
+    stale[i].count = 0;
+    return &stale[i].count;
+}
+
+/* The LTK is ours to keep as soon as the link is encrypted (made by f5,
+ * or, in legacy pairing, once the device has sent it). Keep it at once: a
+ * device that is slow with, or leaves out, its identity keys is bonded all
+ * the same; its identity (IRK and address) is added when it arrives. */
+static int have_ltk(const btp_le *l)
+{
+    return l->sc || (l->received_keys & 0x10 && l->received_keys & KEY_ENC);
+}
+
+static void store_bond(btc_core *core, btp_le *l)
+{
+    btc_link *link = &core->links[l->link];
+    btc_device *device;
+    btc_key *key;
+    const uint8_t *address = link->address;
+    uint8_t address_type = link->address_type;
+    int identity = (l->received_keys & 0x20) && (l->received_keys & KEY_ID);
+    if (!have_ltk(l)) return;
+    if (identity)
+    {
+        /* Under the identity address; adverts from new random addresses are
+         * resolved with the IRK. */
+        address = l->identity + 1;
+        address_type = l->identity[0];
+        if (memcmp(address, link->address, 6) != 0 &&
+            btc_key_find(core, link->address) != 0)
+            (void)btc_key_forget(core, link->address);
+    }
+    key = btc_key_store(core, address, 1);
+    if (key == 0) return;
+    memcpy(key->key, l->ltk, 16);
+    /* Secure Connections: EDIV and Rand are zero. */
+    memcpy(key->ediv, l->ediv, 2);
+    memcpy(key->rand, l->rand, 8);
+    key->address_type = address_type;
+    key->key_size = l->key_size;
+    if (identity)
+    {
+        memcpy(key->irk, l->irk, 16);
+        key->has_irk = 1;
+    }
+    device = btc_device_find(core, link->address);
+    key->flags = (uint16_t)(BTC_DEV_HID | BTC_DEV_LE |
+        (device != 0 ? device->flags &
+         (BTC_DEV_KEYBOARD | BTC_DEV_MOUSE | BTC_DEV_GAMEPAD) : 0));
+    if (device != 0)
+    {
+        /* The device found by scanning (under whatever address it used) is
+         * the bonded one: it moves to the paired devices, listed under its
+         * identity address. */
+        device->flags |= BTC_DEV_PAIRED | BTC_DEV_LE;
+        memcpy(device->identity, address, 6);
+        device->identity_type = address_type;
+        device->has_identity = 1;
+    }
+    {
+        uint8_t *count = stale_count(link->address, 0);
+        if (count != 0) *count = 0;
+    }
+    ++core->keys_generation;
+    btc_note("bond stored, identity|sc", (uint32_t)identity << 8 | l->sc);
+}
+
+static void begin_gatt(btc_core *core, btp_le *l);
+
+/* Pairing finished once every promised key has arrived. */
+static void send_keys(btc_core *core, btp_le *l);
+
+/* The keys the device promised (the negotiated responder set), as the PDUs
+ * that carry them: Encryption Information (0x10) and Master Identification
+ * (KEY_ENC) for EncKey, Identity Information (0x20) and Identity Address
+ * (KEY_ID) for IdKey. */
+static uint8_t keys_needed(const btp_le *l)
+{
+    uint8_t need = 0;
+    if (l->expected_keys & KEY_ENC) need |= 0x10 | KEY_ENC;
+    if (l->expected_keys & KEY_ID) need |= 0x20 | KEY_ID;
+    return need;
+}
+
+static void keys_check(btc_core *core, btp_le *l)
+{
+    uint8_t need;
+    if (l->state != BTP_LE_KEYS) return;
+    store_bond(core, l);
+    need = keys_needed(l);
+    if ((l->received_keys & need) != need)
+        return;
+    /* Core spec Vol 3 Part H 3.6.1: the responder distributes first; the
+     * initiator's keys follow once all of the responder's have arrived. */
+    send_keys(core, l);
+    begin_gatt(core, l);
+}
+
+/* Our half of the key distribution, after encryption: what the device
+ * asked for in its Pairing Response. The keys are made from secrets this
+ * pairing already has, and are never used (we are always the central). */
+static void send_keys(btc_core *core, btp_le *l)
+{
+    uint8_t p[17], tag[16];
+    if (l->keys_sent) return;
+    l->keys_sent = 1;
+    uint8_t label[2];
+    const uint8_t *secret = l->sc ? l->ltk : l->mrand;
+    btc_link *link = &core->links[l->link];
+    (void)link;
+    if (l->pres[5] & KEY_ENC && !l->sc)
+    {
+        label[0] = 'L'; label[1] = 0;
+        btv_aes_cmac(secret, label, 2, tag);
+        p[0] = SMP_ENCRYPTION_INFO;
+        memcpy(p + 1, tag, 16);
+        (void)smp_send(core, l, p, 17);
+        label[0] = 'E';
+        btv_aes_cmac(secret, label, 2, tag);
+        p[0] = SMP_MASTER_ID;
+        memcpy(p + 1, tag, 10);
+        (void)smp_send(core, l, p, 11);
+    }
+    if (l->pres[5] & KEY_ID)
+    {
+        label[0] = 'I'; label[1] = 0;
+        btv_aes_cmac(secret, label, 2, tag);
+        p[0] = SMP_IDENTITY_INFO;
+        memcpy(p + 1, tag, 16);
+        (void)smp_send(core, l, p, 17);
+        p[0] = SMP_IDENTITY_ADDRESS;
+        p[1] = 0;                                 /* public */
+        memcpy(p + 2, core->info.address, 6);
+        (void)smp_send(core, l, p, 8);
+    }
+}
+
+void btp_le_encryption(btc_core *core, uint8_t link, uint8_t status)
+{
+    btp_le *l = for_link(core, link);
+    if (l == 0 || !l->active) return;
+    if (status != 0)
+    {
+        btc_note("LE encryption failed, state|status", (uint32_t)l->state << 8 | status);
+        if (l->state == BTP_LE_ENCRYPTING &&
+            !(status == 0x05 || status == 0x06 || status == 0x3d))
+        {
+            btc_key *key = key_for(core, core->links[link].address);
+            uint8_t *count = stale_count(core->links[link].address, 1);
+            if (key != 0 && ++*count >= STALE_LIMIT)
+            {
+                btc_note("stored key failed twice: discarded", status);
+                (void)btc_key_forget(core, key->address);
+                *count = 0;
+            }
+        }
+        if (l->state == BTP_LE_ENCRYPTING &&
+            (status == 0x05 || status == 0x06 || status == 0x3d))
+        {
+            /* The device refused our key (authentication failure, PIN or
+             * key missing, MIC failure): it lost our pairing, pair afresh.
+             * Any other status (a connection timeout, say) says nothing
+             * about the key, which is kept. */
+            btc_key *key = key_for(core, core->links[link].address);
+            if (key != 0) (void)btc_key_forget(core, key->address);
+            start_pairing(core, l);
+            return;
+        }
+        fail(core, l, 0x100u | status);
+    }
+}
+
+/* Called by the core once the link is encrypted. */
+static void use_cache(btc_core *core, btp_le *l, btc_key *key);
+
+void btp_le_secured(btc_core *core, uint8_t link)
+{
+    btp_le *l = for_link(core, link);
+    if (l == 0 || !l->active) return;
+    l->encrypted = 1;
+    if (l->state == BTP_LE_PAIRING && l->smp_step == BTP_SMP_ENCRYPT)
+    {
+        btc_note("link encrypted after pairing, sc", l->sc);
+        step(l, BTP_LE_KEYS, core->now);
+        keys_check(core, l);
+        return;
+    }
+    if (l->state == BTP_LE_ENCRYPTING)
+    {
+        uint8_t *count = stale_count(core->links[link].address, 0);
+        btc_key *key = key_for(core, core->links[link].address);
+        if (count != 0) *count = 0;
+        btc_note("link encrypted with the stored key", key != 0 && key->gatt.valid);
+        if (key != 0 && key->gatt.valid)
+            use_cache(core, l, key);
+        else
+            begin_gatt(core, l);
+    }
+}
+
+/* ---- GATT client ----------------------------------------------------- */
+
+static void begin_gatt(btc_core *core, btp_le *l)
+{
+    uint8_t p[9];
+    l->char_count = 0;
+    l->protocol_mode = l->keyboard_in = l->keyboard_out = l->mouse_in = 0;
+    l->map_value = l->map_offset = 0;
+    l->report_mode = l->reading_reference = l->from_cache = 0;
+    btv_hid_map_init(&l->map);
+    p[0] = ATT_FIND_BY_VALUE_REQUEST;
+    write16(p + 1, 0x0001);
+    write16(p + 3, 0xffff);
+    write16(p + 5, 0x2800);          /* primary service */
+    write16(p + 7, 0x1812);          /* HID */
+    step(l, BTP_LE_SERVICE, core->now);
+    att_send(core, l, p, 9);
+}
+
+static void read_characteristics(btc_core *core, btp_le *l)
+{
+    uint8_t p[7];
+    p[0] = ATT_READ_BY_TYPE_REQUEST;
+    write16(p + 1, l->cursor);
+    write16(p + 3, l->service_end);
+    write16(p + 5, 0x2803);
+    att_send(core, l, p, 7);
+}
+
+static uint16_t characteristic_end(const btp_le *l, unsigned int index)
+{
+    return index + 1u < l->char_count ?
+           (uint16_t)(l->chars[index + 1].declaration - 1u) : l->service_end;
+}
+
+/* In report mode the Report characteristics that carry something the map
+ * says we can use; in boot mode the two boot inputs. */
+static int wants_notifications(const btp_le *l,
+                               const btp_le_characteristic *c)
+{
+    if (l->report_mode)
+        return c->uuid == UUID_REPORT && c->report_type == 1 && c->want;
+    return c->uuid == UUID_BOOT_KEYBOARD_IN || c->uuid == UUID_BOOT_MOUSE_IN;
+}
+
+/* Characteristics whose descriptors are read at discovery: every Report
+ * (for its Report Reference and CCCD) and the boot inputs. */
+static int needs_descriptors(const btp_le_characteristic *c)
+{
+    return c->uuid == UUID_REPORT || c->uuid == UUID_BOOT_KEYBOARD_IN ||
+           c->uuid == UUID_BOOT_MOUSE_IN;
+}
+
+static void start_map(btc_core *core, btp_le *l);
+static void finish_discovery(btc_core *core, btp_le *l);
+
+static void subscribe_next(btc_core *core, btp_le *l);
+static void save_cache(btc_core *core, btp_le *l);
+/* Calm retries: a link that drops before it is set up makes the next
+ * advertisement-triggered connection wait, longer each time, 2 s to 10 s. */
+static unsigned int quick_fails;
+static uint32_t retry_after;
+
+static void find_descriptors(btc_core *core, btp_le *l)
+{
+    l->reading_reference = 0;
+    while (l->descriptor_index < l->char_count)
+    {
+        const btp_le_characteristic *c = &l->chars[l->descriptor_index];
+        uint16_t end = characteristic_end(l, l->descriptor_index);
+        if (needs_descriptors(c) && c->value < end)
+        {
+            uint8_t p[5];
+            p[0] = ATT_FIND_INFO_REQUEST;
+            write16(p + 1, (uint16_t)(c->value + 1u));
+            write16(p + 3, end);
+            step(l, BTP_LE_DESCRIPTORS, core->now);
+            att_send(core, l, p, 5);
+            return;
+        }
+        ++l->descriptor_index;
+    }
+    /* Everything is known but the map: read it, and choose the mode. */
+    if (l->map_value != 0)
+    {
+        start_map(core, l);
+        return;
+    }
+    finish_discovery(core, l);
+}
+
+/* Report mode when the map is usable and has an input we can subscribe to,
+ * otherwise boot protocol (if the device has boot inputs), then subscribe. */
+static void finish_discovery(btc_core *core, btp_le *l)
+{
+    unsigned int i;
+    uint8_t mode = 0;
+    uint16_t out = 0;
+    int map_ok = btv_hid_map_finish(&l->map);
+    int extras_ok = btv_hid_extras_finish(&l->extras, &l->xparser);
+    if (map_ok || extras_ok)
+    {
+        for (i = 0; i < l->char_count; ++i)
+        {
+            btp_le_characteristic *c = &l->chars[i];
+            if (c->uuid != UUID_REPORT) continue;
+            if (c->report_type == 1 && c->cccd != 0 &&
+                ((map_ok && btv_hid_map_wants(&l->map, c->report_id)) ||
+                 (extras_ok && btv_hid_extras_wants(&l->extras, c->report_id))))
+            {
+                c->want = 1;
+                mode = 1;
+            }
+            else if (c->report_type == 2 && map_ok && l->map.has_leds &&
+                     c->report_id == l->map.led_id && out == 0)
+                out = c->value;
+        }
+    }
+    l->report_mode = mode;
+    if (l->protocol_mode != 0)
+    {
+        uint8_t p[4];
+        p[0] = ATT_WRITE_COMMAND;
+        write16(p + 1, l->protocol_mode);
+        p[3] = mode ? 0x01 : 0x00;   /* report protocol, or boot protocol */
+        att_send(core, l, p, 4);
+    }
+    if (mode && out != 0) l->keyboard_out = out;
+    l->subscribe_index = 0;
+    step(l, BTP_LE_SUBSCRIBING, core->now);
+    subscribe_next(core, l);
+}
+
+/* ---- the Report Map ------------------------------------------------ */
+
+static void map_read(btc_core *core, btp_le *l)
+{
+    uint8_t p[5];
+    if (l->map_offset == 0)
+    {
+        p[0] = ATT_READ_REQUEST;
+        write16(p + 1, l->map_value);
+        att_send(core, l, p, 3);
+    }
+    else
+    {
+        p[0] = ATT_READ_BLOB_REQUEST;
+        write16(p + 1, l->map_value);
+        write16(p + 3, l->map_offset);
+        att_send(core, l, p, 5);
+    }
+}
+
+static void start_map(btc_core *core, btp_le *l)
+{
+    l->map_offset = 0;
+    btv_hid_map_init(&l->map);
+    btv_hid_extras_init(&l->extras, &l->xparser);
+    step(l, BTP_LE_MAP, core->now);
+    map_read(core, l);
+}
+
+/* A piece of the map arrived (a Read or Read Blob response). A full piece
+ * means there may be more. */
+static void map_piece(btc_core *core, btp_le *l, const uint8_t *p,
+                      size_t bytes)
+{
+    size_t length = bytes - 1u;
+    btv_hid_map_feed(&l->map, p + 1, length);
+    btv_hid_extras_feed(&l->extras, &l->xparser, p + 1, length);
+    l->map_offset = (uint16_t)(l->map_offset + length);
+    if (length >= ATT_DEFAULT_MTU - 1u && l->map_offset < MAP_LIMIT)
+    {
+        map_read(core, l);
+        return;
+    }
+    finish_discovery(core, l);
+}
+
+static void subscribe_next(btc_core *core, btp_le *l)
+{
+    while (l->subscribe_index < l->char_count)
+    {
+        const btp_le_characteristic *c = &l->chars[l->subscribe_index++];
+        if (wants_notifications(l, c) && c->cccd != 0)
+        {
+            uint8_t p[5];
+            p[0] = ATT_WRITE_REQUEST;
+            write16(p + 1, c->cccd);
+            write16(p + 3, 0x0001);  /* notifications */
+            att_send(core, l, p, 5);
+            return;
+        }
+    }
+    if (!l->report_mode && l->keyboard_in == 0 && l->mouse_in == 0)
+    {
+        /* 0x22: it has a map, but not one with a pointer or keys we can use. */
+        fail(core, l, l->map_value != 0 ? 0x22 : 0x20);
+        return;
+    }
+    step(l, BTP_LE_READY, core->now);
+    ++core->links_generation;
+    save_cache(core, l);
+    l->bat_state = BTP_BAT_WAIT;
+    l->bat_at = core->now + BATTERY_DELAY_MS;
+    quick_fails = 0;
+    /* Set up: now the update rate of a mouse. */
+    /* While A2DP is up the CSR radio cannot also serve a 7.5 ms link: the
+     * audio ran out of controller buffers and broke up.  15 to 30 ms then;
+     * the pump moves the link back and forth as audio starts and stops. */
+    if (core->audio_busy)
+        update_link(core, l, 0x000c, 0x0018, 0, 0x0190);
+    else
+        update_link(core, l, 0x0006, 0x000c, 0, 0x0190);
+    l->fast_link = (uint8_t)!core->audio_busy;
+}
+
+/* ---- the Battery Service -------------------------------------------------
+ * Found and read once the device is set up, with the input reports already
+ * flowing: Find By Type Value (0x180F), the characteristic declarations,
+ * the descriptors (for the CCCD), a Read of the level and a Write to
+ * switch its notifications on.  Any error ends it quietly: not every
+ * device has one.  The level is in btp_le for the device list. */
+
+static void bat_start(btc_core *core, btp_le *l)
+{
+    uint8_t p[9];
+    p[0] = ATT_FIND_BY_VALUE_REQUEST;
+    write16(p + 1, 0x0001);
+    write16(p + 3, 0xffff);
+    write16(p + 5, 0x2800);
+    write16(p + 7, UUID_BATTERY_SERVICE);
+    l->bat_state = BTP_BAT_SERVICE;
+    att_send(core, l, p, 9);
+}
+
+static void bat_done(btp_le *l)
+{
+    l->bat_state = BTP_BAT_DONE;
+}
+
+static void bat_read(btc_core *core, btp_le *l)
+{
+    uint8_t p[3];
+    p[0] = ATT_READ_REQUEST;
+    write16(p + 1, l->bat_value);
+    l->bat_state = BTP_BAT_READ;
+    att_send(core, l, p, 3);
+}
+
+/* Returns 1 when the PDU was the battery search's. */
+static int bat_data(btc_core *core, btp_le *l, const uint8_t *p, size_t bytes)
+{
+    uint8_t q[7];
+    size_t offset;
+    if (l->state != BTP_LE_READY || l->bat_state < BTP_BAT_SERVICE ||
+        l->bat_state >= BTP_BAT_DONE)
+        return 0;
+    if (p[0] != ATT_ERROR && p[0] != ATT_FIND_BY_VALUE_RESPONSE &&
+        p[0] != ATT_READ_BY_TYPE_RESPONSE && p[0] != ATT_FIND_INFO_RESPONSE &&
+        p[0] != ATT_READ_RESPONSE && p[0] != ATT_WRITE_RESPONSE)
+        return 0;
+    l->waiting_opcode = 0;
+    if (p[0] == ATT_ERROR)
+    {
+        /* No such service or characteristic, or a refusal: the descriptors
+         * and the notification are optional, the rest ends the search. */
+        if (l->bat_state == BTP_BAT_DESCRIPTORS) bat_read(core, l);
+        else if (l->bat_state == BTP_BAT_ENABLE) bat_done(l);
+        else bat_done(l);
+        return 1;
+    }
+    switch (l->bat_state)
+    {
+    case BTP_BAT_SERVICE:
+        if (p[0] != ATT_FIND_BY_VALUE_RESPONSE || bytes < 5) { bat_done(l); break; }
+        l->bat_end = read16(p + 3);
+        q[0] = ATT_READ_BY_TYPE_REQUEST;
+        write16(q + 1, read16(p + 1));
+        write16(q + 3, l->bat_end);
+        write16(q + 5, 0x2803);
+        l->bat_state = BTP_BAT_CHARACTERISTIC;
+        att_send(core, l, q, 7);
+        break;
+    case BTP_BAT_CHARACTERISTIC:
+        if (p[0] != ATT_READ_BY_TYPE_RESPONSE || bytes < 2 || p[1] != 7)
+        {
+            bat_done(l);
+            break;
+        }
+        for (offset = 2; offset + 7 <= bytes; offset += 7)
+            if (read16(p + offset + 5) == UUID_BATTERY_LEVEL)
+            {
+                l->bat_value = read16(p + offset + 3);
+                l->bat_notify = (p[offset + 2] & 0x10u) != 0;
+                break;
+            }
+        if (l->bat_value == 0) { bat_done(l); break; }
+        if (l->bat_value < l->bat_end)
+        {
+            q[0] = ATT_FIND_INFO_REQUEST;
+            write16(q + 1, (uint16_t)(l->bat_value + 1u));
+            write16(q + 3, l->bat_end);
+            l->bat_state = BTP_BAT_DESCRIPTORS;
+            att_send(core, l, q, 5);
+        }
+        else
+            bat_read(core, l);
+        break;
+    case BTP_BAT_DESCRIPTORS:
+        if (p[0] == ATT_FIND_INFO_RESPONSE && bytes >= 2 && p[1] == 1)
+            for (offset = 2; offset + 4 <= bytes; offset += 4)
+                if (read16(p + offset + 2) == UUID_CCCD)
+                    l->bat_cccd = read16(p + offset);
+        bat_read(core, l);
+        break;
+    case BTP_BAT_READ:
+        if (p[0] == ATT_READ_RESPONSE && bytes >= 2 && p[1] <= 100)
+        {
+            l->battery = p[1];
+            ++btc_profile_generation;
+            btc_note("battery level, link|percent", (uint32_t)l->link << 8 | p[1]);
+        }
+        if (l->bat_notify && l->bat_cccd != 0)
+        {
+            q[0] = ATT_WRITE_REQUEST;
+            write16(q + 1, l->bat_cccd);
+            write16(q + 3, 0x0001);
+            l->bat_state = BTP_BAT_ENABLE;
+            att_send(core, l, q, 5);
+        }
+        else
+            bat_done(l);
+        break;
+    default:
+        bat_done(l);
+        break;
+    }
+    return 1;
+}
+
+/* What was found goes with the bond, for the next connection. */
+static void save_cache(btc_core *core, btp_le *l)
+{
+    btc_key *key;
+    unsigned int i, n = 0;
+    if (!l->report_mode || l->from_cache) return;
+    key = key_for(core, core->links[l->link].address);
+    if (key == 0) return;
+    memset(&key->gatt, 0, sizeof(key->gatt));
+    for (i = 0; i < l->char_count && n < BTC_GATT_INPUTS; ++i)
+    {
+        const btp_le_characteristic *c = &l->chars[i];
+        if (c->uuid != UUID_REPORT || !c->want) continue;
+        key->gatt.value[n] = c->value;
+        key->gatt.cccd[n] = c->cccd;
+        key->gatt.report_id[n] = c->report_id;
+        ++n;
+    }
+    if (n == 0) return;
+    key->gatt.count = (uint8_t)n;
+    key->gatt.protocol_mode = l->protocol_mode;
+    key->gatt.keyboard_out = l->keyboard_out;
+    key->gatt.map = l->map;
+    key->gatt.extras = l->extras;
+    key->gatt.valid = 1;
+    ++core->keys_generation;
+    btc_note("GATT handles kept with the bond, inputs", n);
+}
+
+/* A reconnection of a bonded device: no discovery. Protocol Mode, then the
+ * input reports' notifications, as soon as the link is encrypted. */
+static void use_cache(btc_core *core, btp_le *l, btc_key *key)
+{
+    unsigned int i;
+    l->char_count = 0;
+    l->protocol_mode = key->gatt.protocol_mode;
+    l->keyboard_out = key->gatt.keyboard_out;
+    l->keyboard_in = l->mouse_in = l->map_value = 0;
+    l->map = key->gatt.map;
+    l->extras = key->gatt.extras;
+    for (i = 0; i < key->gatt.count && i < BTC_GATT_INPUTS; ++i)
+    {
+        btp_le_characteristic *c = &l->chars[l->char_count++];
+        memset(c, 0, sizeof(*c));
+        c->uuid = UUID_REPORT;
+        c->value = key->gatt.value[i];
+        c->cccd = key->gatt.cccd[i];
+        c->report_id = key->gatt.report_id[i];
+        c->report_type = 1;
+        c->want = 1;
+    }
+    l->report_mode = 1;
+    l->from_cache = 1;
+    if (l->protocol_mode != 0)
+    {
+        uint8_t p[4];
+        p[0] = ATT_WRITE_COMMAND;
+        write16(p + 1, l->protocol_mode);
+        p[3] = 0x01;
+        att_send(core, l, p, 4);
+    }
+    l->subscribe_index = 0;
+    btc_note("using the kept GATT handles", l->char_count);
+    step(l, BTP_LE_SUBSCRIBING, core->now);
+    subscribe_next(core, l);
+}
+
+static void att_error(btc_core *core, btp_le *l, const uint8_t *p,
+                      size_t bytes)
+{
+    uint8_t request, code;
+    if (bytes < 5) return;
+    request = p[1];
+    code = p[4];
+    l->waiting_opcode = 0;
+    if (l->from_cache && code != 0x05 && code != 0x0f &&
+        l->state == BTP_LE_SUBSCRIBING)
+    {
+        /* The kept handles no longer fit (the device has changed): forget
+         * them and discover afresh. */
+        btc_key *key = key_for(core, core->links[l->link].address);
+        btc_note("kept GATT handles refused, discovering; code", code);
+        if (key != 0) key->gatt.valid = 0;
+        ++core->keys_generation;
+        begin_gatt(core, l);
+        return;
+    }
+    if (code == 0x05 || code == 0x0f)
+    {
+        /* Insufficient authentication/encryption: secure, then retry. If
+         * securing the link does not help (it wants authenticated pairing,
+         * which just works is not), give up rather than go round for ever. */
+        btc_key *key;
+        if (l->encrypted || ++l->secure_retries > 3)
+        {
+            fail(core, l, 0x24);
+            return;
+        }
+        key = key_for(core, core->links[l->link].address);
+        if (key != 0)
+        {
+            step(l, BTP_LE_ENCRYPTING, core->now);
+            start_encryption(core, l, key->key, key->rand, key->ediv);
+        }
+        else
+            start_pairing(core, l);
+        return;
+    }
+    switch (request)
+    {
+    case ATT_FIND_BY_VALUE_REQUEST:
+        fail(core, l, 0x21);         /* no HID service */
+        break;
+    case ATT_READ_BY_TYPE_REQUEST:
+        l->descriptor_index = 0;
+        find_descriptors(core, l);
+        break;
+    case ATT_FIND_INFO_REQUEST:
+    case ATT_READ_REQUEST:
+    case ATT_READ_BLOB_REQUEST:
+        if (l->state == BTP_LE_MAP)
+        {
+            /* The map is unreadable, or ended on an exact piece boundary
+             * (invalid offset 0x07): use what we have. */
+            if (l->map_offset == 0)
+                fail(core, l, 0x23);
+            else
+                finish_discovery(core, l);
+            break;
+        }
+        ++l->descriptor_index;
+        find_descriptors(core, l);
+        break;
+    case ATT_WRITE_REQUEST:
+        subscribe_next(core, l);
+        break;
+    default:
+        break;
+    }
+}
+
+static void record_characteristic(btp_le *l, const uint8_t *e)
+{
+    btp_le_characteristic *c;
+    if (l->char_count >= BTP_LE_MAX_CHARS) return;
+    c = &l->chars[l->char_count++];
+    c->declaration = read16(e);
+    c->properties = e[2];
+    c->value = read16(e + 3);
+    c->uuid = read16(e + 5);
+    c->cccd = 0;
+    c->reference = 0;
+    c->report_id = 0;
+    c->report_type = 0;
+    c->want = 0;
+    switch (c->uuid)
+    {
+    case UUID_REPORT_MAP: l->map_value = c->value; break;
+    case UUID_REPORT:
+        /* Until the Report Reference says otherwise: notify means input. */
+        c->report_type = (c->properties & 0x10u) ? 1 : 2;
+        break;
+    case UUID_PROTOCOL_MODE: l->protocol_mode = c->value; break;
+    case UUID_BOOT_KEYBOARD_IN: l->keyboard_in = c->value; break;
+    case UUID_BOOT_KEYBOARD_OUT: l->keyboard_out = c->value; break;
+    case UUID_BOOT_MOUSE_IN: l->mouse_in = c->value; break;
+    default: break;
+    }
+}
+
+/* An input report of report mode: find its characteristic, decode it with
+ * the map, hand pointer and key events to the same paths as boot mode. */
+static void report_notification(btc_core *core, btp_le *l, uint16_t handle,
+                                const uint8_t *report, size_t bytes)
+{
+    unsigned int i;
+    btc_link *link = &core->links[l->link];
+    btv_hid_event e;
+    btv_hid_extra_event x;
+    for (i = 0; i < l->char_count; ++i)
+    {
+        const btp_le_characteristic *c = &l->chars[i];
+        if (c->value != handle || !c->want) continue;
+        if (btv_hid_map_wants(&l->map, c->report_id) &&
+            btv_hid_map_decode(&l->map, c->report_id, report, bytes, &e))
+        {
+            if (e.keyboard)
+            {
+                uint8_t boot[8];
+                if (!l->keyboard)
+                {
+                    if (!btv_hid_riscos_keyboard_attach(&btp_hid_riscos)) return;
+                    l->keyboard = 1;
+                    link->flags |= BTC_DEV_HID | BTC_DEV_KEYBOARD;
+                }
+                boot[0] = e.modifiers;
+                boot[1] = 0;
+                memcpy(boot + 2, e.keys, 6);
+                btv_hid_riscos_keyboard_report(&btp_hid_riscos, &l->kb, boot, 8);
+            }
+            if (e.pointer)
+            {
+                if (!l->mouse)
+                {
+                    btv_hid_riscos_mouse_attach(&btp_hid_riscos);
+                    l->mouse = 1;
+                    link->flags |= BTC_DEV_HID | BTC_DEV_MOUSE;
+                }
+                btv_hid_riscos_mouse_event(&btp_hid_riscos, &l->pointer,
+                                           e.buttons, e.dx, e.dy, e.wheel, e.pan);
+            }
+        }
+        if (btv_hid_extras_wants(&l->extras, c->report_id) &&
+            btv_hid_extras_decode(&l->extras, c->report_id, report, bytes, &x))
+            btp_hid_extras_deliver(core, l->link, &x, &l->pad, &l->pad_attached,
+                                   l->last_consumer);
+        return;
+    }
+}
+
+static void notification(btc_core *core, btp_le *l, const uint8_t *p,
+                         size_t bytes)
+{
+    uint16_t handle;
+    btc_link *link = &core->links[l->link];
+    if (bytes < 3) return;
+    handle = read16(p + 1);
+    if (l->bat_value != 0 && handle == l->bat_value)
+    {
+        if (bytes >= 4 && p[3] <= 100)
+        {
+            l->battery = p[3];
+            ++btc_profile_generation;
+        }
+        return;
+    }
+    ++l->reports;
+    if (l->report_mode)
+    {
+        report_notification(core, l, handle, p + 3, bytes - 3);
+        return;
+    }
+    if (handle != 0 && handle == l->keyboard_in)
+    {
+        if (!l->keyboard)
+        {
+            if (!btv_hid_riscos_keyboard_attach(&btp_hid_riscos)) return;
+            l->keyboard = 1;
+            link->flags |= BTC_DEV_HID | BTC_DEV_KEYBOARD;
+        }
+        btv_hid_riscos_keyboard_report(&btp_hid_riscos, &l->kb, p + 3,
+                                       bytes - 3);
+    }
+    else if (handle != 0 && handle == l->mouse_in)
+    {
+        if (!l->mouse)
+        {
+            btv_hid_riscos_mouse_attach(&btp_hid_riscos);
+            l->mouse = 1;
+            link->flags |= BTC_DEV_HID | BTC_DEV_MOUSE;
+        }
+        btv_hid_riscos_mouse_report(&btp_hid_riscos, &l->pointer, p + 3,
+                                    bytes - 3);
+    }
+}
+
+/* Requests the device sends to us: we offer no attributes. */
+static void att_server(btc_core *core, btp_le *l, const uint8_t *p,
+                       size_t bytes)
+{
+    uint8_t reply[5];
+    if (p[0] == ATT_MTU_REQUEST && bytes >= 3)
+    {
+        reply[0] = ATT_MTU_RESPONSE;
+        write16(reply + 1, 23);
+        (void)btc_le_send(core, l->link, CID_ATT, reply, 3);
+        return;
+    }
+    reply[0] = ATT_ERROR;
+    reply[1] = p[0];
+    write16(reply + 2, bytes >= 3 ? read16(p + 1) : 0);
+    reply[4] = (p[0] == ATT_FIND_INFO_REQUEST ||
+                p[0] == ATT_FIND_BY_VALUE_REQUEST ||
+                p[0] == ATT_READ_BY_TYPE_REQUEST || p[0] == 0x10) ?
+               0x0a : 0x06;          /* not found / not supported */
+    (void)btc_le_send(core, l->link, CID_ATT, reply, 5);
+}
+
+static void att_data(btc_core *core, btp_le *l, const uint8_t *p,
+                     size_t bytes)
+{
+    size_t offset;
+    if (bytes == 0) return;
+    if (bat_data(core, l, p, bytes)) return;
+    switch (p[0])
+    {
+    case ATT_ERROR: att_error(core, l, p, bytes); return;
+    case ATT_NOTIFY: notification(core, l, p, bytes); return;
+    case ATT_INDICATE:
+    {
+        uint8_t confirm = ATT_CONFIRM;
+        /* Service Changed (GATT 2A05) is an indication: the handles we kept
+         * may be wrong now. */
+        {
+            btc_key *key = key_for(core, core->links[l->link].address);
+            if (key != 0 && key->gatt.valid)
+            {
+                key->gatt.valid = 0;
+                ++core->keys_generation;
+                btc_note("indication: kept GATT handles dropped", 0);
+            }
+        }
+        notification(core, l, p, bytes);
+        (void)btc_le_send(core, l->link, CID_ATT, &confirm, 1);
+        return;
+    }
+    case ATT_FIND_BY_VALUE_RESPONSE:
+        if (bytes < 5 || l->state != BTP_LE_SERVICE) return;
+        l->waiting_opcode = 0;
+        l->service_start = read16(p + 1);
+        l->service_end = read16(p + 3);
+        l->cursor = l->service_start;
+        step(l, BTP_LE_CHARACTERISTICS, core->now);
+        read_characteristics(core, l);
+        return;
+    case ATT_READ_BY_TYPE_RESPONSE:
+    {
+        uint8_t length;
+        uint16_t last = 0;
+        if (bytes < 2 || l->state != BTP_LE_CHARACTERISTICS) return;
+        l->waiting_opcode = 0;
+        length = p[1];
+        /* Only 16-bit UUID declarations (length 7) matter here. */
+        for (offset = 2; length >= 5 && offset + length <= bytes;
+             offset += length)
+        {
+            if (length == 7) record_characteristic(l, p + offset);
+            last = read16(p + offset);
+        }
+        if (last == 0 || last >= l->service_end)
+        {
+            l->descriptor_index = 0;
+            find_descriptors(core, l);
+        }
+        else
+        {
+            l->cursor = (uint16_t)(last + 1u);
+            read_characteristics(core, l);
+        }
+        return;
+    }
+    case ATT_FIND_INFO_RESPONSE:
+        if (bytes < 2 || l->state != BTP_LE_DESCRIPTORS) return;
+        l->waiting_opcode = 0;
+        if (p[1] == 1)               /* 16-bit UUIDs */
+            for (offset = 2; offset + 4 <= bytes; offset += 4)
+            {
+                uint16_t uuid = read16(p + offset + 2);
+                if (uuid == UUID_CCCD)
+                    l->chars[l->descriptor_index].cccd = read16(p + offset);
+                else if (uuid == UUID_REPORT_REFERENCE)
+                    l->chars[l->descriptor_index].reference =
+                        read16(p + offset);
+            }
+        if (l->chars[l->descriptor_index].reference != 0)
+        {
+            /* The Report Reference: report ID and type (HOGP 2.3.3.4). */
+            uint8_t r[3];
+            r[0] = ATT_READ_REQUEST;
+            write16(r + 1, l->chars[l->descriptor_index].reference);
+            l->reading_reference = 1;
+            att_send(core, l, r, 3);
+            return;
+        }
+        ++l->descriptor_index;
+        find_descriptors(core, l);
+        return;
+    case ATT_READ_RESPONSE:
+    case ATT_READ_BLOB_RESPONSE:
+        l->waiting_opcode = 0;
+        if (l->state == BTP_LE_DESCRIPTORS && l->reading_reference)
+        {
+            btp_le_characteristic *c = &l->chars[l->descriptor_index];
+            if (bytes >= 3)
+            {
+                c->report_id = p[1];
+                c->report_type = p[2];
+            }
+            ++l->descriptor_index;
+            find_descriptors(core, l);
+        }
+        else if (l->state == BTP_LE_MAP)
+            map_piece(core, l, p, bytes);
+        return;
+    case ATT_WRITE_RESPONSE:
+        if (l->state != BTP_LE_SUBSCRIBING) return;
+        l->waiting_opcode = 0;
+        subscribe_next(core, l);
+        return;
+    default:
+        /* Requests have even opcodes below 0x1f (plus 0x20). */
+        if (((p[0] & 1u) == 0 && p[0] < 0x1f) || p[0] == 0x20)
+            att_server(core, l, p, bytes);
+        return;
+    }
+}
+
+/* ---- hooks ------------------------------------------------------ */
+
+void btp_le_init(btc_core *core, uint8_t link)
+{
+    btp_le *l = for_link(core, link);
+    if (l == 0) return;
+    memset(l, 0, sizeof(*l));
+    l->link = link;
+    btv_hid_keyboard_init(&l->kb);
+    btv_hid_mouse_init(&l->pointer);
+    btv_hid_pad_init(&l->pad);
+    l->battery = 0xff;
+}
+
+void btp_le_link_opened(btc_core *core, uint8_t link)
+{
+    btp_le *l = for_link(core, link);
+    btc_key *key;
+    btp_le_init(core, link);
+    l->active = 1;
+    key = key_for(core, core->links[link].address);
+    if (key != 0)
+    {
+        l->stored_key_tried = 1;
+        step(l, BTP_LE_ENCRYPTING, core->now);
+        start_encryption(core, l, key->key, key->rand, key->ediv);
+    }
+    else
+        start_pairing(core, l);
+}
+
+void btp_le_link_closed(btc_core *core, uint8_t link)
+{
+    btp_le *l = for_link(core, link);
+    if (l == 0 || !l->active) return;
+    sc_release(core, l);
+    detach_all(core, l);
+    if (l->state != BTP_LE_READY)
+    {
+        if (quick_fails < 5) ++quick_fails;
+        retry_after = core->now + 2000u * quick_fails;
+        btc_note("LE link lost before it was set up; fails|state",
+                 quick_fails << 8 | l->state);
+    }
+    btp_le_init(core, link);
+}
+
+void btp_le_data(btc_core *core, uint8_t link, uint16_t cid,
+                 const uint8_t *data, size_t bytes)
+{
+    btp_le *l = for_link(core, link);
+    if (l == 0 || !l->active) return;
+    if (cid == CID_SMP)
+    {
+        smp_log("SMP in, code|length", data, bytes);
+        smp_data(core, l, data, bytes);
+    }
+    else if (cid == CID_ATT) att_data(core, l, data, bytes);
+}
+
+/* Reconnect bonded input devices when they advertise. */
+void btp_le_advert(btc_core *core, const uint8_t address[6],
+                   uint8_t address_type)
+{
+    btc_key *key;
+    if (core->state != BTC_READY || btc_link_by_address(core, address) != 0)
+        return;
+    if ((int32_t)(core->now - retry_after) < 0) return;
+    key = key_for(core, address);
+    if (key == 0 || !(key->flags & BTC_DEV_HID)) return;
+    (void)btc_connect(core, address, 1, address_type, BTC_PROFILE_LE_HID);
+}
+
+/* Background scanning while a bonded LE input device is away. */
+static int bonded_input_away(btc_core *core)
+{
+    unsigned int index;
+    for (index = 0; index < BTC_KEYS; ++index)
+    {
+        btc_key *key = &core->keys[index];
+        unsigned int link;
+        int connected = 0;
+        if (!key->used || !key->le || !(key->flags & BTC_DEV_HID)) continue;
+        for (link = 0; link < BTC_LINKS; ++link)
+        {
+            btp_le *l = &core->profiles->le[link];
+            if (l->active && core->links[link].state != BTC_LINK_FREE &&
+                key_for(core, core->links[link].address) == key)
+                connected = 1;
+        }
+        if (!connected) return 1;
+    }
+    return 0;
+}
+
+int btp_le_busy(btc_core *core)
+{
+    unsigned int index;
+    for (index = 0; index < BTC_LINKS; ++index)
+    {
+        const btc_link *link = &core->links[index];
+        const btp_le *l = &core->profiles->le[index];
+        if (!link->le || link->state == BTC_LINK_FREE) continue;
+        /* A connection merely being made does not hold up a classic page:
+         * the controller does both. The link being set up (pairing,
+         * encrypting, discovering) does. */
+        if (link->state == BTC_LINK_CONNECTING) continue;
+        if (l->active && l->state != BTP_LE_READY && l->state != BTP_LE_FAILED)
+            return 1;
+    }
+    return 0;
+}
+
+void btp_le_pump(btc_core *core)
+{
+    unsigned int index;
+    int connecting = 0;
+    for (index = 0; index < BTC_LINKS; ++index)
+    {
+        btp_le *l = &core->profiles->le[index];
+        if (core->links[index].state == BTC_LINK_CONNECTING &&
+            core->links[index].le)
+            connecting = 1;
+        if (!l->active) continue;
+        if (l->drop && (int32_t)(core->now - l->drop_at) >= 0)
+        {
+            l->drop = 0;
+            (void)btc_disconnect(core, core->links[index].address);
+        }
+        if (l->state == BTP_LE_KEYS && l->sc &&
+            core->now - l->step_started >= KEYS_GRACE_MS)
+        {
+            /* Bonded; the device is slow with (or has none of) its
+             * identity keys: carry on without waiting longer. */
+            btc_note("identity keys late: going on", l->received_keys);
+            store_bond(core, l);
+            send_keys(core, l);
+            begin_gatt(core, l);
+        }
+        if (l->bat_state == BTP_BAT_WAIT && l->state == BTP_LE_READY &&
+            (int32_t)(core->now - l->bat_at) >= 0 && l->waiting_opcode == 0)
+            bat_start(core, l);
+        if (l->keyboard && l->keyboard_out != 0 && l->state == BTP_LE_READY)
+        {
+            uint32_t flags = btp_hid_riscos.led_flags;
+            uint8_t leds = btv_hid_keyboard_leds(flags);
+            if (leds != l->leds)
+            {
+                uint8_t p[4];
+                p[0] = ATT_WRITE_COMMAND;
+                write16(p + 1, l->keyboard_out);
+                p[3] = leds;
+                (void)btc_le_send(core, l->link, CID_ATT, p, 4);
+                l->leds = leds;
+            }
+        }
+        if (l->state != BTP_LE_READY && l->state != BTP_LE_FAILED &&
+            l->state != BTP_LE_IDLE &&
+            core->now - l->step_started >= STEP_TIMEOUT_MS)
+            fail(core, l, 0x30u + l->state);
+    }
+    {
+        const btp_a2dp *a = &core->profiles->a2dp;
+        core->audio_busy = (uint8_t)(a->state >= BTP_A2DP_SIGNALLING &&
+                                     a->state <= BTP_A2DP_SUSPENDED &&
+                                     a->state != BTP_A2DP_SUSPENDED);
+    }
+    {
+        /* Input links already set up follow the audio: slower while it
+         * plays, back to the mouse's own rate when it stops. */
+        unsigned int index;
+        for (index = 0; index < BTC_LINKS; ++index)
+        {
+            btp_le *l = &core->profiles->le[index];
+            if (!l->active || l->state != BTP_LE_READY) continue;
+            if (core->audio_busy && l->fast_link)
+            {
+                update_link(core, l, 0x000c, 0x0018, 0, 0x0190);
+                l->fast_link = 0;
+            }
+            else if (!core->audio_busy && !l->fast_link)
+            {
+                update_link(core, l, 0x0006, 0x000c, 0, 0x0190);
+                l->fast_link = 1;
+            }
+        }
+    }
+    btc_le_background(core, !connecting && !btc_scanning(core) &&
+                      bonded_input_away(core));
+}

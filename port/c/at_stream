@@ -1,0 +1,44 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#include "at_stream.h"
+#include <string.h>
+void btv_at_stream_init(btv_at_stream *s)
+{
+    if (s != NULL) memset(s, 0, sizeof(*s));
+}
+size_t btv_at_stream_feed(btv_at_stream *s, const uint8_t *data, size_t bytes)
+{
+    size_t i;
+    uint8_t ch;
+    if (s == NULL || data == NULL || s->ready || s->failed) return 0;
+    for (i = 0; i < bytes; ++i)
+    {
+        ch = data[i];
+        if (ch == '\r')
+        {
+            if (s->used == 0) continue;
+            s->line[s->used] = 0;
+            s->ready = 1;
+            return i + 1;
+        }
+        if (ch == '\n' && s->used == 0) continue;
+        if (ch < 32 || ch > 126 || s->used == 256)
+        {
+            s->failed = 1;
+            return i + 1;
+        }
+        s->line[s->used++] = (char)ch;
+    }
+    return bytes;
+}
+const char *btv_at_stream_line(const btv_at_stream *s)
+{
+    return s != NULL && s->ready && !s->failed ? s->line : NULL;
+}
+int btv_at_stream_take(btv_at_stream *s)
+{
+    if (s == NULL || !s->ready || s->failed) return 0;
+    s->used = 0;
+    s->ready = 0;
+    return 1;
+}

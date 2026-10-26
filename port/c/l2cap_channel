@@ -1,0 +1,436 @@
+/*-
+ * Copyright (c) 2005 Iain Hibbert.
+ * Copyright (c) 2006 Itronix Inc.
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. The name of Itronix Inc. may not be used to endorse
+ *    or promote products derived from this software without specific
+ *    prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY ITRONIX INC. ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL ITRONIX INC. BE LIABLE FOR ANY
+ * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+/* Adapted from the connection/configuration state transitions in the pinned
+ * NetBSD l2cap_signal.c. Kernel requests, mbufs and timers are replaced with
+ * copied output slots and an explicit ACL-owner acceptance contract. */
+#include "l2cap_channel.h"
+#include <string.h>
+
+static uint16_t read16(const uint8_t *p)
+{
+    return (uint16_t)((unsigned int)p[0] | ((unsigned int)p[1] << 8));
+}
+
+static void write16(uint8_t *p, uint16_t value)
+{
+    p[0] = (uint8_t)value;
+    p[1] = (uint8_t)(value >> 8);
+}
+
+static int identifier_used(const btv_l2cap_channel *channel, uint8_t identifier)
+{
+    return identifier == 0 ||
+        (channel->identifiers[identifier >> 3] & (1U << (identifier & 7))) != 0;
+}
+
+static void reserve_identifier(btv_l2cap_channel *channel, uint8_t identifier)
+{
+    channel->identifiers[identifier >> 3] |= (uint8_t)(1U << (identifier & 7));
+}
+
+static void config_request(btv_l2cap_channel *channel)
+{
+    uint8_t parameters[8];
+    write16(parameters, channel->remote_cid);
+    write16(parameters + 2, 0);
+    parameters[4] = 1;
+    parameters[5] = 2;
+    write16(parameters + 6, channel->receive_mtu);
+    channel->request_bytes = btv_l2cap_signal_encode(channel->request,
+        sizeof(channel->request), 4, channel->config_id, parameters, 8);
+}
+
+static int fail(btv_l2cap_channel *channel, uint16_t result)
+{
+    channel->state = BTV_CHANNEL_FAILED;
+    channel->result = result;
+    channel->request_bytes = 0;
+    channel->response_bytes = 0;
+    channel->awaiting = 0;
+    channel->response_opens = 0;
+    channel->retry_pending = 0;
+    return -1;
+}
+
+void btv_l2cap_channel_init(btv_l2cap_channel *channel)
+{
+    if (channel != NULL)
+        memset(channel, 0, sizeof(*channel));
+}
+
+int btv_l2cap_channel_connect(btv_l2cap_channel *channel, uint16_t psm,
+                             uint16_t local_cid, uint16_t receive_mtu,
+                             uint8_t connect_id, uint8_t config_id, uint32_t now)
+{
+    uint8_t parameters[4];
+    if (channel == NULL || channel->state != BTV_CHANNEL_IDLE ||
+        (psm & 0x0101U) != 1 || local_cid < 0x40 || receive_mtu < 48 ||
+        connect_id == 0 || config_id == 0 || connect_id == config_id)
+        return 0;
+    channel->local_cid = local_cid;
+    channel->receive_mtu = receive_mtu;
+    channel->receive_limit = receive_mtu;
+    channel->transmit_mtu = 672;
+    channel->connect_id = connect_id;
+    channel->config_id = config_id;
+    reserve_identifier(channel, connect_id);
+    reserve_identifier(channel, config_id);
+    channel->started = now;
+    channel->state = BTV_CHANNEL_CONNECTING;
+    write16(parameters, psm);
+    write16(parameters + 2, local_cid);
+    channel->request_bytes = btv_l2cap_signal_encode(channel->request,
+        sizeof(channel->request), 2, connect_id, parameters, sizeof(parameters));
+    return 1;
+}
+
+int btv_l2cap_channel_disconnect(btv_l2cap_channel *channel,
+                                uint8_t identifier, uint32_t now)
+{
+    uint8_t parameters[4];
+    if (channel == NULL || channel->remote_cid < 0x40 || identifier_used(channel, identifier) ||
+        channel->response_bytes != 0 ||
+        (channel->state != BTV_CHANNEL_OPEN && channel->state != BTV_CHANNEL_FAILED &&
+         channel->state != BTV_CHANNEL_CONFIGURING))
+        return 0;
+    channel->disconnect_id = identifier;
+    reserve_identifier(channel, identifier);
+    channel->started = now;
+    channel->state = BTV_CHANNEL_CLOSING;
+    channel->awaiting = 0;
+    channel->retry_pending = 0;
+    write16(parameters, channel->remote_cid);
+    write16(parameters + 2, channel->local_cid);
+    channel->request_bytes = btv_l2cap_signal_encode(channel->request,
+        sizeof(channel->request), 6, identifier, parameters, sizeof(parameters));
+    return 1;
+}
+
+int btv_l2cap_channel_retry(btv_l2cap_channel *channel,
+                           uint8_t identifier, uint32_t now)
+{
+    if (channel == NULL)
+        return 0;
+    btv_l2cap_channel_tick(channel, now);
+    if (channel->state != BTV_CHANNEL_CONFIGURING || !channel->retry_pending ||
+        identifier_used(channel, identifier))
+        return 0;
+    reserve_identifier(channel, identifier);
+    channel->config_id = identifier;
+    channel->retry_pending = 0;
+    ++channel->retries;
+    config_request(channel);
+    return 1;
+}
+
+void btv_l2cap_channel_tick(btv_l2cap_channel *channel, uint32_t now)
+{
+    if (channel != NULL &&
+        (channel->state == BTV_CHANNEL_CONNECTING ||
+         channel->state == BTV_CHANNEL_CONFIGURING ||
+         channel->state == BTV_CHANNEL_CLOSING) &&
+        (uint32_t)(now - channel->started) >= 60000UL)
+        fail(channel, 0xeeee);
+}
+
+void btv_l2cap_channel_abort(btv_l2cap_channel *channel)
+{
+    if (channel != NULL)
+        fail(channel, 0xffff);
+}
+
+size_t btv_l2cap_channel_output(btv_l2cap_channel *channel, uint8_t *output,
+                               size_t capacity, unsigned int *token, uint32_t now)
+{
+    const uint8_t *source;
+    size_t bytes;
+    unsigned int kind;
+    if (channel == NULL || output == NULL || token == NULL)
+        return 0;
+    btv_l2cap_channel_tick(channel, now);
+    kind = channel->response_bytes != 0 ? 2 : 1;
+    bytes = kind == 2 ? channel->response_bytes : channel->request_bytes;
+    source = kind == 2 ? channel->response : channel->request;
+    if (bytes == 0 || capacity < bytes)
+        return 0;
+    memcpy(output, source, bytes);
+    *token = kind;
+    return bytes;
+}
+
+static void maybe_open(btv_l2cap_channel *channel)
+{
+    if (channel->state == BTV_CHANNEL_CONFIGURING &&
+        channel->local_configured && channel->peer_configured)
+        channel->state = BTV_CHANNEL_OPEN;
+}
+
+int btv_l2cap_channel_sent(btv_l2cap_channel *channel, unsigned int token)
+{
+    if (channel == NULL)
+        return 0;
+    if (token == 2 && channel->response_bytes != 0)
+    {
+        if (channel->response[4] == 7)
+            channel->state = BTV_CHANNEL_CLOSED;
+        else if (channel->response_opens)
+            channel->peer_configured = 1;
+        channel->response_bytes = 0;
+        channel->response_opens = 0;
+        maybe_open(channel);
+        return 1;
+    }
+    if (token != 1 || channel->request_bytes == 0 || channel->response_bytes != 0)
+        return 0;
+    channel->awaiting = channel->request[4];
+    channel->request_bytes = 0;
+    return 1;
+}
+
+/* Builds a single response no larger than the classic minimum signaling MTU.
+ * MTU and informational flush timeout are supported. Other mandatory options
+ * receive Unknown Option; hints are ignored. No enhanced channel modes claimed.
+ * Continuation requests receive Reject so partial options never become active. */
+static int configure_peer(btv_l2cap_channel *channel, const btv_l2cap_command *cmd)
+{
+    uint8_t parameters[44];
+    const uint8_t *option;
+    size_t offset, length, used;
+    uint16_t result, mtu;
+    unsigned int type, seen_mtu;
+    if (channel->response_bytes != 0)
+        return 2;
+    result = 0;
+    mtu = 672;
+    seen_mtu = 0;
+    used = 6;
+    memset(parameters, 0, sizeof(parameters));
+    write16(parameters, channel->remote_cid);
+    if (read16(cmd->parameters + 2) != 0)
+        result = 2;
+    offset = 4;
+    while (offset < cmd->bytes)
+    {
+        if (cmd->bytes - offset < 2)
+            return fail(channel, 0xffff);
+        option = cmd->parameters + offset;
+        length = option[1];
+        if (length > cmd->bytes - offset - 2)
+            return fail(channel, 0xffff);
+        type = option[0] & 0x7f;
+        if (result != 2)
+        {
+            if (type == 1)
+            {
+                if (length != 2 || seen_mtu)
+                    result = 2;
+                else
+                {
+                    seen_mtu = 1;
+                    mtu = read16(option + 2);
+                    if (mtu < 48 && result != 3)
+                    {
+                        result = 1;
+                        parameters[6] = 1;
+                        parameters[7] = 2;
+                        write16(parameters + 8, 48);
+                        used = 10;
+                    }
+                }
+            }
+            else if (type == 2)
+            {
+                if (length != 2)
+                    result = 2;
+            }
+            else if (!(option[0] & 0x80))
+            {
+                if (result != 3)
+                    used = 6;
+                result = 3;
+                if (used + 2 <= sizeof(parameters))
+                {
+                    parameters[used++] = option[0];
+                    parameters[used++] = 0;
+                }
+            }
+        }
+        offset += length + 2;
+    }
+    /* A retransmission of the effective configuration is harmless. Changing
+     * an already accepted MTU requires reconfiguration, not implemented here. */
+    if (result == 0 && channel->peer_configured && mtu != channel->transmit_mtu)
+        result = 2;
+    if (result == 2)
+        used = 6;
+    write16(parameters + 4, result);
+    channel->response_bytes = btv_l2cap_signal_encode(channel->response,
+        sizeof(channel->response), 5, cmd->identifier, parameters, used);
+    channel->response_opens = result == 0;
+    if (result == 0)
+        channel->transmit_mtu = mtu;
+    return 1;
+}
+
+int btv_l2cap_channel_receive(btv_l2cap_channel *channel,
+                             const btv_l2cap_command *cmd, uint32_t now)
+{
+    const uint8_t *p;
+    uint16_t result, mtu;
+    if (channel == NULL || cmd == NULL || cmd->identifier == 0 ||
+        (cmd->bytes != 0 && cmd->parameters == NULL))
+        return -1;
+    btv_l2cap_channel_tick(channel, now);
+    p = cmd->parameters;
+    if (cmd->code == 3 && channel->state == BTV_CHANNEL_CONNECTING &&
+        channel->awaiting == 2 && cmd->identifier == channel->connect_id)
+    {
+        if (cmd->bytes != 8)
+            return fail(channel, 0xffff);
+        if (read16(p + 2) != channel->local_cid)
+            return 0;
+        result = read16(p + 4);
+        if (result == 1)
+            return 1; /* Pending never extends the bounded overall deadline. */
+        if (result != 0)
+            return fail(channel, result);
+        if (read16(p) < 0x40 || read16(p + 6) != 0)
+            return fail(channel, 0xffff);
+        channel->remote_cid = read16(p);
+        channel->state = BTV_CHANNEL_CONFIGURING;
+        channel->awaiting = 0;
+        config_request(channel);
+        return 1;
+    }
+    if (cmd->code == 4 && channel->remote_cid >= 0x40 &&
+        (channel->state == BTV_CHANNEL_CONFIGURING || channel->state == BTV_CHANNEL_OPEN))
+    {
+        if (cmd->bytes < 4)
+            return -1;
+        if (read16(p) != channel->local_cid)
+            return 0;
+        return configure_peer(channel, cmd);
+    }
+    if (cmd->code == 5 && channel->state == BTV_CHANNEL_CONFIGURING &&
+        channel->awaiting == 4 && cmd->identifier == channel->config_id)
+    {
+        if (cmd->bytes < 6)
+            return fail(channel, 0xffff);
+        if (read16(p) != channel->local_cid)
+            return 0;
+        result = read16(p + 4);
+        if (read16(p + 2) == 0 && result == 1 && cmd->bytes == 10 &&
+            p[6] == 1 && p[7] == 2 && channel->retries < 3)
+        {
+            /* We only requested MTU. Never advertise more receive storage than
+             * the owner originally provided, or loop on an unchanged offer. */
+            mtu = read16(p + 8);
+            if (mtu < 48 || mtu > channel->receive_limit || mtu == channel->receive_mtu)
+                return fail(channel, result);
+            channel->receive_mtu = mtu;
+            channel->awaiting = 0;
+            channel->retry_pending = 1;
+            return 1;
+        }
+        if (read16(p + 2) != 0 || result != 0)
+            return fail(channel, result != 0 ? result : 0xffff);
+        channel->awaiting = 0;
+        channel->local_configured = 1;
+        maybe_open(channel);
+        return 1;
+    }
+    if (cmd->code == 6 && channel->remote_cid >= 0x40 &&
+        channel->state != BTV_CHANNEL_IDLE)
+    {
+        if (cmd->bytes != 4)
+            return -1;
+        if (read16(p) != channel->local_cid || read16(p + 2) != channel->remote_cid)
+            return 0;
+        if (channel->response_bytes != 0)
+            return 2;
+        channel->request_bytes = 0;
+        channel->awaiting = 0;
+        channel->response_opens = 0;
+        channel->retry_pending = 0;
+        channel->response_bytes = btv_l2cap_signal_encode(channel->response,
+            sizeof(channel->response), 7, cmd->identifier, p, 4);
+        channel->state = BTV_CHANNEL_CLOSING;
+        channel->started = now;
+        return 1;
+    }
+    if (cmd->code == 7 && channel->state == BTV_CHANNEL_CLOSING &&
+        channel->awaiting == 6 && cmd->identifier == channel->disconnect_id)
+    {
+        if (cmd->bytes != 4)
+            return fail(channel, 0xffff);
+        if (read16(p) != channel->remote_cid || read16(p + 2) != channel->local_cid)
+            return 0;
+        channel->state = BTV_CHANNEL_CLOSED;
+        channel->awaiting = 0;
+        return 1;
+    }
+    if (cmd->code == 1 && channel->awaiting != 0 &&
+        ((channel->awaiting == 2 && cmd->identifier == channel->connect_id) ||
+         (channel->awaiting == 4 && cmd->identifier == channel->config_id) ||
+         (channel->awaiting == 6 && cmd->identifier == channel->disconnect_id)))
+        return fail(channel, 0xffff);
+    return 0;
+}
+
+size_t btv_l2cap_channel_write(const btv_l2cap_channel *channel,
+                              uint8_t *pdu, size_t capacity,
+                              const uint8_t *data, size_t bytes)
+{
+    if (channel == NULL || pdu == NULL || channel->state != BTV_CHANNEL_OPEN ||
+        (bytes != 0 && data == NULL) || bytes > channel->transmit_mtu ||
+        capacity < bytes + 4)
+        return 0;
+    write16(pdu, (uint16_t)bytes);
+    write16(pdu + 2, channel->remote_cid);
+    if (bytes != 0)
+        memcpy(pdu + 4, data, bytes);
+    return bytes + 4;
+}
+
+int btv_l2cap_channel_read(const btv_l2cap_channel *channel,
+                          const uint8_t *pdu, size_t bytes,
+                          const uint8_t **data, size_t *length)
+{
+    if (channel == NULL || pdu == NULL || data == NULL || length == NULL || bytes < 4)
+        return -1;
+    if (read16(pdu + 2) != channel->local_cid)
+        return 0;
+    if (channel->state != BTV_CHANNEL_OPEN || bytes - 4 > channel->receive_mtu ||
+        read16(pdu) != bytes - 4)
+        return -1;
+    *data = pdu + 4;
+    *length = bytes - 4;
+    return 1;
+}

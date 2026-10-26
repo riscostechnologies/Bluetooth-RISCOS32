@@ -1,0 +1,244 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#include "sco_receive.h"
+#include <string.h>
+static int active(btv_sco_receive *q)
+{
+    const btv_sco_complete *link;
+    if (q == NULL || q->link == NULL || q->failed) return 0;
+    link = btv_sco_link_result(q->link);
+    if (link == NULL || link->handle != q->handle) { q->failed = 1; return 0; }
+    return 1;
+}
+int btv_sco_receive_init(btv_sco_receive *q, const btv_sco_link *link)
+{
+    const btv_sco_complete *result = btv_sco_link_result(link);
+    if (q == NULL || result == NULL) return 0;
+    memset(q, 0, sizeof(*q));
+    q->link = link; q->handle = result->handle;
+    q->next_sequence = 1;
+    return 1;
+}
+int btv_sco_receive_feed(btv_sco_receive *q, const uint8_t *packet, size_t bytes, uint32_t now)
+{
+    btv_sco_frame frame;
+    unsigned int slot;
+    if (!active(q)) return -1;
+    if (btv_sco_frame_decode(packet, bytes, &frame) != 1) { q->failed = 1; return -1; }
+    if (frame.handle != q->handle) return 0;
+    if (q->next_sequence == 0xffffffffUL) { q->failed = 1; return -1; }
+    if (q->count == 8)
+    {
+        ++q->next_sequence;
+        if (q->dropped != 0xffffffffUL) ++q->dropped;
+        return 2;
+    }
+    slot = (q->head + q->count) % 8;
+    if (frame.bytes) memcpy(q->data[slot], frame.data, frame.bytes);
+    q->info[slot].bytes = (uint16_t)frame.bytes;
+    q->info[slot].status = frame.status;
+    q->info[slot].sequence = q->next_sequence++;
+    q->info[slot].received_at = now;
+    ++q->count;
+    return 1;
+}
+int btv_sco_receive_read(btv_sco_receive *q, uint8_t *output, size_t capacity, btv_sco_packet_info *info)
+{
+    size_t bytes;
+    if (info == NULL || !active(q)) return -1;
+    if (!q->count) return 0;
+    bytes = q->info[q->head].bytes;
+    if (capacity < bytes) return -2;
+    if (bytes && output == NULL) return -1;
+    if (bytes) memcpy(output, q->data[q->head], bytes);
+    *info = q->info[q->head];
+    q->head = (q->head + 1) % 8;
+    --q->count;
+    return 1;
+}
+
+int btv_sco_usb_receive_init(btv_sco_usb_receive *rx, const btv_sco_link *link)
+{
+    if (rx == NULL || !btv_sco_receive_init(&rx->queue, link)) return 0;
+    return btv_hci_stream_init(&rx->stream, BTV_HCI_SCO,
+                               rx->assembly, sizeof(rx->assembly));
+}
+
+/* A header this link could have sent: our handle and, once learned, our
+ * packet length. */
+static int plausible_header(const btv_sco_usb_receive *rx, const uint8_t *p)
+{
+    uint16_t handle = rx->queue.handle;
+    if (p[0] != (uint8_t)handle ||
+        (p[1] & 0x0f) != (uint8_t)((handle >> 8) & 0x0f) || p[2] == 0)
+        return 0;
+    return rx->sync_length == 0 || p[2] == rx->sync_length;
+}
+
+/* Offset of the first of two consecutive plausible headers in the hunt
+ * window, -2 if more bytes are needed to confirm one, or -1. */
+static long find_boundary(const btv_sco_usb_receive *rx)
+{
+    size_t offset, next;
+    for (offset = 0; offset + 3 <= rx->hunt_used; ++offset)
+    {
+        if (!plausible_header(rx, rx->hunt + offset)) continue;
+        next = offset + 3 + rx->hunt[offset + 2];
+        if (next + 3 > rx->hunt_used) return -2;
+        if (plausible_header(rx, rx->hunt + next) &&
+            rx->hunt[next + 2] == rx->hunt[offset + 2])
+            return (long)offset;
+    }
+    return -1;
+}
+
+static void hunt_append(btv_sco_usb_receive *rx, const uint8_t *data,
+                        size_t bytes)
+{
+    while (bytes != 0)
+    {
+        size_t room = sizeof(rx->hunt) - rx->hunt_used;
+        if (room == 0)
+        {
+            /* Slide the window by one packet's worth. */
+            memmove(rx->hunt, rx->hunt + 258, rx->hunt_used - 258);
+            rx->hunt_used -= 258;
+            continue;
+        }
+        if (room > bytes) room = bytes;
+        memcpy(rx->hunt + rx->hunt_used, data, room);
+        rx->hunt_used += room;
+        data += room;
+        bytes -= room;
+    }
+}
+
+static void start_hunting(btv_sco_usb_receive *rx, const uint8_t *tail,
+                          size_t tail_bytes)
+{
+    ++rx->resyncs;
+    rx->hunting = 1;
+    rx->hunt_used = 0;
+    btv_hci_stream_restart(&rx->stream);
+    hunt_append(rx, tail, tail_bytes);
+}
+
+/* Feed aligned bytes. Stops early (consumed < bytes) on entering hunt mode;
+ * returns -1 only if the packet queue itself fails. */
+static int feed_aligned(btv_sco_usb_receive *rx, const uint8_t *data,
+                        size_t bytes, size_t *consumed, uint32_t now)
+{
+    size_t used, packet_bytes;
+    const uint8_t *packet;
+    int result;
+    *consumed = 0;
+    while (*consumed < bytes)
+    {
+        result = btv_hci_stream_feed(&rx->stream, data + *consumed,
+                                     bytes - *consumed, &used);
+        if (result == BTV_HCI_INVALID || used == 0)
+        {
+            start_hunting(rx, 0, 0);
+            return 1;
+        }
+        *consumed += used;
+        if (result != BTV_HCI_COMPLETE)
+        {
+            /* Check a header as soon as it is present: a misframed length
+             * byte would otherwise wait for bytes that never form a packet. */
+            if (rx->stream.used >= 3 &&
+                !plausible_header(rx, rx->stream.storage))
+            {
+                uint8_t tail[258];
+                size_t tail_bytes = rx->stream.used - 1;
+                if (tail_bytes > sizeof(tail)) tail_bytes = sizeof(tail);
+                memcpy(tail, rx->stream.storage + 1, tail_bytes);
+                start_hunting(rx, tail, tail_bytes);
+                return 1;
+            }
+            continue;
+        }
+        packet = btv_hci_stream_packet(&rx->stream, &packet_bytes);
+        if (packet == NULL || packet_bytes < 3 || !plausible_header(rx, packet))
+        {
+            /* Misframed: search again from just after this header. The
+             * tail is copied before the stream storage is released. */
+            uint8_t tail[258];
+            size_t tail_bytes = packet != NULL && packet_bytes > 1 ?
+                                packet_bytes - 1 : 0;
+            if (tail_bytes > sizeof(tail)) tail_bytes = sizeof(tail);
+            if (tail_bytes) memcpy(tail, packet + 1, tail_bytes);
+            btv_hci_stream_take(&rx->stream);
+            start_hunting(rx, tail, tail_bytes);
+            return 1;
+        }
+        if (rx->sync_length == 0) rx->sync_length = packet[2];
+        if (btv_sco_receive_feed(&rx->queue, packet, packet_bytes, now) < 0)
+            return -1;
+        btv_hci_stream_take(&rx->stream);
+    }
+    return 1;
+}
+
+int btv_sco_usb_receive_frame(btv_sco_usb_receive *rx, const uint8_t *data,
+                              size_t bytes, uint32_t status, uint32_t now)
+{
+    size_t consumed;
+    long found;
+    if (rx == NULL) return -1;
+    /* An explicit USB loss (or a stop) still freezes the receiver. */
+    if (status != 0 || (bytes != 0 && data == NULL) || !active(&rx->queue) ||
+        rx->stream.lost)
+        goto lost;
+    for (;;)
+    {
+        if (!rx->hunting && rx->replay_pos < rx->replay_used)
+        {
+            if (feed_aligned(rx, rx->replay + rx->replay_pos,
+                             rx->replay_used - rx->replay_pos,
+                             &consumed, now) < 0)
+                goto lost;
+            rx->replay_pos += consumed;
+            continue;
+        }
+        if (rx->hunting)
+        {
+            if (rx->replay_pos < rx->replay_used)
+                hunt_append(rx, rx->replay + rx->replay_pos,
+                            rx->replay_used - rx->replay_pos);
+            rx->replay_pos = rx->replay_used = 0;
+            found = find_boundary(rx);
+            if (found >= 0)
+            {
+                rx->replay_used = rx->hunt_used - (size_t)found;
+                memcpy(rx->replay, rx->hunt + found, rx->replay_used);
+                rx->replay_pos = 0;
+                rx->hunt_used = 0;
+                rx->hunting = 0;
+                btv_hci_stream_restart(&rx->stream);
+                continue;
+            }
+            if (found == -1 && rx->hunt_used > 2)
+            {
+                /* Only the last two bytes could still begin a header. */
+                memmove(rx->hunt, rx->hunt + rx->hunt_used - 2, 2);
+                rx->hunt_used = 2;
+            }
+            if (bytes == 0) return 1;
+            consumed = bytes < 258 ? bytes : 258;
+            hunt_append(rx, data, consumed);
+            data += consumed;
+            bytes -= consumed;
+            continue;
+        }
+        if (bytes == 0) return 1;
+        if (feed_aligned(rx, data, bytes, &consumed, now) < 0)
+            goto lost;
+        data += consumed;
+        bytes -= consumed;
+    }
+lost:
+    rx->queue.failed = 1;
+    btv_hci_stream_loss(&rx->stream);
+    return -1;
+}

@@ -1,0 +1,133 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/* Compose bridge ACL, L2CAP signaling and one bounded SDP discovery. */
+#include "bridge_sdp.h"
+#include <string.h>
+
+#define OWNER_NONE 0u
+#define OWNER_DISPATCH 1u
+#define OWNER_SDP 2u
+
+static int fail(btv_bridge_sdp *discovery, unsigned int error)
+{
+    discovery->state = BTV_BS_FAILED;
+    discovery->error = error;
+    btv_l2cap_dispatch_abort(&discovery->dispatch);
+    return -1;
+}
+
+int btv_bridge_sdp_start(btv_bridge_sdp *discovery, btv_bridge_acl *acl,
+                         uint16_t service, uint32_t now)
+{
+    if (discovery == 0 || acl == 0 || acl->state != BTV_BA_RUNNING ||
+        service == 0)
+        return 0;
+    memset(discovery, 0, sizeof(*discovery));
+    discovery->acl = acl;
+    btv_l2cap_dispatch_init(&discovery->dispatch);
+    btv_sdp_session_init(&discovery->session);
+    if (!btv_sdp_session_start(&discovery->session,
+            &discovery->dispatch, service, BTV_L2CAP_SIGNAL_MTU,
+            discovery->storage, sizeof(discovery->storage), now))
+        return 0;
+    discovery->state = BTV_BS_RUNNING;
+    return 1;
+}
+
+static int finish_output(btv_bridge_sdp *discovery)
+{
+    int result;
+    if (discovery->output_owner == OWNER_NONE) return 0;
+    result = btv_bridge_acl_take_transmit(discovery->acl);
+    if (result == BTV_TX_WAIT) return 0;
+    if (result != BTV_TX_OK) return fail(discovery, 2);
+    discovery->output_owner = OWNER_NONE;
+    discovery->output_token = 0;
+    return 1;
+}
+
+static int receive_packet(btv_bridge_sdp *discovery, uint32_t now)
+{
+    const uint8_t *packet;
+    size_t bytes;
+    int result;
+    packet = btv_bridge_acl_packet(discovery->acl, &bytes);
+    if (packet == 0) return 0;
+    result = btv_l2cap_dispatch_receive(&discovery->dispatch,
+                                        packet, bytes, now);
+    if (result == 2) return 0;
+    if (result < 0) return fail(discovery, 3);
+    if (result == 0)
+    {
+        result = btv_sdp_session_receive(&discovery->session,
+                                         packet, bytes, now);
+        if (result < 0) return fail(discovery, 4);
+        if (result == 0) return fail(discovery, 5);
+    }
+    if (!btv_bridge_acl_take_packet(discovery->acl))
+        return fail(discovery, 6);
+    return 1;
+}
+
+static int queue_output(btv_bridge_sdp *discovery, uint32_t now)
+{
+    size_t bytes;
+    unsigned int token;
+    int result;
+    if (discovery->output_owner != OWNER_NONE) return 0;
+    bytes = btv_l2cap_dispatch_output(&discovery->dispatch,
+                    discovery->output, sizeof(discovery->output),
+                    &token, now);
+    if (bytes != 0)
+    {
+        result = btv_bridge_acl_queue(discovery->acl,
+                                      discovery->output, bytes);
+        if (result == BTV_TX_WAIT) return 0;
+        if (result != BTV_TX_OK ||
+            !btv_l2cap_dispatch_sent(&discovery->dispatch, token))
+            return fail(discovery, 7);
+        discovery->output_owner = OWNER_DISPATCH;
+        discovery->output_token = token;
+        return 1;
+    }
+    bytes = btv_sdp_session_output(&discovery->session,
+                    discovery->output, sizeof(discovery->output), now);
+    if (bytes == 0) return 0;
+    result = btv_bridge_acl_queue(discovery->acl,
+                                  discovery->output, bytes);
+    if (result == BTV_TX_WAIT) return 0;
+    if (result != BTV_TX_OK || !btv_sdp_session_sent(&discovery->session))
+        return fail(discovery, 8);
+    discovery->output_owner = OWNER_SDP;
+    return 1;
+}
+
+int btv_bridge_sdp_pump(btv_bridge_sdp *discovery, uint32_t now)
+{
+    int result, work;
+    if (discovery == 0 || discovery->state != BTV_BS_RUNNING) return 0;
+    work = 0;
+    result = btv_bridge_acl_pump(discovery->acl);
+    if (result < 0) return fail(discovery, 1);
+    work |= result;
+    result = finish_output(discovery); if (result < 0) return -1; work |= result;
+    result = receive_packet(discovery, now); if (result < 0) return -1; work |= result;
+    btv_sdp_session_tick(&discovery->session, now);
+    if (discovery->session.state == BTV_DISCOVERY_FAILED)
+        return fail(discovery, 9);
+    result = queue_output(discovery, now); if (result < 0) return -1; work |= result;
+    if (discovery->session.state == BTV_DISCOVERY_DONE &&
+        discovery->output_owner == OWNER_NONE)
+    {
+        discovery->state = BTV_BS_DONE;
+        return 1;
+    }
+    return work;
+}
+
+const btv_sdp_service *btv_bridge_sdp_result(
+                         const btv_bridge_sdp *discovery)
+{
+    return discovery != 0 && discovery->state == BTV_BS_DONE ?
+           btv_sdp_session_result(&discovery->session) : 0;
+}

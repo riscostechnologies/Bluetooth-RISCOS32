@@ -1,0 +1,2697 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        bt_core
+ * Purpose:     Shared Bluetooth host core.  One owner for the controller:
+ *              bring-up, a serial HCI command queue, one standing event
+ *              read, ACL in/out for several links, classic and LE
+ *              discovery, pairing and the key store.  Profiles live in
+ *              bt_profiles and are driven through its hooks.
+ ******************************************************************/
+#include "bt_core.h"
+#include "bt_reconnect.h"
+#include "bt_profiles.h"
+#include "hci_frame.h"
+#include <string.h>
+
+static uint32_t last_beat;
+
+/* The bring-up on the HAL debug channel: "[bt] core: <what> <hex>". */
+/* Milliseconds at module initialisation: the zero of the boot timings. */
+uint32_t btc_origin_ms;
+
+/* Set by the module while timing polls (Bluetooth$Trace): told each stage
+ * of btc_pump as it begins. */
+void (*btc_stage_hook)(unsigned int stage);
+#define STAGE(n) do { if (btc_stage_hook) btc_stage_hook(n); } while (0)
+
+void btc_note(const char *what, uint32_t value)
+{
+    static const char digits[] = "0123456789abcdef";
+    char text[96];
+    unsigned int i = 0, shift;
+    while (what[i] != 0 && i < 80) { text[i] = what[i]; ++i; }
+    text[i++] = ' ';
+    for (shift = 32; shift != 0; shift -= 4)
+        text[i++] = digits[(value >> (shift - 4)) & 15u];
+    text[i] = 0;
+    btv_host_bridge_note("core: ", text);
+}
+
+#define COMMAND_TIMEOUT_MS 5000u
+#define CONNECT_TIMEOUT_MS 20000u
+#define NAME_TIMEOUT_MS 8000u
+#define NAMING_BUDGET_MS 45000u   /* a scan stops asking for names after this */
+#define NAME_REFRESHES 2u
+#define STOP_TIMEOUT_MS 3000u
+#define LINK_NONE 0xffu
+#define ACL_BURST 8u
+#define CREDIT_STALL_MS 1000u
+
+/* HCI opcodes. */
+#define OP_INQUIRY 0x0401u
+#define OP_INQUIRY_CANCEL 0x0402u
+#define OP_CREATE_CONNECTION 0x0405u
+#define OP_DISCONNECT 0x0406u
+#define OP_ACCEPT_CONNECTION 0x0409u
+#define OP_CHANGE_PACKET_TYPE 0x040fu
+#define OP_REJECT_CONNECTION 0x040au
+#define OP_LINK_KEY_REPLY 0x040bu
+#define OP_LINK_KEY_NEGATIVE 0x040cu
+#define OP_PIN_CODE_REPLY 0x040du
+#define OP_AUTH_REQUESTED 0x0411u
+#define OP_SET_ENCRYPTION 0x0413u
+#define OP_REMOTE_NAME 0x0419u
+#define OP_REMOTE_NAME_CANCEL 0x041au
+#define OP_IO_CAPABILITY_REPLY 0x042bu
+#define OP_USER_CONFIRM_REPLY 0x042cu
+#define OP_USER_CONFIRM_NEGATIVE 0x042du
+#define OP_USER_PASSKEY_REPLY 0x042eu
+#define OP_USER_PASSKEY_NEGATIVE 0x042fu
+#define OP_WRITE_LINK_POLICY 0x080fu
+#define OP_SET_EVENT_MASK 0x0c01u
+#define OP_WRITE_LOCAL_NAME 0x0c13u
+#define OP_WRITE_SCAN_ENABLE 0x0c1au
+#define OP_WRITE_CLASS 0x0c24u
+#define OP_WRITE_INQUIRY_MODE 0x0c45u
+#define OP_WRITE_SSP_MODE 0x0c56u
+#define OP_WRITE_LE_HOST 0x0c6du
+#define OP_LE_SET_EVENT_MASK 0x2001u
+#define OP_LE_READ_BUFFER 0x2002u
+#define OP_LE_SET_SCAN_PARAMETERS 0x200bu
+#define OP_LE_SET_SCAN_ENABLE 0x200cu
+#define OP_LE_CREATE_CONNECTION 0x200du
+#define OP_LE_CREATE_CANCEL 0x200eu
+
+/* LMP features page 0. */
+#define FEATURE_SSP(info) ((info)->features[0][6] & 0x08u)
+#define FEATURE_LE(info) ((info)->features[0][4] & 0x40u)
+
+static uint16_t read16(const uint8_t *p)
+{
+    return (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
+}
+
+static void write16(uint8_t *p, uint16_t value)
+{
+    p[0] = (uint8_t)value;
+    p[1] = (uint8_t)(value >> 8);
+}
+
+static void problem(btc_core *core, uint32_t code, const uint8_t *address)
+{
+    core->last_problem = code;
+    if (address != 0) memcpy(core->problem_address, address, 6);
+}
+
+/* HCI statuses that mean "nobody answered the page (yet)": worth repeating
+ * when a person asked for the connection (Core Vol 1 Part F: 0x04 Page
+ * Timeout, 0x08 Connection Timeout, 0x0c Command Disallowed, 0x22 LMP
+ * Response Timeout, 0x3e Connection Failed to be Established). */
+static int status_is_retryable(uint8_t status)
+{
+    return status == 0x04 || status == 0x08 || status == 0x0c ||
+           status == 0x22 || status == 0x3e;
+}
+
+#define USER_CONNECT_RETRIES 2u
+
+/* A paging attempt failed, by Command Status or by Connection Complete:
+ * `area` is the problem area (0x02 or 0x03).  A person's Connect is tried
+ * again a moment later (a keyboard in pairing mode is not always listening
+ * the instant it is paged); the reconnection engine has its own schedule.
+ * A link that crossed with the device's own call is not failed by the
+ * report of our page. */
+static void connect_failed(btc_core *core, btc_link *link, uint32_t area,
+                           uint8_t status)
+{
+    if (link->crossed && link->state == BTC_LINK_CONNECTING)
+    {
+        btc_note("page failed but the device called us; status", status);
+        return;
+    }
+    ++core->stats.connect_failures;
+    core->stats.connect_last_status = status;
+    btc_note("connection failed, status", status);
+    if (!link->le && link->outgoing && link->user_retries < USER_CONNECT_RETRIES &&
+        status_is_retryable(status) && !core->retry_pending)
+    {
+        core->retry_pending = 1;
+        memcpy(core->retry_address, link->address, 6);
+        core->retry_profile = link->profile;
+        core->retry_count = (uint8_t)(link->user_retries + 1u);
+        core->retry_at = core->now + 1500u * core->retry_count;
+        ++core->stats.connect_retries;
+        problem(core, 0x0d00u | core->retry_count, link->address);
+        btc_note("connection will be tried again, attempt", core->retry_count + 1u);
+    }
+    else
+        problem(core, area | status, link->address);
+    memset(link, 0, sizeof(*link));
+    ++core->links_generation;
+}
+
+static void fail(btc_core *core, uint32_t error)
+{
+    if (core->state == BTC_FAILED) return;
+    btc_note("FAILED, error", error);
+    btc_note("  was in state", core->state);
+    btc_note("  boot stage", core->boot.stage);
+    btc_note("  boot error|status", core->boot.error << 8 | core->boot.status);
+    btc_note("  config steps left", core->config_step);
+    btc_note("  command waiting|opcode", core->command_waiting << 16 |
+                                       core->waiting_opcode);
+    btc_note("  credits|queued", core->credits << 8 | core->command_count);
+    core->error = error;
+    core->state = BTC_FAILED;
+    core->state_since = core->now;
+}
+
+int btc_link_index(const btc_core *core, const btc_link *link)
+{
+    return (int)(link - core->links);
+}
+
+btc_link *btc_link_by_handle(btc_core *core, uint16_t handle)
+{
+    unsigned int index;
+    for (index = 0; index < BTC_LINKS; ++index)
+        if (core->links[index].state != BTC_LINK_FREE &&
+            core->links[index].state != BTC_LINK_CONNECTING &&
+            core->links[index].handle == handle)
+            return &core->links[index];
+    return 0;
+}
+
+btc_link *btc_link_by_address(btc_core *core, const uint8_t address[6])
+{
+    unsigned int index;
+    for (index = 0; index < BTC_LINKS; ++index)
+        if (core->links[index].state != BTC_LINK_FREE &&
+            memcmp(core->links[index].address, address, 6) == 0)
+            return &core->links[index];
+    /* A bonded LE device found at a private address is listed, and so
+     * asked for, by its identity address. */
+    for (index = 0; index < core->device_count; ++index)
+        if (core->devices[index].has_identity &&
+            memcmp(core->devices[index].identity, address, 6) == 0 &&
+            memcmp(core->devices[index].address, address, 6) != 0)
+            return btc_link_by_address(core, core->devices[index].address);
+    return 0;
+}
+
+static btc_link *link_allocate(btc_core *core, const uint8_t address[6])
+{
+    unsigned int index;
+    for (index = 0; index < BTC_LINKS; ++index)
+        if (core->links[index].state == BTC_LINK_FREE)
+        {
+            btc_link *link = &core->links[index];
+            memset(link, 0, sizeof(*link));
+            memcpy(link->address, address, 6);
+            link->next_ident = 1;
+            link->started = core->now;
+            return link;
+        }
+    return 0;
+}
+
+btc_device *btc_device_find(btc_core *core, const uint8_t address[6])
+{
+    unsigned int index;
+    for (index = 0; index < core->device_count; ++index)
+        if (memcmp(core->devices[index].address, address, 6) == 0)
+            return &core->devices[index];
+    return 0;
+}
+
+/* ---- remembered names ----------------------------------------------- */
+
+/* A private Low Energy address changes every quarter of an hour: its name
+ * is not worth keeping. */
+static int address_is_stable(const btc_device *d)
+{
+    return !(d->flags & BTC_DEV_RANDOM_ADDR) || (d->address[5] & 0xc0u) == 0xc0u;
+}
+
+static btc_name_entry *name_find(btc_core *core, const uint8_t address[6])
+{
+    unsigned int index;
+    for (index = 0; index < BTC_NAME_CACHE; ++index)
+        if (core->names[index].used &&
+            memcmp(core->names[index].address, address, 6) == 0)
+            return &core->names[index];
+    return 0;
+}
+
+/* The device has a name it was told (not one recalled): keep it. */
+static void name_remember(btc_core *core, const btc_device *d)
+{
+    btc_name_entry *e;
+    if (!(d->flags & BTC_DEV_NAMED) || d->name[0] == 0 || !address_is_stable(d))
+        return;
+    e = name_find(core, d->address);
+    if (e == 0)
+    {
+        e = &core->names[core->name_next];
+        core->name_next = (uint8_t)((core->name_next + 1u) % BTC_NAME_CACHE);
+    }
+    e->used = 1;
+    memcpy(e->address, d->address, 6);
+    memcpy(e->device_class, d->device_class, 3);
+    e->flags = (uint16_t)(d->flags & (BTC_DEV_AUDIO_SINK | BTC_DEV_HANDSFREE |
+                BTC_DEV_HID | BTC_DEV_KEYBOARD | BTC_DEV_MOUSE | BTC_DEV_LE |
+                BTC_DEV_GAMEPAD | BTC_DEV_CLASSIC));
+    memcpy(e->name, d->name, BTC_NAME_BYTES);
+}
+
+/* A device met again: what was learnt about it before, flagged so that a
+ * fresh name (from a scan's data or a request) can replace it. */
+static void name_recall(btc_core *core, btc_device *d)
+{
+    btc_name_entry *e = name_find(core, d->address);
+    if (e == 0) return;
+    memcpy(d->name, e->name, BTC_NAME_BYTES);
+    memcpy(d->device_class, e->device_class, 3);
+    d->flags |= (uint16_t)(e->flags | BTC_DEV_NAMED);
+    d->name_cached = 1;
+    d->name_source = 3;
+}
+
+/* How much a scan result is worth keeping when the table is full: what a
+ * person came to find (a connected or paired device, then classic devices,
+ * what has a name or is an input or audio device, the nearer ones) beats a
+ * beacon that happens to be in range. */
+int btc_device_value(btc_core *core, const btc_device *d)
+{
+    int rssi = d->rssi == 0 ? -70 : d->rssi, v = (rssi + 128) >> 3;
+    if ((d->flags & (BTC_DEV_CONNECTED | BTC_DEV_PAIRED)) ||
+        btc_key_find(core, d->address) != 0)
+        return 1000;
+    if (!(d->flags & BTC_DEV_LE) || (d->flags & BTC_DEV_CLASSIC)) v += 40;
+    if (d->flags & (BTC_DEV_HID | BTC_DEV_AUDIO_SINK | BTC_DEV_HANDSFREE))
+        v += 30;
+    if (d->flags & BTC_DEV_NAMED) v += 20;
+    return v;
+}
+
+/* Room for one more: the least valuable entry goes, if it is worth less
+ * than `incoming` (which is a guess before the result has been read). */
+static btc_device *device_make_room(btc_core *core, int incoming)
+{
+    unsigned int index, worst = 0;
+    int worst_value = 100000;
+    for (index = 0; index < core->device_count; ++index)
+    {
+        int v = btc_device_value(core, &core->devices[index]);
+        if (v < worst_value) { worst_value = v; worst = index; }
+    }
+    if (worst_value >= incoming) return 0;
+    ++core->stats.devices_evicted;
+    core->devices[worst] = core->devices[core->device_count - 1u];
+    --core->device_count;
+    return &core->devices[core->device_count];
+}
+
+static btc_device *device_new(btc_core *core, const uint8_t address[6])
+{
+    btc_device *device = &core->devices[core->device_count++];
+    memset(device, 0, sizeof(*device));
+    memcpy(device->address, address, 6);
+    name_recall(core, device);
+    ++core->devices_generation;
+    return device;
+}
+
+/* A scan result: `le` for Low Energy, `rssi` as the controller gave it
+ * (0 when it did not).  Returns 0 when the table is full of better. */
+btc_device *btc_device_add_scan(btc_core *core, const uint8_t address[6],
+                                int le, int8_t rssi)
+{
+    btc_device *device = btc_device_find(core, address);
+    int incoming;
+    if (device != 0) return device;
+    if (core->device_count >= BTC_DEVICES)
+    {
+        incoming = (le ? 0 : 40) + (((rssi == 0 ? -70 : rssi) + 128) >> 3);
+        if (device_make_room(core, incoming) == 0)
+        {
+            ++core->stats.devices_dropped;
+            return 0;
+        }
+    }
+    return device_new(core, address);
+}
+
+/* A device that must be listed (a link): the least valuable makes room. */
+btc_device *btc_device_add(btc_core *core, const uint8_t address[6])
+{
+    btc_device *device = btc_device_find(core, address);
+    if (device != 0) return device;
+    if (core->device_count >= BTC_DEVICES &&
+        device_make_room(core, 100000) == 0)
+        return 0;
+    return device_new(core, address);
+}
+
+btc_key *btc_key_find(btc_core *core, const uint8_t address[6])
+{
+    unsigned int index;
+    for (index = 0; index < BTC_KEYS; ++index)
+        if (core->keys[index].used &&
+            memcmp(core->keys[index].address, address, 6) == 0)
+            return &core->keys[index];
+    return 0;
+}
+
+btc_key *btc_key_store(btc_core *core, const uint8_t address[6], int le)
+{
+    btc_key *key = btc_key_find(core, address);
+    unsigned int index;
+    if (key == 0)
+    {
+        for (index = 0; index < BTC_KEYS && core->keys[index].used; ++index) {}
+        /* Full: replace the oldest (first) entry. */
+        if (index == BTC_KEYS)
+        {
+            memmove(core->keys, core->keys + 1,
+                    sizeof(core->keys[0]) * (BTC_KEYS - 1));
+            index = BTC_KEYS - 1;
+        }
+        key = &core->keys[index];
+        memset(key, 0, sizeof(*key));
+        key->used = 1;
+        memcpy(key->address, address, 6);
+    }
+    key->le = (uint8_t)(le != 0);
+    ++core->keys_generation;
+    return key;
+}
+
+int btc_key_unpack(btc_key *out, const uint8_t *entry, unsigned int bytes)
+{
+    if (bytes != sizeof(btc_key) && bytes != BTC_KEY_V1_BYTES) return 0;
+    memset(out, 0, sizeof *out);
+    memcpy(out, entry, bytes);
+    if (bytes == BTC_KEY_V1_BYTES) out->gatt.valid = 0;
+    return 1;
+}
+
+int btc_key_forget(btc_core *core, const uint8_t address[6])
+{
+    btc_key *key = btc_key_find(core, address);
+    if (key == 0) return 0;
+    memset(key, 0, sizeof(*key));
+    ++core->keys_generation;
+    return 1;
+}
+
+/* ---- commands ---------------------------------------------------- */
+
+int btc_command_queue(btc_core *core, uint16_t opcode,
+                      const uint8_t *parameters, uint8_t bytes,
+                      uint8_t kind, uint8_t link)
+{
+    btc_command *command;
+    if (core->command_count >= BTC_COMMANDS) return 0;
+    command = &core->commands[(core->command_head + core->command_count) &
+                              (BTC_COMMANDS - 1u)];
+    command->packet[0] = (uint8_t)opcode;
+    command->packet[1] = (uint8_t)(opcode >> 8);
+    command->packet[2] = bytes;
+    if (bytes != 0) memcpy(command->packet + 3, parameters, bytes);
+    command->bytes = (uint16_t)(3u + bytes);
+    command->kind = kind;
+    command->link = link;
+    ++core->command_count;
+    return 1;
+}
+
+static void submit_command(btc_core *core)
+{
+    btc_command *command;
+    uint32_t ignored;
+    int result;
+    if (core->command_ticket != 0 || core->command_waiting ||
+        core->command_count == 0 || core->credits == 0)
+        return;
+    command = &core->commands[core->command_head];
+    result = btv_host_bridge_submit(BTV_HOST_BRIDGE_COMMAND, command->packet,
+                                    command->bytes, 0, &core->command_ticket,
+                                    &ignored);
+    if (result == BTV_HOST_BRIDGE_BUSY) return;
+    if (result != BTV_HOST_BRIDGE_OK)
+    {
+        core->command_ticket = 0;
+        fail(core, 0x100u);
+        return;
+    }
+    core->in_flight = *command;
+    core->command_resends = 0;
+    core->command_waiting = 1;
+    btc_note("command sent", read16(command->packet));
+    core->command_waiting = 1;
+    core->waiting_opcode = read16(command->packet);
+    core->waiting_kind = command->kind;
+    core->waiting_link = command->link;
+    core->waiting_since = core->now;
+    core->credits = 0;
+    core->command_head = (uint8_t)((core->command_head + 1u) &
+                                   (BTC_COMMANDS - 1u));
+    --core->command_count;
+}
+
+/* ---- transmit ---------------------------------------------------- */
+
+static uint16_t pool_free(const btc_core *core, const btc_link *link)
+{
+    return link->le && !core->le_shared ? core->le_free : core->acl_free;
+}
+
+static void pool_take(btc_core *core, const btc_link *link)
+{
+    if (link->le && !core->le_shared) --core->le_free;
+    else --core->acl_free;
+}
+
+static void pool_give(btc_core *core, const btc_link *link, uint16_t count)
+{
+    if (link->le && !core->le_shared)
+    {
+        core->le_free = (uint16_t)(core->le_free + count);
+        if (core->le_free > core->le_max) core->le_free = core->le_max;
+    }
+    else
+    {
+        core->acl_free = (uint16_t)(core->acl_free + count);
+        if (core->acl_free > core->acl_max) core->acl_free = core->acl_max;
+    }
+}
+
+int btc_can_send(const btc_core *core, uint8_t link, size_t bytes)
+{
+    const btc_link *l;
+    if (link >= BTC_LINKS) return 0;
+    l = &core->links[link];
+    return l->state == BTC_LINK_OPEN &&
+           l->tx_used + bytes + 2u <= BTC_TX_BYTES;
+}
+
+size_t btc_link_backlog(const btc_core *core, uint8_t link)
+{
+    return link < BTC_LINKS ? core->links[link].tx_used : 0;
+}
+
+int btc_send_pdu(btc_core *core, uint8_t link, const uint8_t *pdu,
+                 size_t bytes)
+{
+    btc_link *l;
+    if (link >= BTC_LINKS || bytes < 4) return -1;
+    l = &core->links[link];
+    if (l->state != BTC_LINK_OPEN) return -1;
+    if (l->tx_used + bytes + 2u > BTC_TX_BYTES) return 0;
+    write16(l->tx + l->tx_used, (uint16_t)bytes);
+    memcpy(l->tx + l->tx_used + 2, pdu, bytes);
+    l->tx_used = (uint16_t)(l->tx_used + bytes + 2u);
+    return 1;
+}
+
+int btc_send_l2cap(btc_core *core, uint8_t link, uint16_t cid,
+                   const uint8_t *data, size_t bytes)
+{
+    btc_link *l;
+    size_t total = bytes + 4u;
+    if (link >= BTC_LINKS || total > 0xffffu) return -1;
+    l = &core->links[link];
+    if (l->state != BTC_LINK_OPEN) return -1;
+    if (l->tx_used + total + 2u > BTC_TX_BYTES) return 0;
+    write16(l->tx + l->tx_used, (uint16_t)total);
+    write16(l->tx + l->tx_used + 2, (uint16_t)bytes);
+    write16(l->tx + l->tx_used + 4, cid);
+    if (bytes != 0) memcpy(l->tx + l->tx_used + 6, data, bytes);
+    l->tx_used = (uint16_t)(l->tx_used + total + 2u);
+    return 1;
+}
+
+/* A free ACL OUT slot, or BTC_ACL_OUT_SLOTS when all are busy. */
+static unsigned int acl_out_slot(btc_core *core)
+{
+    unsigned int slot;
+    for (slot = 0; slot < BTC_ACL_OUT_SLOTS; ++slot)
+        if (core->acl_out_ticket[slot] == 0) return slot;
+    return BTC_ACL_OUT_SLOTS;
+}
+
+static int submit_acl(btc_core *core)
+{
+    unsigned int pass, index, slot;
+    static uint8_t next;
+    uint32_t ignored;
+    int result;
+    slot = acl_out_slot(core);
+    if (slot == BTC_ACL_OUT_SLOTS)
+    {
+        ++core->acl_no_slot;
+        return 0;
+    }
+    for (pass = 0; pass < BTC_LINKS; ++pass)
+    {
+        btc_link *link;
+        uint16_t pdu_bytes, chunk, mtu, flags;
+        index = next + pass;
+        if (index >= BTC_LINKS) index -= BTC_LINKS;
+        link = &core->links[index];
+        if (link->state != BTC_LINK_OPEN || link->tx_used == 0) continue;
+        if (pool_free(core, link) == 0)
+        {
+            ++core->acl_no_credit;
+            continue;
+        }
+        mtu = link->le && !core->le_shared ? core->le_mtu : core->acl_mtu;
+        pdu_bytes = read16(link->tx);
+        chunk = (uint16_t)(pdu_bytes - link->tx_offset);
+        if (chunk > mtu) chunk = mtu;
+        if (chunk > sizeof(core->acl_out) - 4u)
+            chunk = (uint16_t)(sizeof(core->acl_out) - 4u);
+        flags = link->tx_offset != 0 ? 0x1000u :
+                (link->le ? 0x0000u : 0x2000u);
+        write16(core->acl_out, (uint16_t)(link->handle | flags));
+        write16(core->acl_out + 2, chunk);
+        memcpy(core->acl_out + 4, link->tx + 2 + link->tx_offset, chunk);
+        result = btv_host_bridge_submit(BTV_HOST_BRIDGE_ACL_OUT,
+                    core->acl_out, (uint32_t)chunk + 4u, 0,
+                    &core->acl_out_ticket[slot], &ignored);
+        if (result == BTV_HOST_BRIDGE_BUSY)
+        {
+            ++core->acl_busy;
+            return 0;
+        }
+        if (result != BTV_HOST_BRIDGE_OK)
+        {
+            core->acl_out_ticket[slot] = 0;
+            fail(core, 0x101u);
+            return 0;
+        }
+        core->acl_out_bytes = (uint32_t)chunk + 4u;
+        ++core->acl_sent;
+        pool_take(core, link);
+        ++link->outstanding;
+        link->tx_offset = (uint16_t)(link->tx_offset + chunk);
+        if (link->tx_offset >= pdu_bytes)
+        {
+            uint16_t record = (uint16_t)(pdu_bytes + 2u);
+            memmove(link->tx, link->tx + record, link->tx_used - record);
+            link->tx_used = (uint16_t)(link->tx_used - record);
+            link->tx_offset = 0;
+        }
+        next = (uint8_t)(index + 1u >= BTC_LINKS ? 0 : index + 1u);
+        return 1;
+    }
+    return 0;
+}
+
+/* Frees every finished ACL OUT slot; returns 1 when all are free. */
+static int acl_out_finished(btc_core *core)
+{
+    unsigned int slot, busy = 0;
+    int result;
+    for (slot = 0; slot < BTC_ACL_OUT_SLOTS; ++slot)
+    {
+        if (core->acl_out_ticket[slot] == 0) continue;
+        result = btv_host_bridge_poll(core->acl_out_ticket[slot],
+                                      core->completion);
+        if (result == BTV_HOST_BRIDGE_PENDING)
+        {
+            ++busy;
+            continue;
+        }
+        core->acl_out_ticket[slot] = 0;
+        if (result != BTV_HOST_BRIDGE_OK || core->completion->error != 0)
+        {
+            fail(core, 0x107u);
+            return 0;
+        }
+    }
+    return busy == 0;
+}
+
+static void send_acl(btc_core *core)
+{
+    unsigned int burst;
+    for (burst = 0; burst < ACL_BURST; ++burst)
+    {
+        (void)acl_out_finished(core);      /* free whatever has landed */
+        if (!submit_acl(core)) return;
+    }
+}
+
+/* Role Change (0x12): status, address, new role (0 master, 1 slave). */
+static void role_change(btc_core *core, const uint8_t *event, size_t bytes)
+{
+    btc_link *link;
+    if (bytes < 10u || event[2] != 0) return;
+    link = btc_link_by_address(core, event + 3);
+    if (link == 0) return;
+    link->role = event[9];
+    core->last_role = event[9];
+    btc_note("role change (0 master), link", (uint32_t)event[9] << 8 | (uint32_t)btc_link_index(core, link));
+}
+
+/* Mode Change (0x14): status, handle, mode (0 active, 1 hold, 2 sniff, 3
+ * park), interval. We do not want the link anywhere but active: a sniffing
+ * speaker polls once an interval and the audio crawls. */
+static void mode_change(btc_core *core, const uint8_t *event, size_t bytes)
+{
+    uint8_t p[2];
+    btc_link *link;
+    if (bytes < 8u || event[2] != 0) return;
+    link = btc_link_by_handle(core, (uint16_t)(read16(event + 3) & 0x0fff));
+    if (link == 0) return;
+    btc_note("link mode (0 active, 2 sniff), interval", (uint32_t)event[5] << 16 | read16(event + 6));
+    if (event[5] == 2)
+    {
+        write16(p, link->handle);
+        (void)btc_command_queue(core, 0x0804u, p, 2, BTC_R_IGNORE, LINK_NONE);  /* Exit Sniff Mode */
+    }
+}
+
+/* Switch Role (0x080B): be the master of a link we are the slave of. */
+void btc_become_master(btc_core *core, uint8_t index)
+{
+    btc_link *link;
+    uint8_t p[7];
+    if (index >= BTC_LINKS) return;
+    link = &core->links[index];
+    if (link->state != BTC_LINK_OPEN || link->le || link->role == 0 ||
+        link->switch_sent) return;
+    link->switch_sent = 1;
+    memcpy(p, link->address, 6);
+    p[6] = 0x00;
+    btc_note("asking to be the master of link", index);
+    (void)btc_command_queue(core, 0x080bu, p, 7, BTC_R_IGNORE, LINK_NONE);
+}
+
+static void completed_packets(btc_core *core, const uint8_t *event,
+                              size_t bytes)
+{
+    unsigned int count, index;
+    if (bytes < 3u) return;
+    count = event[2];
+    if (bytes < 3u + count * 4u) return;
+    core->last_nocp = core->now;
+    ++core->nocp_events;
+    /* The first events after start-up, and each one while the credits are
+     * short, are logged: handle, packets, the credits before. */
+    if (core->nocp_events <= 40u || core->acl_free == 0)
+        for (index = 0; index < count; ++index)
+            btc_note("completed packets, handle|n|free-before",
+                     (uint32_t)(read16(event + 3 + index * 4) & 0x0fff) << 16 |
+                     (read16(event + 5 + index * 4) & 0xffu) << 8 |
+                     (core->acl_free & 0xffu));
+    for (index = 0; index < count; ++index)
+    {
+        uint16_t handle = (uint16_t)(read16(event + 3 + index * 4) & 0x0fff);
+        uint16_t packets = read16(event + 5 + index * 4);
+        btc_link *link = btc_link_by_handle(core, handle);
+        if (link == 0) continue;
+        if (packets > link->outstanding) packets = link->outstanding;
+        link->outstanding = (uint16_t)(link->outstanding - packets);
+        pool_give(core, link, packets);
+        core->nocp_packets += packets;
+    }
+}
+
+/* ---- receive ----------------------------------------------------- */
+
+static void link_data(btc_core *core, btc_link *link)
+{
+    uint8_t index = (uint8_t)btc_link_index(core, link);
+    uint16_t cid = read16(link->rx + 2);
+    if (link->le)
+    {
+        if (cid == 0x0005) btc_l2cap_receive(core, index, link->rx,
+                                             link->rx_used);
+        else btp_le_data(core, index, cid, link->rx + 4,
+                         (size_t)link->rx_used - 4u);
+        return;
+    }
+    btc_l2cap_receive(core, index, link->rx, link->rx_used);
+}
+
+static void acl_packet(btc_core *core, const uint8_t *packet, size_t bytes)
+{
+    uint16_t header, length, boundary;
+    btc_link *link;
+    if (bytes < 4) return;
+    header = read16(packet);
+    length = read16(packet + 2);
+    if ((size_t)length + 4u != bytes) return;
+    link = btc_link_by_handle(core, (uint16_t)(header & 0x0fff));
+    if (link == 0 || link->state == BTC_LINK_CONNECTING) return;
+    boundary = (uint16_t)((header >> 12) & 3u);
+    packet += 4;
+    if (boundary != 1)
+    {
+        uint16_t expected;
+        if (link->rx_used != 0) ++link->rx_dropped;
+        link->rx_used = 0;
+        link->rx_expected = 0;
+        if (length < 4) return;
+        expected = (uint16_t)(read16(packet) + 4u);
+        if (expected > BTC_RX_BYTES)
+        {
+            ++link->rx_dropped;
+            return;
+        }
+        link->rx_expected = expected;
+    }
+    else if (link->rx_expected == 0)
+        return;
+    if ((size_t)link->rx_used + length > link->rx_expected)
+    {
+        ++link->rx_dropped;
+        link->rx_used = link->rx_expected = 0;
+        return;
+    }
+    memcpy(link->rx + link->rx_used, packet, length);
+    link->rx_used = (uint16_t)(link->rx_used + length);
+    if (link->rx_used == link->rx_expected)
+    {
+        link_data(core, link);
+        link->rx_used = link->rx_expected = 0;
+    }
+}
+
+static void process_acl_input(btc_core *core)
+{
+    while (core->acl_in_offset < core->acl_in_bytes)
+    {
+        size_t consumed = 0, packet_bytes;
+        const uint8_t *packet;
+        int result = btv_hci_stream_feed(&core->acl_stream,
+                        core->acl_in + core->acl_in_offset,
+                        core->acl_in_bytes - core->acl_in_offset, &consumed);
+        core->acl_in_offset += (uint32_t)consumed;
+        if (result == BTV_HCI_INVALID)
+        {
+            /* Resynchronise on the next transfer. */
+            btv_hci_stream_init(&core->acl_stream, BTV_HCI_ACL,
+                                core->acl_stream_storage,
+                                sizeof(core->acl_stream_storage));
+            core->acl_in_offset = core->acl_in_bytes;
+            break;
+        }
+        if (result != BTV_HCI_COMPLETE) break;
+        packet = btv_hci_stream_packet(&core->acl_stream, &packet_bytes);
+        if (packet != 0) acl_packet(core, packet, packet_bytes);
+        btv_hci_stream_take(&core->acl_stream);
+    }
+    core->acl_in_bytes = core->acl_in_offset = 0;
+}
+
+/* ---- discovery ---------------------------------------------------- */
+
+static uint16_t flags_for_uuid(uint16_t uuid)
+{
+    switch (uuid)
+    {
+    case 0x110a: case 0x110b: case 0x110d: return BTC_DEV_AUDIO_SINK;
+    case 0x1108: case 0x111e: case 0x1112: case 0x1131:
+        return BTC_DEV_HANDSFREE;
+    case 0x1124: case 0x1812: return BTC_DEV_HID;
+    default: return 0;
+    }
+}
+
+static uint16_t flags_for_class(const uint8_t cod[3])
+{
+    unsigned int major = cod[1] & 0x1fu, minor = cod[0] >> 2;
+    uint16_t flags = 0;
+    if (major == 4)
+    {
+        /* Audio/video: 1 headset, 2 hands-free, 5 loudspeaker,
+         * 6 headphones, 7 portable audio, 10 hifi. */
+        if (minor == 1 || minor == 2) flags |= BTC_DEV_HANDSFREE;
+        flags |= BTC_DEV_AUDIO_SINK;
+    }
+    else if (major == 5)
+    {
+        flags |= BTC_DEV_HID;
+        if (cod[0] & 0x40u) flags |= BTC_DEV_KEYBOARD;
+        if (cod[0] & 0x80u) flags |= BTC_DEV_MOUSE;
+        /* The minor class, low part: 1 joystick, 2 game pad. */
+        if (((cod[0] >> 2) & 0x0fu) == 1 || ((cod[0] >> 2) & 0x0fu) == 2)
+            flags |= BTC_DEV_GAMEPAD;
+    }
+    if (cod[2] & 0x20u) flags |= BTC_DEV_AUDIO_SINK; /* rendering */
+    return flags;
+}
+
+static uint16_t flags_for_appearance(uint16_t appearance)
+{
+    if (appearance == 0x03c1) return BTC_DEV_HID | BTC_DEV_KEYBOARD;
+    if (appearance == 0x03c2) return BTC_DEV_HID | BTC_DEV_MOUSE;
+    if (appearance == 0x03c4 || appearance == 0x03c5)      /* joystick, gamepad */
+        return BTC_DEV_HID | BTC_DEV_GAMEPAD;
+    if ((appearance >> 6) == 0x0f) return BTC_DEV_HID;
+    if ((appearance >> 6) == 0x25) return BTC_DEV_AUDIO_SINK; /* 0x0940.. */
+    return 0;
+}
+
+/* Some devices put binary data in their name fields: accept only names
+ * that look like text (UTF-8 bytes above 0x7f are allowed). */
+static int name_is_text(const uint8_t *name, size_t bytes)
+{
+    size_t index;
+    for (index = 0; index < bytes && name[index] != 0; ++index)
+        if (name[index] < 0x20 || name[index] == 0x7f) return 0;
+    return index != 0;
+}
+
+/* EIR and LE advertising data share the length/type/value format. */
+static void parse_data(btc_core *core, btc_device *device, const uint8_t *data,
+                       size_t bytes)
+{
+    btc_stats *core_stats = &core->stats;
+    size_t offset = 0;
+    while (offset + 1 < bytes && data[offset] != 0)
+    {
+        size_t length = data[offset];
+        uint8_t type = data[offset + 1];
+        const uint8_t *value = data + offset + 2;
+        size_t value_bytes;
+        if (offset + 1 + length > bytes) break;
+        value_bytes = length - 1;
+        if ((type == 0x09 || (type == 0x08 && (device->name[0] == 0 || device->name_cached))) &&
+            value_bytes != 0 && name_is_text(value, value_bytes))
+        {
+            size_t copy = value_bytes < BTC_NAME_BYTES - 1 ?
+                          value_bytes : BTC_NAME_BYTES - 1;
+            memcpy(device->name, value, copy);
+            device->name[copy] = 0;
+            device->flags |= BTC_DEV_NAMED;
+            device->name_cached = 0;
+            device->name_source = 1;
+            if (device->flags & BTC_DEV_LE) ++core_stats->le_names;
+            else ++core_stats->eir_names;
+        }
+        else if ((type == 0x02 || type == 0x03) && value_bytes >= 2)
+        {
+            size_t index;
+            for (index = 0; index + 1 < value_bytes; index += 2)
+                device->flags |= flags_for_uuid(read16(value + index));
+        }
+        else if (type == 0x19 && value_bytes == 2)
+        {
+            device->appearance = read16(value);
+            device->flags |= flags_for_appearance(device->appearance);
+        }
+        offset += length + 1;
+    }
+}
+
+static void inquiry_result(btc_core *core, const uint8_t *event, size_t bytes)
+{
+    /* 0x01 Inquiry Result (14 octets each: address, page scan repetition
+     * mode, two reserved, class, clock offset), 0x22 with RSSI (one
+     * reserved, then class, clock offset, RSSI), 0x2f Extended (the same
+     * as 0x22, one response, then 240 octets of Extended Inquiry Response
+     * data: Core Vol 4 Part E 7.7.2, 7.7.33, 7.7.38). */
+    unsigned int count = event[2], index, format = event[0];
+    size_t record = 14u;
+    if (format == 0x2f) count = 1;
+    if (bytes < 3u + count * record) return;
+    for (index = 0; index < count; ++index)
+    {
+        const uint8_t *r = event + 3 + index * record;
+        btc_device *device;
+        int8_t rssi = format == 0x02 ? 0 : (int8_t)r[13];
+        device = btc_device_add_scan(core, r, 0, rssi);
+        ++core->stats.inquiry_results;
+        if (device == 0) continue;
+        device->page_scan_rep_mode = r[6];
+        device->flags |= BTC_DEV_CLASSIC;
+        if (format == 0x02)
+        {
+            memcpy(device->device_class, r + 9, 3);
+            device->clock_offset = read16(r + 12);
+        }
+        else
+        {
+            memcpy(device->device_class, r + 8, 3);
+            device->clock_offset = read16(r + 11);
+            device->rssi = rssi;
+        }
+        device->flags |= flags_for_class(device->device_class);
+        if (format == 0x2f && bytes >= 3u + 14u + 240u)
+        {
+            parse_data(core, device, event + 17, 240);
+            if (!(device->flags & BTC_DEV_LE)) name_remember(core, device);
+        }
+        ++core->devices_generation;
+    }
+}
+
+static void le_advert(btc_core *core, const uint8_t *event, size_t bytes)
+{
+    /* LE Advertising Report (Core Vol 4 Part E 7.7.65.2).  Num_Reports
+     * reports follow, laid out field by field, not report by report: the
+     * event types of all of them, then the address types, the addresses,
+     * the data lengths, the data, the RSSIs.  A busy controller packs several
+     * into one event; with one report it reads the same as a record. */
+    unsigned int n, i, data_at = 0, total = 0;
+    const uint8_t *types, *address_types, *addresses, *lengths, *data, *rssi;
+    if (bytes < 4) return;
+    n = event[3];
+    if (n == 0 || n > 25u) return;
+    types = event + 4;
+    address_types = types + n;
+    addresses = address_types + n;
+    lengths = addresses + 6u * n;
+    data = lengths + n;
+    for (i = 0; i < n; ++i)
+    {
+        if (lengths[i] > 31u) return;
+        total += lengths[i];
+    }
+    if (4u + 9u * n + total > bytes) return;
+    rssi = data + total;
+    for (i = 0; i < n; ++i)
+    {
+        btc_device *device;
+        const uint8_t *address = addresses + 6u * i;
+        uint8_t length = lengths[i];
+        if (types[i] == 0x00 || types[i] == 0x01)
+            btp_le_advert(core, address, address_types[i]);
+        if (core->le_scanning && !core->le_scan_background)
+        {
+            ++core->stats.le_reports;
+            device = btc_device_add_scan(core, address, 1, (int8_t)rssi[i]);
+            if (device != 0)
+            {
+                device->flags |= BTC_DEV_LE;
+                if (address_types[i] & 1) device->flags |= BTC_DEV_RANDOM_ADDR;
+                device->rssi = (int8_t)rssi[i];
+                parse_data(core, device, data + data_at, length);
+                name_remember(core, device);
+                ++core->devices_generation;
+            }
+        }
+        data_at += length;
+    }
+}
+
+static void remote_name(btc_core *core, const uint8_t *event, size_t bytes)
+{
+    btc_device *device;
+    size_t length, copy;
+    if (bytes < 9) return;
+    device = btc_device_find(core, event + 3);
+    core->stats.name_last_status = event[2];
+    if (device != 0) device->name_status = event[2];
+    if (event[2] != 0)
+    {
+        ++core->stats.name_failures;
+        btc_note("name request failed, status", event[2]);
+    }
+    if (device != 0 && event[2] == 0 && bytes > 9 &&
+        name_is_text(event + 9, bytes - 9))
+    {
+        length = bytes - 9;
+        for (copy = 0; copy < length && copy < BTC_NAME_BYTES - 1 &&
+             event[9 + copy] != 0; ++copy)
+            device->name[copy] = (char)event[9 + copy];
+        device->name[copy] = 0;
+        device->flags |= BTC_DEV_NAMED;
+        device->name_cached = 0;
+        device->name_source = 2;
+        ++core->stats.names_found;
+        name_remember(core, device);
+        ++core->devices_generation;
+    }
+    core->naming = 0;
+}
+
+static void start_le_scan(btc_core *core, int background)
+{
+    static const uint8_t enable[2] = { 1, 1 };
+    if (!core->le_supported) return;
+    if (core->le_scanning)
+    {
+        if (!background) core->le_scan_background = 0;
+        return;
+    }
+    {
+        /* 30 ms in 60 when the radio is free; 11.25 ms in 160 while A2DP
+         * is up (scan parameters only change while scanning is off). */
+        uint8_t duty = core->audio_busy ? 2u : 1u;
+        /* 0: never set here, which is the configured normal duty. */
+        if ((core->le_scan_duty ? core->le_scan_duty : 1u) != duty)
+        {
+            uint8_t scan[7];
+            scan[0] = 1;
+            write16(scan + 1, duty == 2u ? 0x0100 : 0x0060);
+            write16(scan + 3, duty == 2u ? 0x0012 : 0x0030);
+            scan[5] = 0;
+            scan[6] = 0;
+            if (!btc_command_queue(core, OP_LE_SET_SCAN_PARAMETERS, scan, 7,
+                                   BTC_R_IGNORE, LINK_NONE))
+                return;
+            core->le_scan_duty = duty;
+        }
+    }
+    if (btc_command_queue(core, OP_LE_SET_SCAN_ENABLE, enable, 2,
+                          BTC_R_IGNORE, LINK_NONE))
+    {
+        core->le_scanning = 1;
+        core->le_scan_background = (uint8_t)background;
+    }
+}
+
+static void stop_le_scan(btc_core *core)
+{
+    static const uint8_t disable[2] = { 0, 0 };
+    if (!core->le_scanning) return;
+    if (btc_command_queue(core, OP_LE_SET_SCAN_ENABLE, disable, 2,
+                          BTC_R_IGNORE, LINK_NONE))
+        core->le_scanning = 0;
+}
+
+/* Write Scan Enable (0x0C1A): 0x01 inquiry scan, 0x02 page scan. Page scan
+ * is always on, so that bonded devices can reconnect; inquiry scan only
+ * when asked, so that a device that is looking can find this one. */
+void btc_discoverable(btc_core *core, int on)
+{
+    uint8_t scan = on ? 0x03 : 0x02;
+    core->discoverable = (uint8_t)(on != 0);
+    (void)btc_command_queue(core, OP_WRITE_SCAN_ENABLE, &scan, 1,
+                            BTC_R_IGNORE, LINK_NONE);
+}
+
+static int scan_begin(btc_core *core, unsigned int seconds);
+
+int btc_scan(btc_core *core, unsigned int seconds)
+{
+    core->scan_retries = 0;
+    return scan_begin(core, seconds);
+}
+
+static int scan_begin(btc_core *core, unsigned int seconds)
+{
+    uint8_t inquiry[5] = { 0x33, 0x8b, 0x9e, 0, 0 };
+    unsigned int units;
+    if (core->state != BTC_READY || core->inquiring) return 0;
+    if (seconds == 0) seconds = 10;
+    if (seconds > 60) seconds = 60;
+    units = (seconds * 25u + 16u) >> 5; /* 1.28 s units */
+    if (units == 0) units = 1;
+    core->inquiry_bursts = 0;
+    if (core->audio_busy && units > 1)
+    {
+        /* An inquiry holds the whole radio: A2DP stalled for its length
+         * and the audio jumped.  1.28 s at a time instead, 2.5 s apart. */
+        core->inquiry_bursts = (uint8_t)((units + 2u) / 3u - 1u);
+        units = 1;
+    }
+    inquiry[3] = (uint8_t)units;
+    core->scan_seconds = (uint8_t)seconds;
+    /* A fresh list for each scan, but what is connected or paired stays
+     * (a scan does not make it vanish from the list), and names already
+     * learnt come back with the devices that bear them. */
+    {
+        unsigned int index, kept = 0;
+        for (index = 0; index < core->device_count; ++index)
+        {
+            btc_device *d = &core->devices[index];
+            if (!(d->flags & (BTC_DEV_CONNECTED | BTC_DEV_PAIRED)) &&
+                btc_key_find(core, d->address) == 0)
+                continue;
+            if (kept != index) core->devices[kept] = *d;
+            core->devices[kept].name_tried = 0;
+            ++kept;
+        }
+        core->device_count = (uint8_t)kept;
+    }
+    ++core->devices_generation;
+    ++core->stats.scans;
+    core->naming_until = 0;
+    core->name_refreshes = 0;
+    if (!btc_command_queue(core, OP_INQUIRY, inquiry, 5, BTC_R_INQUIRY,
+                           LINK_NONE))
+        return 0;
+    core->inquiring = 1;
+    core->scan_requested = 1;
+    core->scan_until = core->now + seconds * 1000u;
+    start_le_scan(core, 0);
+    return 1;
+}
+
+void btc_scan_stop(btc_core *core)
+{
+    core->scan_retry_pending = 0;
+    if (core->inquiring)
+        (void)btc_command_queue(core, OP_INQUIRY_CANCEL, 0, 0, BTC_R_IGNORE,
+                                LINK_NONE);
+    core->inquiring = 0;
+    core->scan_requested = 0;
+    if (core->le_scanning && !core->le_scan_background) stop_le_scan(core);
+}
+
+/* A scan that reports each advertiser once per run (duplicate filtering)
+ * would never report a bonded device again if the first report was set
+ * aside (a connection that had just failed, the wait after it): the
+ * background scan is restarted every few seconds, which makes the
+ * controller forget what it has reported. */
+#define LE_BACKGROUND_RESTART_MS 4000u
+
+void btc_le_background(btc_core *core, int on)
+{
+    if (core->state != BTC_READY) return;
+    if (on && !core->le_scanning)
+    {
+        start_le_scan(core, 1);
+        core->le_background_since = core->now;
+    }
+    else if (on && core->le_scanning && core->le_scan_background &&
+             core->now - core->le_background_since >= LE_BACKGROUND_RESTART_MS)
+    {
+        stop_le_scan(core);              /* started again by the next pump */
+        ++core->stats.le_scan_restarts;
+    }
+    else if (!on && core->le_scanning && core->le_scan_background)
+        stop_le_scan(core);
+}
+
+int btc_scanning(const btc_core *core)
+{
+    return core->scan_requested || core->naming;
+}
+
+/* Which unnamed device to ask next: the kinds a person is looking for
+ * (input, audio, phones) and the nearer ones first, each tried again once
+ * if it did not answer; a name remembered from an earlier scan is only
+ * refreshed when nothing else is left, and not often. */
+static int name_score(const btc_device *d)
+{
+    unsigned int major = d->device_class[1] & 0x1fu;
+    int score, rssi = d->rssi == 0 ? -70 : d->rssi;
+    if ((d->flags & (BTC_DEV_HID | BTC_DEV_AUDIO_SINK | BTC_DEV_HANDSFREE)) ||
+        major == 4 || major == 5)
+        score = 60;
+    else if (major == 2) score = 40;
+    else if (major == 1) score = 30;
+    else score = 10;
+    score += (rssi + 128) >> 3;
+    if (d->name_tried != 0) score -= 20;
+    if (d->name_cached) score -= 100;
+    return score;
+}
+
+static btc_device *name_candidate(btc_core *core)
+{
+    unsigned int index;
+    btc_device *best = 0;
+    int best_score = -1000;
+    for (index = 0; index < core->device_count; ++index)
+    {
+        btc_device *d = &core->devices[index];
+        int score, limit;
+        if (!(d->flags & BTC_DEV_CLASSIC) || (d->flags & BTC_DEV_CONNECTED))
+            continue;
+        if ((d->flags & BTC_DEV_NAMED) && !d->name_cached) continue;
+        if (d->name_cached && core->name_refreshes >= NAME_REFRESHES) continue;
+        score = name_score(d);
+        limit = score >= 40 ? 2 : 1;
+        if (d->name_tried >= limit) continue;
+        if (score > best_score) { best_score = score; best = d; }
+    }
+    return best;
+}
+
+static void scan_tick(btc_core *core)
+{
+    if (!core->scan_requested) return;
+    if (core->le_scanning && !core->le_scan_background &&
+        (int32_t)(core->now - core->scan_until) >= 0)
+        stop_le_scan(core);
+    if (core->inquiring) return;
+    if (core->inquiry_bursts != 0)
+    {
+        static const uint8_t burst[5] = { 0x33, 0x8b, 0x9e, 1, 0 };
+        if ((int32_t)(core->now - core->burst_at) < 0) return;
+        if (btc_command_queue(core, OP_INQUIRY, burst, 5, BTC_R_INQUIRY,
+                              LINK_NONE))
+        {
+            --core->inquiry_bursts;
+            core->inquiring = 1;
+        }
+        return;
+    }
+    if (core->le_scanning && !core->le_scan_background) return;
+    /* While A2DP plays, no Remote Name Requests: each pages the device and
+     * holds the radio for up to five seconds.  Names still come from the
+     * scan's own data (EIR). */
+    if (core->audio_busy && !core->naming) core->naming_until = core->now;
+    /* Names for classic devices that did not send one. */
+    if (core->naming)
+    {
+        if (core->now - core->name_started >= NAME_TIMEOUT_MS)
+        {
+            (void)btc_command_queue(core, OP_REMOTE_NAME_CANCEL,
+                                    core->problem_address, 6,
+                                    BTC_R_IGNORE, LINK_NONE);
+            core->naming = 0;
+            ++core->stats.name_failures;
+            core->stats.name_last_status = 0xffu;
+            btc_note("name request timed out", 0);
+        }
+        return;
+    }
+    if (core->naming_until == 0)
+        core->naming_until = core->now + NAMING_BUDGET_MS;
+    if ((int32_t)(core->now - core->naming_until) < 0)
+    {
+        btc_device *device = name_candidate(core);
+        if (device != 0)
+        {
+            uint8_t parameters[10];
+            memcpy(parameters, device->address, 6);
+            parameters[6] = device->page_scan_rep_mode;
+            parameters[7] = 0;
+            write16(parameters + 8,
+                    (uint16_t)(device->clock_offset | 0x8000u));
+            if (btc_command_queue(core, OP_REMOTE_NAME, parameters, 10,
+                                  BTC_R_NAME, LINK_NONE))
+            {
+                if (device->name_cached) ++core->name_refreshes;
+                ++device->name_tried;
+                ++core->stats.name_requests;
+                memcpy(core->problem_address, device->address, 6);
+                core->naming = 1;
+                core->name_started = core->now;
+            }
+            return;
+        }
+    }
+    else
+        btc_note("naming budget spent", core->stats.name_requests);
+    {
+        unsigned int index, unnamed = 0;
+        for (index = 0; index < core->device_count; ++index)
+            if (!(core->devices[index].flags & BTC_DEV_NAMED)) ++unnamed;
+        btc_note("scan finished, devices|unnamed", (uint32_t)core->device_count << 8 | unnamed);
+    }
+    core->scan_requested = 0;
+    ++core->devices_generation;
+}
+
+/* ---- connections ------------------------------------------------- */
+
+static void apply_known_flags(btc_core *core, btc_link *link)
+{
+    btc_device *device = btc_device_find(core, link->address);
+    btc_key *key = btc_key_find(core, link->address);
+    if (device != 0) link->flags |= device->flags;
+    if (key != 0) link->flags |= key->flags;
+}
+
+int btc_connect(btc_core *core, const uint8_t address[6], int le,
+                uint8_t address_type, uint8_t profile)
+{
+    btc_link *link;
+    btc_device *device;
+    if (core->state != BTC_READY) return 0;
+    if (!le && btc_link_by_address(core, address) == 0 && btp_le_busy(core))
+    {
+        /* Paging while a Low Energy link is being set up can starve it
+         * until its supervision timer fires (HCI 0x08): wait. */
+        memcpy(core->deferred_address, address, 6);
+        core->deferred_profile = profile;
+        core->deferred = 1;
+        btc_note("classic connect deferred, LE link busy", 0);
+        return 1;
+    }
+    link = btc_link_by_address(core, address);
+    if (link != 0)
+    {
+        /* Already connected: just add the profile. */
+        if (link->state == BTC_LINK_OPEN && link->profile != profile)
+        {
+            link->profile = profile;
+            btp_link_opened(core, (uint8_t)btc_link_index(core, link));
+        }
+        return 1;
+    }
+    link = link_allocate(core, address);
+    if (link == 0) return 0;
+    device = btc_device_find(core, address);
+    /* Only one thing may page at a time: a name being asked for gives way
+     * to the connection (and no more names are asked for in this scan). */
+    if (core->naming)
+    {
+        (void)btc_command_queue(core, OP_REMOTE_NAME_CANCEL,
+                                core->problem_address, 6, BTC_R_IGNORE,
+                                LINK_NONE);
+        core->naming = 0;
+    }
+    core->scan_requested = 0;
+    ++core->stats.connects;
+    btc_note(le ? "connecting (LE), profile" : "connecting (BR/EDR), profile",
+             profile);
+    link->user_retries = core->engine_call ? 0xffu : 0u;
+    link->le = (uint8_t)(le != 0);
+    link->address_type = address_type;
+    link->outgoing = 1;
+    link->profile = profile;
+    link->state = BTC_LINK_CONNECTING;
+    apply_known_flags(core, link);
+    if (core->inquiring) btc_scan_stop(core);
+    if (link->le)
+    {
+        uint8_t p[25];
+        if (core->le_scanning) stop_le_scan(core);
+        /* While A2DP is up the CSR radio has no time to spare: look for
+         * the device 11.25 ms in 160 instead of 30 in 60. */
+        write16(p, core->audio_busy ? 0x0100 : 0x0060);     /* scan interval */
+        write16(p + 2, core->audio_busy ? 0x0012 : 0x0030); /* scan window */
+        p[4] = 0;                    /* no white list */
+        p[5] = address_type;
+        memcpy(p + 6, address, 6);
+        p[12] = 0;                   /* own address public */
+        write16(p + 13, 0x0018);     /* interval 30 ms .. */
+        write16(p + 15, 0x0028);     /* .. 50 ms (7.5 to 15 ms starved some mice) */
+        write16(p + 17, 0x0000);     /* latency */
+        write16(p + 19, 0x0258);     /* supervision 6 s: rides out a page or scan */
+        write16(p + 21, 0x0000);
+        write16(p + 23, 0x0000);
+        if (!btc_command_queue(core, OP_LE_CREATE_CONNECTION, p, 25,
+                               BTC_R_LE_CONNECT,
+                               (uint8_t)btc_link_index(core, link)))
+        {
+            link->state = BTC_LINK_FREE;
+            return 0;
+        }
+    }
+    else
+    {
+        uint8_t p[13];
+        memcpy(p, address, 6);
+        write16(p + 6, 0xcc18);      /* DM/DH 1, 3, 5 */
+        p[8] = device != 0 ? device->page_scan_rep_mode : 1;
+        p[9] = 0;
+        write16(p + 10, device != 0 ?
+                (uint16_t)(device->clock_offset | 0x8000u) : 0);
+        /* Stay master.  As a slave we transmit only when the sink polls
+         * us: the DM-40BT polls every 20 ms, which carries barely a third
+         * of a 44.1 kHz SBC stream and makes the audio stutter. */
+        p[12] = 0;                   /* no role switch */
+        if (!btc_command_queue(core, OP_CREATE_CONNECTION, p, 13,
+                               BTC_R_CONNECT,
+                               (uint8_t)btc_link_index(core, link)))
+        {
+            link->state = BTC_LINK_FREE;
+            return 0;
+        }
+    }
+    ++core->links_generation;
+    return 1;
+}
+
+static void link_disconnect(btc_core *core, btc_link *link, uint8_t reason)
+{
+    uint8_t p[3];
+    if (link->state == BTC_LINK_CONNECTING)
+    {
+        if (link->le)
+            (void)btc_command_queue(core, OP_LE_CREATE_CANCEL, 0, 0,
+                                    BTC_R_IGNORE, LINK_NONE);
+        link->closing_sent = 1;
+        return;
+    }
+    if (link->state != BTC_LINK_OPEN) return;
+    write16(p, link->handle);
+    p[2] = reason;
+    btc_note("disconnecting, handle|reason", (uint32_t)link->handle << 8 | reason);
+    if (btc_command_queue(core, OP_DISCONNECT, p, 3, BTC_R_IGNORE,
+                          (uint8_t)btc_link_index(core, link)))
+    {
+        link->state = BTC_LINK_CLOSING;
+        link->started = core->now;
+        ++core->links_generation;
+    }
+}
+
+int btc_disconnect(btc_core *core, const uint8_t address[6])
+{
+    btc_link *link = btc_link_by_address(core, address);
+    if (link == 0) return 0;
+    link_disconnect(core, link, 0x13);
+    return 1;
+}
+
+static void link_released(btc_core *core, btc_link *link)
+{
+    uint8_t index = (uint8_t)btc_link_index(core, link);
+    btc_device *device = btc_device_find(core, link->address);
+    if (link->state == BTC_LINK_OPEN || link->state == BTC_LINK_CLOSING)
+    {
+        /* The handle is already gone: a profile that reacts to its channels
+         * closing must not queue a Disconnect for it (the controller may
+         * even have given the handle to a new link by then). */
+        link->state = BTC_LINK_CLOSING;
+        btc_l2cap_link_closed(core, index);
+        btp_link_closed(core, index);
+    }
+    pool_give(core, link, link->outstanding);
+    if (device != 0) device->flags &= (uint16_t)~BTC_DEV_CONNECTED;
+    memset(link, 0, sizeof(*link));
+    ++core->links_generation;
+    ++core->devices_generation;
+}
+
+static void link_opened(btc_core *core, btc_link *link, uint16_t handle)
+{
+    btc_device *device = btc_device_add(core, link->address);
+    link->handle = handle;
+    link->state = BTC_LINK_OPEN;
+    link->started = core->now;
+    btc_note(link->le ? "link open (LE), handle|outgoing" :
+             "link open (BR/EDR), handle|outgoing",
+             (uint32_t)handle << 8 | link->outgoing);
+    if ((core->last_problem >> 8) == 0x0du) core->last_problem = 0;
+    apply_known_flags(core, link);
+    if (device != 0)
+    {
+        device->flags |= BTC_DEV_CONNECTED | (link->le ? BTC_DEV_LE : 0);
+        if (link->le && (link->address_type & 1))
+            device->flags |= BTC_DEV_RANDOM_ADDR;
+    }
+    ++core->links_generation;
+    if (!link->le)
+    {
+        /* Multi-slot packets for every classic link, whichever side made
+         * it: one the remote device made (the speaker reconnecting) starts
+         * with single-slot packets only, and A2DP over the CSR adapter then
+         * ran at about 50 ACL packets a second. */
+        uint8_t p[4];
+        write16(p, handle);
+        write16(p + 2, 0xcc18);      /* DM/DH 1, 3, 5 */
+        (void)btc_command_queue(core, OP_CHANGE_PACKET_TYPE, p, 4,
+                                BTC_R_IGNORE, (uint8_t)btc_link_index(core, link));
+    }
+    btp_link_opened(core, (uint8_t)btc_link_index(core, link));
+}
+
+static void connection_complete(btc_core *core, const uint8_t *event,
+                                size_t bytes)
+{
+    btc_link *link;
+    if (bytes < 13 || event[11] != 1) return;   /* ACL only */
+    link = btc_link_by_address(core, event + 5);
+    if (link == 0 || link->state != BTC_LINK_CONNECTING) return;
+    if (event[2] != 0)
+    {
+        connect_failed(core, link, 0x0300u, event[2]);
+        return;
+    }
+    link_opened(core, link, (uint16_t)(read16(event + 3) & 0x0fff));
+    if (link->closing_sent) link_disconnect(core, link, 0x13);
+}
+
+static void le_connection_complete(btc_core *core, const uint8_t *event,
+                                   size_t bytes)
+{
+    btc_link *link;
+    uint16_t handle;
+    if (bytes < 21) return;
+    handle = (uint16_t)(read16(event + 4) & 0x0fff);
+    link = btc_link_by_address(core, event + 8);
+    if (link == 0)
+    {
+        /* Cancelled attempts report status 0x02 with a zero address. */
+        unsigned int index;
+        for (index = 0; index < BTC_LINKS; ++index)
+            if (core->links[index].state == BTC_LINK_CONNECTING &&
+                core->links[index].le)
+            {
+                link = &core->links[index];
+                break;
+            }
+        if (link == 0) return;
+    }
+    if (event[3] != 0)
+    {
+        problem(core, 0x0400u | event[3], link->address);
+        memset(link, 0, sizeof(*link));
+        ++core->links_generation;
+        return;
+    }
+    link->address_type = event[7];
+    link_opened(core, link, handle);
+    if (link->closing_sent) link_disconnect(core, link, 0x13);
+}
+
+static void connection_request(btc_core *core, const uint8_t *event,
+                               size_t bytes)
+{
+    uint8_t p[7];
+    btc_link *link, *existing;
+    btc_key *key;
+    uint8_t why = 0;
+    int unbonded_ok;
+    if (bytes < 12) return;
+    memcpy(p, event + 2, 6);
+    key = btc_key_find(core, event + 2);
+    existing = btc_link_by_address(core, event + 2);
+    ++core->stats.incoming;
+    /* Bonded devices may connect to us (keyboards and mice reconnecting,
+     * speakers resuming); so may a keyboard, mouse or speaker while the
+     * person has made this computer discoverable (a device that starts the
+     * pairing itself).  Class of device: event octets 8 to 10. */
+    {
+        unsigned int major = event[9] & 0x1fu;
+        unbonded_ok = key == 0 && core->discoverable &&
+                      (major == 5 || major == 4);
+    }
+    if (event[11] != 1) why = 2;                        /* not an ACL link */
+    else if ((key == 0 && !unbonded_ok) ) why = 1;      /* not a bonded device */
+    else if (key != 0 && key->le) why = 3;              /* bonded for LE only */
+    else if (existing != 0 && !(existing->state == BTC_LINK_CONNECTING &&
+                                existing->outgoing && !existing->le))
+        why = 4;                                        /* already linked */
+    memcpy(core->stats.last_incoming_address, event + 2, 6);
+    if (why == 0 && existing != 0)
+    {
+        /* We are paging this very device while it pages us: it is plainly
+         * awake and calling, so take its call (rejecting it sends it back
+         * to sleep, and our page may then find nobody listening).  The
+         * report of our own page, whichever way it ends, no longer ends
+         * this link (connect_failed). */
+        link = existing;
+        link->crossed = 1;
+        link->outgoing = 0;
+        ++core->stats.incoming_crossed;
+        btc_note("device called while we were paging it; accepted", 0);
+    }
+    else if (why == 0 && (link = link_allocate(core, event + 2)) == 0)
+    {
+        why = 5;                                        /* no free link */
+    }
+    if (why != 0)
+    {
+        core->stats.last_incoming_reason = why;
+        ++core->stats.incoming_rejected;
+        btc_note("incoming connection refused, reason", why);
+        p[6] = 0x0f;                 /* unacceptable device address */
+        (void)btc_command_queue(core, OP_REJECT_CONNECTION, p, 7,
+                                BTC_R_IGNORE, LINK_NONE);
+        return;
+    }
+    core->stats.last_incoming_reason = 0;
+    ++core->stats.incoming_accepted;
+    btc_note("incoming connection accepted, bonded", key != 0);
+    link->state = BTC_LINK_CONNECTING;
+    link->outgoing = 0;
+    if (key != 0)
+    {
+        link->flags = key->flags;
+        link->profile = (key->flags & BTC_DEV_HID) ? BTC_PROFILE_HID :
+                        BTC_PROFILE_A2DP;
+    }
+    else
+    {
+        int input = (event[9] & 0x1fu) == 5;
+        link->flags = input ? BTC_DEV_HID : BTC_DEV_AUDIO_SINK;
+        link->profile = input ? BTC_PROFILE_HID : BTC_PROFILE_A2DP;
+    }
+    /* A speaker's audio wants its master's polling; as the slave of a
+     * speaker that polls seldom the stream crawls (a tenth of the rate).
+     * So ask to be the master for what carries audio. Other devices may
+     * keep the master's role. */
+    p[6] = (link->flags & BTC_DEV_AUDIO_SINK) ? 0x00 : 0x01;
+    link->role = p[6] == 0x00 ? 0 : 1;
+    (void)btc_command_queue(core, OP_ACCEPT_CONNECTION, p, 7, BTC_R_CONNECT,
+                            (uint8_t)btc_link_index(core, link));
+    ++core->links_generation;
+}
+
+static void disconnection_complete(btc_core *core, const uint8_t *event,
+                                   size_t bytes)
+{
+    btc_link *link;
+    if (bytes < 6 || event[2] != 0) return;
+    link = btc_link_by_handle(core, (uint16_t)(read16(event + 3) & 0x0fff));
+    if (link == 0) return;
+    link->disconnect_reason = event[5];
+    /* Who ended it: we, if we had asked; otherwise the device or the radio
+     * (0x08 is the supervision timer). */
+    btc_note(link->state == BTC_LINK_CLOSING ?
+             "disconnected, we asked; reason|le" :
+             "disconnected, not by us; reason|le",
+             (uint32_t)event[5] << 8 | link->le);
+    link_released(core, link);
+}
+
+/* ---- classic security --------------------------------------------- */
+
+static void secured(btc_core *core, btc_link *link)
+{
+    if (link->security == BTC_SEC_ENCRYPTED) return;
+    link->security = BTC_SEC_ENCRYPTED;
+    ++core->links_generation;
+    btp_link_secured(core, (uint8_t)btc_link_index(core, link));
+}
+
+/* How long an incoming link's remote end has to start the security
+ * procedures itself, and how soon a collided procedure is tried again.
+ * Both sides starting the same LMP procedure at once ends it with HCI
+ * error 0x23 (LMP Error Transaction Collision / LL Procedure Collision,
+ * Core Vol 1 Part F), so on a link the other end opened it goes first. */
+#define INCOMING_SECURE_MS 2500u
+#define COLLISION_RETRY_MS 400u
+#define COLLISION_RETRIES 3u
+#define HCI_COLLISION 0x23u
+
+static int request_authentication(btc_core *core, uint8_t index)
+{
+    btc_link *link = &core->links[index];
+    uint8_t p[2];
+    write16(p, link->handle);
+    if (!btc_command_queue(core, OP_AUTH_REQUESTED, p, 2, BTC_R_AUTH, index))
+        return 0;
+    link->security = BTC_SEC_AUTHENTICATING;
+    btc_note("authentication requested by us, link", index);
+    return 1;
+}
+
+static int request_encryption(btc_core *core, uint8_t index)
+{
+    btc_link *link = &core->links[index];
+    uint8_t p[3];
+    write16(p, link->handle);
+    p[2] = 1;
+    if (!btc_command_queue(core, OP_SET_ENCRYPTION, p, 3, BTC_R_ENCRYPT, index))
+        return 0;
+    link->security = BTC_SEC_ENCRYPTING;
+    btc_note("encryption requested by us, link", index);
+    return 1;
+}
+
+/* Try the security procedures again soon, after a collision. */
+static int secure_retry(btc_core *core, btc_link *link)
+{
+    if (link->secure_retries >= COLLISION_RETRIES) return 0;
+    ++link->secure_retries;
+    link->security = BTC_SEC_NONE;
+    link->secure_wanted = 1;
+    link->secure_at = core->now + COLLISION_RETRY_MS * link->secure_retries;
+    btc_note("security procedure collided, retry", link->secure_retries);
+    return 1;
+}
+
+/* Called by profiles: authenticate and encrypt a classic link. On a link
+ * the other end opened this waits for it to do so first (it knows the key
+ * and is the master), and does it itself only if it has not within
+ * INCOMING_SECURE_MS. */
+int btc_secure(btc_core *core, uint8_t index)
+{
+    btc_link *link;
+    if (index >= BTC_LINKS) return 0;
+    link = &core->links[index];
+    if (link->state != BTC_LINK_OPEN || link->le) return 0;
+    if (link->security == BTC_SEC_ENCRYPTED)
+    {
+        btp_link_secured(core, index);
+        return 1;
+    }
+    if (link->security != BTC_SEC_NONE) return 1;
+    if (!link->outgoing)
+    {
+        link->secure_wanted = 1;
+        link->secure_at = core->now + INCOMING_SECURE_MS;
+        btc_note("incoming link: waiting for the remote's security, link",
+                 index);
+        return 1;
+    }
+    return request_authentication(core, index);
+}
+
+/* The wait for the remote or for a retry is over. */
+static void secure_due(btc_core *core, uint8_t index)
+{
+    btc_link *link = &core->links[index];
+    link->secure_wanted = 0;
+    if (link->state != BTC_LINK_OPEN || link->le) return;
+    if (link->security == BTC_SEC_NONE)
+        (void)request_authentication(core, index);
+    else if (link->security == BTC_SEC_ENCRYPTING && !link->closing_sent)
+        (void)request_encryption(core, index);
+}
+
+static void authentication_complete(btc_core *core, const uint8_t *event,
+                                    size_t bytes)
+{
+    btc_link *link;
+    uint8_t index;
+    if (bytes < 5) return;
+    link = btc_link_by_handle(core, (uint16_t)(read16(event + 3) & 0x0fff));
+    if (link == 0) return;
+    index = (uint8_t)btc_link_index(core, link);
+    btc_note("authentication complete, status", event[2]);
+    if (event[2] == HCI_COLLISION && secure_retry(core, link)) return;
+    if (event[2] != 0)
+    {
+        ++core->stats.auth_failures;
+        core->stats.auth_last_status = event[2];
+        link->security = BTC_SEC_FAILED;
+        problem(core, 0x0500u | event[2], link->address);
+        /* A stale key: forget it so the next attempt pairs afresh. */
+        if (event[2] == 0x05 || event[2] == 0x06)
+            (void)btc_key_forget(core, link->address);
+        link_disconnect(core, link, 0x05);
+        return;
+    }
+    if (!link->outgoing)
+    {
+        /* The remote started this, and starts the encryption too. */
+        link->security = BTC_SEC_ENCRYPTING;
+        link->secure_wanted = 1;
+        link->secure_at = core->now + INCOMING_SECURE_MS;
+        return;
+    }
+    (void)request_encryption(core, index);
+}
+
+static void encryption_change(btc_core *core, const uint8_t *event,
+                              size_t bytes, int refresh)
+{
+    btc_link *link;
+    if (bytes < (refresh ? 5u : 6u)) return;
+    link = btc_link_by_handle(core, (uint16_t)(read16(event + 3) & 0x0fff));
+    if (link == 0) return;
+    if (link->le) btp_le_encryption(core, (uint8_t)btc_link_index(core, link),
+                                    event[2]);
+    btc_note("encryption change, status", event[2]);
+    if (event[2] == HCI_COLLISION && !link->le && secure_retry(core, link))
+        return;
+    if (event[2] != 0)
+    {
+        ++core->stats.enc_failures;
+        core->stats.enc_last_status = event[2];
+        link->security = BTC_SEC_FAILED;
+        problem(core, 0x0600u | event[2], link->address);
+        if (!link->le) link_disconnect(core, link, 0x05);
+        return;
+    }
+    if (refresh || event[5] != 0) secured(core, link);
+}
+
+static void link_key_request(btc_core *core, const uint8_t *event,
+                             size_t bytes)
+{
+    uint8_t p[22];
+    btc_key *key;
+    if (bytes < 8) return;
+    key = btc_key_find(core, event + 2);
+    memcpy(p, event + 2, 6);
+    if (key != 0 && !key->le)
+    {
+        memcpy(p + 6, key->key, 16);
+        ++core->stats.link_keys_replied;
+        (void)btc_command_queue(core, OP_LINK_KEY_REPLY, p, 22, BTC_R_IGNORE,
+                                LINK_NONE);
+    }
+    else
+    {
+        ++core->stats.link_keys_refused;
+        btc_note("link key requested, none held", 0);
+        (void)btc_command_queue(core, OP_LINK_KEY_NEGATIVE, p, 6,
+                                BTC_R_IGNORE, LINK_NONE);
+    }
+}
+
+static void link_key_notification(btc_core *core, const uint8_t *event,
+                                  size_t bytes)
+{
+    btc_key *key;
+    btc_link *link;
+    btc_device *device;
+    if (bytes < 25) return;
+    key = btc_key_store(core, event + 2, 0);
+    if (key == 0) return;
+    ++core->stats.link_keys_stored;
+    btc_note("link key stored, type", event[24]);
+    memcpy(key->key, event + 8, 16);
+    key->key_type = event[24];
+    key->key_size = 16;
+    link = btc_link_by_address(core, event + 2);
+    device = btc_device_find(core, event + 2);
+    if (link != 0) key->flags |= link->flags;
+    if (device != 0)
+    {
+        key->flags |= device->flags;
+        device->flags |= BTC_DEV_PAIRED;
+    }
+    if (link != 0 && link->profile == BTC_PROFILE_HID)
+        key->flags |= BTC_DEV_HID;
+    if (link != 0 && link->profile == BTC_PROFILE_A2DP)
+        key->flags |= BTC_DEV_AUDIO_SINK;
+    key->flags &= (uint16_t)(BTC_DEV_AUDIO_SINK | BTC_DEV_HANDSFREE |
+                             BTC_DEV_HID | BTC_DEV_KEYBOARD | BTC_DEV_MOUSE |
+                             BTC_DEV_GAMEPAD);
+}
+
+/* Shown by the app while a keyboard pairs: type this on the keyboard. */
+uint32_t btc_passkey, btc_passkey_generation;
+/* Bumped by every profile state change, so the device list is re-read. */
+uint32_t btc_profile_generation;
+
+
+/* ---- pairing questions -------------------------------------------- */
+
+#define IO_NO_INPUT_NO_OUTPUT 0x03u
+
+static void prompt_set(btc_core *core, uint8_t kind, const uint8_t *address,
+                       uint32_t value)
+{
+    core->prompt_kind = kind;
+    memcpy(core->prompt_address, address, 6);
+    core->prompt_value = value;
+    core->prompt_since = core->now;
+    ++core->prompt_generation;
+}
+
+static void prompt_clear(btc_core *core)
+{
+    if (core->prompt_kind == BTC_PROMPT_NONE) return;
+    core->prompt_kind = BTC_PROMPT_NONE;
+    ++core->prompt_generation;
+}
+
+/* The other side's IO capability was NoInputNoOutput, or it is an input
+ * device we already know: no six digits can be compared. */
+static int just_works(btc_core *core, const uint8_t address[6])
+{
+    btc_device *device = btc_device_find(core, address);
+    if (memcmp(core->remote_io_address, address, 6) == 0 &&
+        core->remote_io == IO_NO_INPUT_NO_OUTPUT)
+        return 1;
+    return device != 0 && (device->flags & (BTC_DEV_KEYBOARD | BTC_DEV_MOUSE));
+}
+
+int btc_prompt_answer(btc_core *core, int accept, uint32_t passkey)
+{
+    uint8_t p[10];
+    uint8_t kind = core->prompt_kind;
+    if (kind == BTC_PROMPT_NONE) return 0;
+    memcpy(p, core->prompt_address, 6);
+    prompt_clear(core);
+    if (kind == BTC_PROMPT_CONFIRM)
+        return btc_command_queue(core, accept ? OP_USER_CONFIRM_REPLY
+                                              : OP_USER_CONFIRM_NEGATIVE,
+                                 p, 6, BTC_R_IGNORE, LINK_NONE);
+    if (accept && passkey <= 999999u)
+    {
+        p[6] = (uint8_t)passkey; p[7] = (uint8_t)(passkey >> 8);
+        p[8] = (uint8_t)(passkey >> 16); p[9] = (uint8_t)(passkey >> 24);
+        return btc_command_queue(core, OP_USER_PASSKEY_REPLY, p, 10,
+                                 BTC_R_IGNORE, LINK_NONE);
+    }
+    return btc_command_queue(core, OP_USER_PASSKEY_NEGATIVE, p, 6,
+                             BTC_R_IGNORE, LINK_NONE);
+}
+
+static void pairing_event(btc_core *core, const uint8_t *event, size_t bytes)
+{
+    uint8_t p[23];
+    if (bytes < 8) return;
+    memcpy(p, event + 2, 6);
+    switch (event[0])
+    {
+    case 0x31: /* IO Capability Request */
+        p[6] = 0x01;     /* DisplayYesNo: keyboards type a passkey */
+        p[7] = 0x00;     /* no OOB data */
+        p[8] = 0x04;     /* general bonding, MITM not required */
+        (void)btc_command_queue(core, OP_IO_CAPABILITY_REPLY, p, 9,
+                                BTC_R_IGNORE, LINK_NONE);
+        break;
+    case 0x32: /* IO Capability Response: what the other side can do */
+        core->remote_io = event[8];
+        memcpy(core->remote_io_address, event + 2, 6);
+        break;
+    case 0x33: /* User Confirmation Request */
+        /* Just Works (the other side has no display, as with a mouse,
+         * keyboard or speaker) is accepted at once, as the specification
+         * has the host do.  Where both sides can show six digits it is
+         * numeric comparison, and the user decides. */
+        if (bytes >= 12 && !just_works(core, event + 2))
+        {
+            prompt_set(core, BTC_PROMPT_CONFIRM, event + 2,
+                       ((uint32_t)event[8] | ((uint32_t)event[9] << 8) |
+                        ((uint32_t)event[10] << 16) |
+                        ((uint32_t)event[11] << 24)) % 1000000u);
+            break;
+        }
+        (void)btc_command_queue(core, OP_USER_CONFIRM_REPLY, p, 6,
+                                BTC_R_IGNORE, LINK_NONE);
+        break;
+    case 0x34: /* User Passkey Request: the user types what the other
+                * side shows */
+        prompt_set(core, BTC_PROMPT_ENTRY, event + 2, 0);
+        break;
+    case 0x3b: /* User Passkey Notification */
+        if (bytes >= 12)
+        {
+            btc_passkey = (uint32_t)event[8] | ((uint32_t)event[9] << 8) |
+                          ((uint32_t)event[10] << 16) |
+                          ((uint32_t)event[11] << 24);
+            ++btc_passkey_generation;
+            memcpy(core->problem_address, event + 2, 6);
+        }
+        break;
+    case 0x16: /* PIN Code Request (legacy): 0000 */
+        p[6] = 4;
+        memset(p + 7, 0, 16);
+        memcpy(p + 7, "0000", 4);
+        {
+            /* Only a keyboard needs telling: it expects the PIN typed on
+             * it.  Mice and speakers take 0000 silently. */
+            btc_link *link = btc_link_by_address(core, event + 2);
+            btc_device *device = btc_device_find(core, event + 2);
+            uint16_t flags = (uint16_t)((link != 0 ? link->flags : 0) |
+                                        (device != 0 ? device->flags : 0));
+            if ((flags & BTC_DEV_KEYBOARD) && !(flags & BTC_DEV_MOUSE))
+            {
+                btc_passkey = 0;
+                ++btc_passkey_generation;
+            }
+        }
+        (void)btc_command_queue(core, OP_PIN_CODE_REPLY, p, 23,
+                                BTC_R_IGNORE, LINK_NONE);
+        break;
+    case 0x36: /* Simple Pairing Complete */
+        prompt_clear(core);
+        if (event[2] != 0) problem(core, 0x0700u | event[2], event + 3);
+        break;
+    default:
+        break;
+    }
+}
+
+/* ---- events ------------------------------------------------------- */
+
+static void configure(btc_core *core);
+
+static void command_result(btc_core *core, uint8_t status,
+                           const uint8_t *returns, size_t bytes)
+{
+    uint8_t kind = core->waiting_kind, index = core->waiting_link;
+    btc_link *link = index < BTC_LINKS ? &core->links[index] : 0;
+    core->command_waiting = 0;
+    switch (kind)
+    {
+    case BTC_R_CONFIG:
+        if (core->config_step != 0) --core->config_step;
+        if (core->config_step == 0 && core->state == BTC_CONFIGURING)
+        {
+            core->state = BTC_READY;
+            core->state_since = core->now;
+            btc_note("READY", core->now);
+            btc_note("READY, ms since module init", core->now - btc_origin_ms);
+            btp_init(core);
+            btc_rc_ready(core);
+        }
+        break;
+    case BTC_R_LE_BUFFER:
+        if (status == 0 && bytes >= 4)
+        {
+            core->le_mtu = read16(returns + 1);
+            core->le_max = core->le_free = returns[3];
+            core->le_shared = core->le_mtu == 0 || core->le_max == 0;
+        }
+        if (core->le_shared) core->le_mtu = core->acl_mtu;
+        if (core->config_step != 0) --core->config_step;
+        if (core->config_step == 0 && core->state == BTC_CONFIGURING)
+        {
+            core->state = BTC_READY;
+            core->state_since = core->now;
+            btc_note("READY", core->now);
+            btc_note("READY, ms since module init", core->now - btc_origin_ms);
+            btp_init(core);
+            btc_rc_ready(core);
+        }
+        break;
+    case BTC_R_CONNECT:
+    case BTC_R_LE_CONNECT:
+        if (status != 0 && link != 0 && link->state == BTC_LINK_CONNECTING)
+        {
+            if (link->crossed && core->waiting_opcode != OP_ACCEPT_CONNECTION)
+                btc_note("our page was refused after the device called; status", status);
+            else if (link->crossed)
+            {
+                /* The device's own call was what we answered. */
+                problem(core, 0x0200u | status, link->address);
+                memset(link, 0, sizeof(*link));
+                ++core->links_generation;
+            }
+            else
+                connect_failed(core, link, 0x0200u, status);
+        }
+        break;
+    case BTC_R_AUTH:
+    case BTC_R_ENCRYPT:
+        if (status == HCI_COLLISION && link != 0 &&
+            link->state == BTC_LINK_OPEN && secure_retry(core, link))
+            break;
+        if (status != 0 && link != 0 && link->state == BTC_LINK_OPEN)
+        {
+            link->security = BTC_SEC_FAILED;
+            problem(core, 0x0800u | status, link->address);
+            link_disconnect(core, link, 0x05);
+        }
+        break;
+    case BTC_R_NAME:
+        if (status != 0) core->naming = 0;
+        break;
+    case BTC_R_LE_RAND:
+        btp_le_rand(core, index, status, returns != 0 ? returns + 1 : 0,
+                    bytes > 0 ? bytes - 1 : 0);
+        break;
+    case BTC_R_LE_ENCRYPT:
+        if (status != 0) btp_le_encryption(core, index, status);
+        break;
+    case BTC_R_BUFFER:
+        /* Read Buffer Size, asked again after a stall: status, ACL data
+         * length (2), SCO data length (1), ACL packets (2), SCO packets (2). */
+        if (status == 0 && bytes >= 6 && read16(returns + 3) != 0)
+        {
+            btc_note("ACL buffers now, length|packets", (uint32_t)read16(returns + 1) << 16 | read16(returns + 4));
+            core->acl_mtu = read16(returns + 1);
+            core->acl_max = read16(returns + 4);
+        }
+        core->acl_free = core->acl_max;
+        break;
+    case BTC_R_INQUIRY:
+        if (status != 0)
+        {
+            core->inquiring = 0;
+            ++core->stats.scan_failures;
+            core->stats.scan_last_status = status;
+            btc_note("inquiry refused, status", status);
+            /* The controller was busy (paging, setting a link up): again
+             * in a moment, which is what a person would do. */
+            if ((status == 0x0c || status == 0x09 || status == 0x0d) &&
+                core->scan_retries < 2u)
+            {
+                ++core->scan_retries;
+                core->scan_retry_at = core->now + 1200u * core->scan_retries;
+                core->scan_retry_pending = 1;
+                core->scan_requested = 0;
+                if (core->le_scanning && !core->le_scan_background)
+                    stop_le_scan(core);
+            }
+            else
+                problem(core, 0x0900u | status, 0);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+static void handle_event(btc_core *core, const uint8_t *event, size_t bytes)
+{
+    if (bytes < 2) return;
+    switch (event[0])
+    {
+    case 0x0e: /* Command Complete */
+        if (bytes < 5) return;
+        btc_note("Command Complete, op|status",
+             (uint32_t)read16(event + 3) << 8 | (bytes > 5 ? event[5] : 0));
+        core->credits = event[2];
+        if (core->command_waiting && read16(event + 3) == core->waiting_opcode)
+            command_result(core, bytes > 5 ? event[5] : 0, event + 5,
+                           bytes - 5);
+        break;
+    case 0x0f: /* Command Status */
+        if (bytes < 6) return;
+        btc_note("Command Status, op|status",
+             (uint32_t)read16(event + 4) << 8 | event[2]);
+        core->credits = event[3];
+        if (core->command_waiting && read16(event + 4) == core->waiting_opcode)
+            command_result(core, event[2], 0, 0);
+        break;
+    case 0x13: completed_packets(core, event, bytes); break;
+    case 0x12: role_change(core, event, bytes); break;
+    case 0x14: mode_change(core, event, bytes); break;
+    case 0x01: /* Inquiry Complete */
+        core->inquiring = 0;
+        if (core->inquiry_bursts != 0) core->burst_at = core->now + 2500u;
+        btc_note("inquiry complete, status|devices", (bytes > 2 ? event[2] : 0u) << 8 | core->device_count);
+        break;
+    case 0x02: case 0x22: case 0x2f: inquiry_result(core, event, bytes); break;
+    case 0x07: remote_name(core, event, bytes); break;
+    case 0x03: connection_complete(core, event, bytes); break;
+    case 0x04: connection_request(core, event, bytes); break;
+    case 0x05: disconnection_complete(core, event, bytes); break;
+    case 0x06: authentication_complete(core, event, bytes); break;
+    case 0x08: encryption_change(core, event, bytes, 0); break;
+    case 0x30: encryption_change(core, event, bytes, 1); break;
+    case 0x17: link_key_request(core, event, bytes); break;
+    case 0x18: link_key_notification(core, event, bytes); break;
+    case 0x16: case 0x31: case 0x32: case 0x33: case 0x34: case 0x36:
+    case 0x3b:
+        pairing_event(core, event, bytes);
+        break;
+    case 0x10: fail(core, 0x0200u | (bytes > 2 ? event[2] : 0)); break;
+    case 0x3e: /* LE meta */
+        if (bytes < 3) return;
+        if (event[2] == 0x01) le_connection_complete(core, event, bytes);
+        else if (event[2] == 0x02) le_advert(core, event, bytes);
+        else if (event[2] == 0x03 && bytes >= 12)
+        {
+            /* LE Connection Update Complete: status, handle, interval (in
+             * 1.25 ms), latency, supervision timeout (10 ms). */
+            btc_note("LE connection update, status|handle", (uint32_t)event[3] << 16 | read16(event + 4));
+            btc_note("  interval|latency", (uint32_t)read16(event + 6) << 16 | read16(event + 8));
+            btc_note("  supervision timeout", read16(event + 10));
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+/* ---- bring-up ---------------------------------------------------- */
+
+static void configure(btc_core *core)
+{
+    static const uint8_t event_mask[8] =
+        { 0xff, 0xff, 0xfb, 0xff, 0x07, 0xf8, 0xbf, 0x3d };
+    static const uint8_t le_event_mask[8] = { 0x1f, 0, 0, 0, 0, 0, 0, 0 };
+    static const uint8_t class_of_device[3] = { 0x04, 0x01, 0x00 };
+    static const uint8_t one = 1, page_scan = 2, inquiry_mode = 2;
+    static const uint8_t le_host[2] = { 1, 0 };
+    /* Role switch is allowed, so that we can be the master of a link (we
+     * ask for it, for audio); no hold, no sniff, no park: any of them would
+     * let the remote device decide when we may transmit. */
+    static const uint8_t link_policy[2] = { 0x01, 0x00 };   /* role switch only */
+    uint8_t name[248], scan[7];
+    uint8_t steps = 0;
+    memset(name, 0, sizeof(name));
+    memcpy(name, "RISC OS", 7);
+    scan[0] = 1;                     /* active: gets names from scan data */
+    write16(scan + 1, 0x0060);
+    write16(scan + 3, 0x0030);
+    scan[5] = 0;
+    scan[6] = 0;
+    core->acl_mtu = core->info.acl_bytes;
+    btc_note("controller ACL buffers, length|packets", (uint32_t)core->info.acl_bytes << 16 | core->info.acl_packets);
+    core->acl_max = core->acl_free = core->info.acl_packets;
+    core->le_shared = 1;
+    core->le_mtu = core->acl_mtu;
+    core->ssp_supported = FEATURE_SSP(&core->info) != 0;
+    core->le_supported = FEATURE_LE(&core->info) != 0;
+    steps += btc_command_queue(core, OP_SET_EVENT_MASK, event_mask, 8,
+                               BTC_R_CONFIG, LINK_NONE);
+    if (core->ssp_supported)
+        steps += btc_command_queue(core, OP_WRITE_SSP_MODE, &one, 1,
+                                   BTC_R_CONFIG, LINK_NONE);
+    steps += btc_command_queue(core, OP_WRITE_INQUIRY_MODE, &inquiry_mode, 1,
+                               BTC_R_CONFIG, LINK_NONE);
+    steps += btc_command_queue(core, OP_WRITE_CLASS, class_of_device, 3,
+                               BTC_R_CONFIG, LINK_NONE);
+    steps += btc_command_queue(core, OP_WRITE_LOCAL_NAME, name, 248,
+                               BTC_R_CONFIG, LINK_NONE);
+    steps += btc_command_queue(core, OP_WRITE_LINK_POLICY, link_policy, 2,
+                               BTC_R_CONFIG, LINK_NONE);
+    steps += btc_command_queue(core, OP_WRITE_SCAN_ENABLE, &page_scan, 1,
+                               BTC_R_CONFIG, LINK_NONE);
+    if (core->le_supported)
+    {
+        steps += btc_command_queue(core, OP_WRITE_LE_HOST, le_host, 2,
+                                   BTC_R_CONFIG, LINK_NONE);
+        steps += btc_command_queue(core, OP_LE_SET_EVENT_MASK, le_event_mask,
+                                   8, BTC_R_CONFIG, LINK_NONE);
+        steps += btc_command_queue(core, OP_LE_SET_SCAN_PARAMETERS, scan, 7,
+                                   BTC_R_CONFIG, LINK_NONE);
+        core->le_scan_duty = 1;     /* 30 ms in 60: start_le_scan's normal duty */
+        steps += btc_command_queue(core, OP_LE_READ_BUFFER, 0, 0,
+                                   BTC_R_LE_BUFFER, LINK_NONE);
+    }
+    btc_note("configuring, commands queued", steps);
+    core->config_step = steps;
+    core->credits = core->boot.credits != 0 ? core->boot.credits : 1;
+    core->state = BTC_CONFIGURING;
+    core->state_since = core->now;
+}
+
+static void boot_pump(btc_core *core)
+{
+    uint8_t command[68];
+    size_t bytes;
+    uint32_t ignored;
+    int result;
+    btv_hci_bootstrap_tick(&core->boot, core->now);
+    if (core->boot.stage == BTV_BOOT_FAILED)
+    {
+        fail(core, 0x0400u | core->boot.error);
+        return;
+    }
+    if (core->boot.stage == BTV_BOOT_DISCOVERED)
+    {
+        if (core->command_ticket != 0) return;
+        if (!btv_hci_bootstrap_snapshot(&core->boot, &core->info))
+        {
+            fail(core, 0x0401u);
+            return;
+        }
+        configure(core);
+        return;
+    }
+    if (core->command_ticket != 0) return;
+    bytes = btv_hci_bootstrap_command(&core->boot, command, sizeof(command));
+    if (bytes == 0) return;
+    result = btv_host_bridge_submit(BTV_HOST_BRIDGE_COMMAND, command,
+                                    (uint32_t)bytes, 0, &core->command_ticket,
+                                    &ignored);
+    if (result == BTV_HOST_BRIDGE_BUSY) return;
+    btc_note("boot command sent, stage", core->boot.stage);
+    if (result != BTV_HOST_BRIDGE_OK ||
+        !btv_hci_bootstrap_sent(&core->boot, core->now))
+    {
+        core->command_ticket = 0;
+        fail(core, 0x0402u);
+    }
+}
+
+int btc_start(btc_core *core, btc_profiles *profiles,
+              btv_host_bridge_completion *completion, uint32_t now)
+{
+    uint32_t ignored;
+    if (core == 0 || profiles == 0 || completion == 0) return 0;
+    memset(core, 0, sizeof(*core));
+    core->profiles = profiles;
+    core->completion = completion;
+    core->now = now;
+    if (btv_host_bridge_open(&ignored) != BTV_HOST_BRIDGE_OK)
+    {
+        core->state = BTC_FAILED;
+        core->error = 1;
+        return 0;
+    }
+    /* The transport starts the controller in the background (power, reset,
+     * speed, the patch's 323 records), a little each pump; the HCI
+     * bring-up begins when it has finished (transport_up). Until then the
+     * state is BOOTING, which the app shows as "Starting". */
+    btv_hci_stream_init(&core->acl_stream, BTV_HCI_ACL,
+                        core->acl_stream_storage,
+                        sizeof(core->acl_stream_storage));
+    core->transport_wait = 1;
+    core->state = BTC_BOOTING;
+    core->state_since = now;
+    last_beat = now;
+    btc_note("started, BOOTING at", now);
+    return 1;
+}
+
+/* The transport's start-up is over: the HCI bring-up begins. */
+static void transport_up(btc_core *core)
+{
+    core->transport_wait = 0;
+    btv_hci_bootstrap_start(&core->boot, core->now, 0);
+    btv_hci_bootstrap_skip_extended(&core->boot);
+    /* The bring-up's timeouts run from the first pump after this. */
+    core->boot_rebase = 1;
+    btc_note("transport up, bring-up begins", core->now);
+}
+
+/* ---- transport polling ---------------------------------------------- */
+
+static void poll_transport(btc_core *core)
+{
+    btv_host_bridge_completion *c = core->completion;
+    uint32_t ignored;
+    int result;
+    if (core->command_ticket != 0)
+    {
+        result = btv_host_bridge_poll(core->command_ticket, c);
+        if (result != BTV_HOST_BRIDGE_PENDING)
+        {
+            core->command_ticket = 0;
+            if (result != BTV_HOST_BRIDGE_OK || c->error != 0)
+            {
+                /* Send the same command again before giving up on the
+                 * adapter: a lost control transfer is not a dead one. */
+                if (core->command_waiting && core->command_resends < 3 &&
+                    btv_host_bridge_submit(BTV_HOST_BRIDGE_COMMAND,
+                                           core->in_flight.packet,
+                                           core->in_flight.bytes, 0,
+                                           &core->command_ticket,
+                                           &ignored) == BTV_HOST_BRIDGE_OK)
+                {
+                    ++core->command_resends;
+                    ++core->stats.command_resends;
+                    core->waiting_since = core->now;
+                }
+                else
+                {
+                    core->command_ticket = 0;
+                    fail(core, 0x0102u);
+                    return;
+                }
+            }
+        }
+    }
+    /* Drain every waiting event: during a scan, LE adverts arrive far
+     * faster than one per pump, and an overflowing event buffer loses
+     * bytes and desynchronises the whole event stream. */
+    {
+        unsigned int drained;
+        for (drained = 0; drained < 64u; ++drained)
+        {
+            unsigned int slot;
+            /* Keep the queue full, so the next pump has events waiting
+             * rather than a transfer it has only just submitted. */
+            while (core->event_count < BTC_EVENT_SLOTS)
+            {
+                uint32_t ticket = 0;
+                slot = (core->event_head + core->event_count) %
+                       BTC_EVENT_SLOTS;
+                result = btv_host_bridge_submit(BTV_HOST_BRIDGE_EVENT_IN, 0,
+                            BTC_EVENT_BYTES, 0, &ticket, &ignored);
+                if (result == BTV_HOST_BRIDGE_BUSY) break;
+                if (result != BTV_HOST_BRIDGE_OK)
+                {
+                    /* Bits 12-15: the transport's refusal (e.g. 1 for
+                     * "invalid": the adapter has gone away). */
+                    fail(core, 0x0104u | ((uint32_t)(-result & 15) << 12));
+                    return;
+                }
+                core->event_ticket[slot] = ticket;
+                ++core->event_count;
+            }
+            if (core->event_count == 0) break;
+            slot = core->event_head;
+            result = btv_host_bridge_poll(core->event_ticket[slot], c);
+            if (result == BTV_HOST_BRIDGE_PENDING) break;
+            core->event_ticket[slot] = 0;
+            core->event_head = (uint8_t)((slot + 1u) % BTC_EVENT_SLOTS);
+            --core->event_count;
+            if (result != BTV_HOST_BRIDGE_OK || c->error != 0 ||
+                c->bytes > BTC_EVENT_BYTES)
+            {
+                /* Bits 12-15: 1-3 read failures, 4 refused, 5 too long,
+                 * 7 other USB status, 15 unplugged. */
+                uint32_t why = result != BTV_HOST_BRIDGE_OK ? 4u :
+                               c->error == 0 ? 5u :
+                               c->error <= 3 ? c->error :
+                               c->error == 6 ? 15u : 7u;
+                fail(core, 0x0103u | ((why & 15u) << 12));
+                return;
+            }
+            if (core->state == BTC_BOOTING)
+            {
+                btc_note("boot event code|len", c->data[0] << 8 | c->bytes);
+                if (btv_hci_bootstrap_event(&core->boot, c->data, c->bytes,
+                                            core->now) < 0)
+                    fail(core, 0x0404u);
+            }
+            else
+                handle_event(core, c->data, c->bytes);
+            if (core->state == BTC_FAILED) return;
+        }
+    }
+    if (core->state == BTC_BOOTING) return;
+    /* Every packet waiting, not one a pump: a mouse at a 7.5 ms interval
+     * sends reports faster than the ticker comes round, and handing them
+     * over in a batch makes the pointer judder. */
+    {
+        unsigned int packets;
+        for (packets = 0; packets < 16u; ++packets)
+        {
+            int more = 0;
+            if (core->acl_in_ticket != 0)
+            {
+                result = btv_host_bridge_poll(core->acl_in_ticket, c);
+                if (result != BTV_HOST_BRIDGE_PENDING)
+                {
+                    core->acl_in_ticket = 0;
+                    if (result != BTV_HOST_BRIDGE_OK || c->error != 0)
+                    {
+                        fail(core, 0x0105u);
+                        return;
+                    }
+                    memcpy(core->acl_in, c->data, c->bytes);
+                    core->acl_in_bytes = c->bytes;
+                    core->acl_in_offset = 0;
+                    process_acl_input(core);
+                    more = 1;
+                }
+            }
+            if (core->acl_in_ticket == 0)
+            {
+                result = btv_host_bridge_submit(BTV_HOST_BRIDGE_ACL_IN, 0,
+                            BTV_HOST_BRIDGE_IO_BYTES, 0, &core->acl_in_ticket,
+                            &ignored);
+                if (result != BTV_HOST_BRIDGE_OK &&
+                    result != BTV_HOST_BRIDGE_BUSY)
+                {
+                    core->acl_in_ticket = 0;
+                    fail(core, 0x0106u);
+                    return;
+                }
+            }
+            if (!more) break;
+        }
+    }
+    (void)acl_out_finished(core);
+}
+
+static void timeouts(btc_core *core)
+{
+    unsigned int index;
+    if (core->deferred && !btp_le_busy(core))
+    {
+        core->deferred = 0;
+        (void)btc_connect(core, core->deferred_address, 0, 0,
+                          core->deferred_profile);
+    }
+    if (core->scan_retry_pending &&
+        (int32_t)(core->now - core->scan_retry_at) >= 0)
+    {
+        core->scan_retry_pending = 0;
+        btc_note("scanning again, attempt", core->scan_retries + 1u);
+        (void)scan_begin(core, core->scan_seconds);
+    }
+    if (core->retry_pending &&
+        (int32_t)(core->now - core->retry_at) >= 0)
+    {
+        uint8_t count = core->retry_count;
+        core->retry_pending = 0;
+        btc_note("trying the connection again, attempt", count + 1u);
+        if (btc_link_by_address(core, core->retry_address) == 0 &&
+            btc_connect(core, core->retry_address, 0, 0, core->retry_profile))
+        {
+            btc_link *again = btc_link_by_address(core, core->retry_address);
+            if (again != 0 && !again->le) again->user_retries = count;
+        }
+    }
+    if (core->command_waiting &&
+        core->now - core->waiting_since >= COMMAND_TIMEOUT_MS)
+    {
+        /* The controller never answered: carry on with the next. */
+        problem(core, 0x0a00u | (core->waiting_opcode & 0xffu), 0);
+        core->waiting_kind = BTC_R_IGNORE;
+        command_result(core, 0xff, 0, 0);
+        core->credits = 1;
+    }
+    /* Flow control: credits that do not come back. If all are out and
+     * nothing has completed for a second the events were lost, or the
+     * controller has: ask what it has (Read Buffer Size), and count the
+     * packets as not in flight, so that the stream is tried again. */
+    if (core->acl_free == 0)
+    {
+        unsigned int k, inflight = 0;
+        for (k = 0; k < BTC_LINKS; ++k)
+            if (core->links[k].state == BTC_LINK_OPEN && !core->links[k].le)
+                inflight += core->links[k].outstanding;
+        if (inflight == 0 || core->credit_wait_since == 0)
+            core->credit_wait_since = core->now;
+        else if (core->now - core->credit_wait_since >= CREDIT_STALL_MS &&
+                 core->now - core->last_nocp >= CREDIT_STALL_MS &&
+                 core->now - core->last_resync >= 2 * CREDIT_STALL_MS)
+        {
+            core->last_resync = core->now;
+            ++core->resyncs;
+            btc_note("ACL credits stalled; resync, packets in flight", inflight);
+            for (k = 0; k < BTC_LINKS; ++k)
+                if (!core->links[k].le) core->links[k].outstanding = 0;
+            core->acl_free = core->acl_max;
+            (void)btc_command_queue(core, 0x1005u, 0, 0, BTC_R_BUFFER, LINK_NONE);
+        }
+    }
+    else
+        core->credit_wait_since = 0;
+    if (core->prompt_kind != BTC_PROMPT_NONE &&
+        core->now - core->prompt_since >= BTC_PROMPT_TIMEOUT_MS)
+        (void)btc_prompt_answer(core, 0, 0);
+    for (index = 0; index < BTC_LINKS; ++index)
+    {
+        btc_link *link = &core->links[index];
+        if (link->secure_wanted && link->state == BTC_LINK_OPEN &&
+            core->now - link->secure_at < 0x80000000u)
+            secure_due(core, (uint8_t)index);
+        if (link->state == BTC_LINK_CONNECTING &&
+            core->now - link->started >= CONNECT_TIMEOUT_MS)
+        {
+            if (link->le && !link->closing_sent)
+            {
+                (void)btc_command_queue(core, OP_LE_CREATE_CANCEL, 0, 0,
+                                        BTC_R_IGNORE, LINK_NONE);
+                link->closing_sent = 1;
+                link->started = core->now;
+            }
+            else if (!link->le || core->now - link->started >= 3000u)
+            {
+                problem(core, 0x0204u, link->address);
+                memset(link, 0, sizeof(*link));
+                ++core->links_generation;
+            }
+        }
+        else if (link->state == BTC_LINK_CLOSING &&
+                 core->now - link->started >= CONNECT_TIMEOUT_MS)
+            link_released(core, link);
+    }
+}
+
+void btc_stop(btc_core *core)
+{
+    unsigned int index;
+    if (core->state == BTC_OFF) return;
+    if (core->state == BTC_READY)
+    {
+        btc_scan_stop(core);
+        stop_le_scan(core);
+        for (index = 0; index < BTC_LINKS; ++index)
+            link_disconnect(core, &core->links[index], 0x15);
+    }
+    core->state = BTC_STOPPING;
+    core->state_since = core->now;
+}
+
+int btc_stopped(const btc_core *core)
+{
+    return core->state == BTC_OFF;
+}
+
+static void stop_pump(btc_core *core)
+{
+    unsigned int index;
+    int busy = 0, result;
+    uint32_t ignored;
+    for (index = 0; index < BTC_LINKS; ++index)
+        if (core->links[index].state == BTC_LINK_OPEN ||
+            core->links[index].state == BTC_LINK_CLOSING)
+            busy = 1;
+    if (busy && core->now - core->state_since < STOP_TIMEOUT_MS &&
+        core->error == 0)
+        return;
+    for (index = 0; index < BTC_LINKS; ++index)
+        if (core->links[index].state != BTC_LINK_FREE)
+            link_released(core, &core->links[index]);
+    result = btv_host_bridge_close(&ignored);
+    if (result == BTV_HOST_BRIDGE_PENDING) return;
+    memset(core->event_ticket, 0, sizeof(core->event_ticket));
+    core->event_head = core->event_count = 0;
+    core->command_ticket = 0;
+    core->acl_in_ticket = 0;
+    memset(core->acl_out_ticket, 0, sizeof(core->acl_out_ticket));
+    core->state = BTC_OFF;
+}
+
+void btc_pump(btc_core *core, uint32_t now)
+{
+    if (core == 0) return;
+    core->now = now;
+    switch (core->state)
+    {
+    case BTC_OFF:
+        return;
+    case BTC_FAILED:
+        /* Release the transport; the owner restarts the core. */
+        btc_stop(core);
+        core->error = core->error != 0 ? core->error : 1;
+        return;
+    case BTC_STOPPING:
+        poll_transport(core);
+        if (core->state == BTC_FAILED) core->state = BTC_STOPPING;
+        submit_command(core);
+        (void)submit_acl(core);
+        stop_pump(core);
+        return;
+    default:
+        break;
+    }
+    if (core->transport_wait && core->state == BTC_BOOTING)
+    {
+        int up;
+        STAGE(1);
+        up = btv_host_bridge_boot();
+        if (up < 0)
+        {
+            fail(core, 0x0107u);
+            return;
+        }
+        if (up == 0) return;
+        transport_up(core);
+    }
+    if (core->boot_rebase && core->state == BTC_BOOTING)
+    {
+        core->boot_rebase = 0;
+        core->boot.started = core->boot.changed = now;
+        core->state_since = now;
+        last_beat = now;
+        btc_note("bring-up clocks start at", now);
+    }
+    if ((core->state == BTC_BOOTING || core->state == BTC_CONFIGURING) &&
+        core->now - last_beat >= 2000u)
+    {
+        last_beat = core->now;
+        btc_note("waiting, state", core->state);
+        btc_note("  boot stage|awaiting", core->boot.stage << 8 |
+                                        core->boot.awaiting);
+        btc_note("  config steps left", core->config_step);
+        btc_note("  command waiting|opcode", core->command_waiting << 16 |
+                                           core->waiting_opcode);
+        btc_note("  credits|queued|ticket", core->credits << 16 |
+                                          core->command_count << 8 |
+                                          (core->command_ticket != 0));
+        btc_note("  events seen", core->event_count);
+    }
+    STAGE(2);
+    poll_transport(core);
+    if (core->state == BTC_FAILED) return;
+    if (core->state == BTC_BOOTING)
+    {
+        STAGE(3);
+        boot_pump(core);
+        return;
+    }
+    STAGE(4);
+    timeouts(core);
+    if (core->state == BTC_READY)
+    {
+        STAGE(5);
+        scan_tick(core);
+        STAGE(6);
+        btc_l2cap_tick(core);
+        STAGE(7);
+        btp_pump(core);
+        STAGE(8);
+        btc_rc_pump(core);
+    }
+    STAGE(9);
+    submit_command(core);
+    send_acl(core);
+}

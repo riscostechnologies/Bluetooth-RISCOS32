@@ -1,0 +1,184 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/* Compose bridge ACL, L2CAP signaling and an outgoing RFCOMM byte stream. */
+#include "bridge_rfcomm.h"
+#include <string.h>
+
+#define OWNER_NONE 0u
+#define OWNER_DISPATCH 1u
+#define OWNER_RFCOMM 2u
+
+static int fail(btv_bridge_rfcomm *bridge, unsigned int error)
+{
+    bridge->state = BTV_BR_FAILED;
+    bridge->error = error;
+    btv_rfcomm_session_abort(&bridge->binding.session);
+    return -1;
+}
+
+int btv_bridge_rfcomm_start(btv_bridge_rfcomm *bridge, btv_bridge_acl *acl,
+                            btv_l2cap_dispatch *dispatch,
+                            uint8_t server_channel, uint32_t now)
+{
+    uint16_t cid;
+    if (bridge == 0 || acl == 0 || dispatch == 0 ||
+        acl->state != BTV_BA_RUNNING || dispatch->failed ||
+        server_channel == 0 || server_channel > 30)
+        return 0;
+    cid = btv_l2cap_dispatch_connect(dispatch, 3, 518, now);
+    if (cid == 0) return 0;
+    memset(bridge, 0, sizeof(*bridge));
+    bridge->acl = acl;
+    bridge->dispatch = dispatch;
+    bridge->local_cid = cid;
+    bridge->binding.session.dlci = server_channel;
+    bridge->state = BTV_BR_OPENING;
+    return 1;
+}
+
+static int finish_output(btv_bridge_rfcomm *bridge)
+{
+    int result;
+    if (bridge->output_owner == OWNER_NONE) return 0;
+    result = btv_bridge_acl_take_transmit(bridge->acl);
+    if (result == BTV_TX_WAIT) return 0;
+    if (result != BTV_TX_OK) return fail(bridge, 2);
+    bridge->output_owner = OWNER_NONE;
+    bridge->output_token = 0;
+    return 1;
+}
+
+static int receive_packet(btv_bridge_rfcomm *bridge, uint32_t now)
+{
+    const uint8_t *packet;
+    size_t bytes;
+    int result;
+    packet = btv_bridge_acl_packet(bridge->acl, &bytes);
+    if (packet == 0) return 0;
+    result = btv_l2cap_dispatch_receive(bridge->dispatch,
+                                        packet, bytes, now);
+    if (result == 2) return 0;
+    if (result < 0) return fail(bridge, 3);
+    if (result == 0)
+    {
+        if (bridge->state == BTV_BR_OPENING) return fail(bridge, 4);
+        result = btv_rfcomm_l2cap_receive(&bridge->binding,
+                                          packet, bytes, now);
+        if (result == 2) return 0;
+        if (result <= 0) return fail(bridge, 5);
+    }
+    if (!btv_bridge_acl_take_packet(bridge->acl)) return fail(bridge, 6);
+    return 1;
+}
+
+static int queue_output(btv_bridge_rfcomm *bridge, uint32_t now)
+{
+    size_t bytes;
+    unsigned int token;
+    int result;
+    if (bridge->output_owner != OWNER_NONE) return 0;
+    bytes = btv_l2cap_dispatch_output(bridge->dispatch,
+                    bridge->output, sizeof(bridge->output), &token, now);
+    if (bytes != 0)
+    {
+        result = btv_bridge_acl_queue(bridge->acl, bridge->output, bytes);
+        if (result == BTV_TX_WAIT) return 0;
+        if (result != BTV_TX_OK ||
+            !btv_l2cap_dispatch_sent(bridge->dispatch, token))
+            return fail(bridge, 7);
+        bridge->output_owner = OWNER_DISPATCH;
+        bridge->output_token = token;
+        return 1;
+    }
+    if (bridge->state == BTV_BR_OPENING || bridge->state == BTV_BR_DONE)
+        return 0;
+    bytes = btv_rfcomm_l2cap_output(&bridge->binding, bridge->output,
+                                    sizeof(bridge->output), now);
+    if (bytes == 0) return 0;
+    result = btv_bridge_acl_queue(bridge->acl, bridge->output, bytes);
+    if (result == BTV_TX_WAIT) return 0;
+    if (result != BTV_TX_OK || !btv_rfcomm_l2cap_sent(&bridge->binding, now))
+        return fail(bridge, 8);
+    bridge->output_owner = OWNER_RFCOMM;
+    return 1;
+}
+
+static int advance(btv_bridge_rfcomm *bridge, uint32_t now)
+{
+    const btv_l2cap_channel *channel;
+    unsigned int old_state;
+    uint8_t server_channel;
+    old_state = bridge->state;
+    btv_l2cap_dispatch_tick(bridge->dispatch, now);
+    channel = btv_l2cap_dispatch_channel(bridge->dispatch, bridge->local_cid);
+    if (channel == 0 || bridge->dispatch->failed) return fail(bridge, 9);
+    if (bridge->state == BTV_BR_OPENING && channel->state == BTV_CHANNEL_OPEN)
+    {
+        server_channel = bridge->binding.session.dlci;
+        if (!btv_rfcomm_l2cap_start(&bridge->binding, channel, 1,
+                                     server_channel, now))
+            return fail(bridge, 10);
+        bridge->state = BTV_BR_NEGOTIATING;
+    }
+    if (bridge->state != BTV_BR_OPENING)
+    {
+        btv_rfcomm_l2cap_tick(&bridge->binding, now);
+        if (bridge->binding.session.state == BTV_RS_FAILED)
+            return fail(bridge, 11);
+        if (bridge->binding.session.state == BTV_RS_READY &&
+            bridge->state == BTV_BR_NEGOTIATING)
+            bridge->state = BTV_BR_READY;
+        if (bridge->binding.session.state == BTV_RS_CLOSED &&
+            bridge->state == BTV_BR_CLOSING && !bridge->disconnect_requested)
+        {
+            if (!btv_l2cap_dispatch_disconnect(bridge->dispatch,
+                                                bridge->local_cid, now))
+                return fail(bridge, 12);
+            bridge->disconnect_requested = 1;
+        }
+        if (bridge->state == BTV_BR_CLOSING &&
+            channel->state == BTV_CHANNEL_CLOSED)
+            bridge->state = BTV_BR_DONE;
+    }
+    return old_state != bridge->state;
+}
+
+int btv_bridge_rfcomm_pump(btv_bridge_rfcomm *bridge, uint32_t now)
+{
+    int result, work;
+    if (bridge == 0 || bridge->state == BTV_BR_IDLE ||
+        bridge->state == BTV_BR_DONE || bridge->state == BTV_BR_FAILED)
+        return 0;
+    work = 0;
+    result = btv_bridge_acl_pump(bridge->acl);
+    if (result < 0) return fail(bridge, 1);
+    work |= result;
+    result = finish_output(bridge); if (result < 0) return -1; work |= result;
+    result = receive_packet(bridge, now); if (result < 0) return -1; work |= result;
+    result = advance(bridge, now); if (result < 0) return -1; work |= result;
+    result = queue_output(bridge, now); if (result < 0) return -1; work |= result;
+    return work;
+}
+
+int btv_bridge_rfcomm_write(btv_bridge_rfcomm *bridge,
+                            const uint8_t *data, size_t bytes)
+{
+    return bridge != 0 && bridge->state == BTV_BR_READY &&
+        btv_rfcomm_session_write(&bridge->binding.session, data, bytes);
+}
+
+size_t btv_bridge_rfcomm_read(btv_bridge_rfcomm *bridge,
+                              uint8_t *data, size_t capacity)
+{
+    return bridge != 0 && bridge->state == BTV_BR_READY ?
+        btv_rfcomm_session_read(&bridge->binding.session, data, capacity) : 0;
+}
+
+int btv_bridge_rfcomm_close(btv_bridge_rfcomm *bridge, uint32_t now)
+{
+    if (bridge == 0 || (bridge->state != BTV_BR_READY &&
+        bridge->state != BTV_BR_NEGOTIATING)) return 0;
+    if (!btv_rfcomm_session_close(&bridge->binding.session, now)) return 0;
+    bridge->state = BTV_BR_CLOSING;
+    return 1;
+}

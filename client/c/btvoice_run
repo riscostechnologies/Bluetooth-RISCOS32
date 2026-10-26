@@ -1,0 +1,650 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#define _POSIX_C_SOURCE 200809L
+/*******************************************************************
+ * File:        btvoice_run
+ * Purpose:     Exercise a BluetoothVoice headset from RISC OS.
+ ******************************************************************/
+#include "modhead.h"
+#include <kernel.h>
+#include <swis.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#define BTV_ABI_VERSION 0x00010000
+#define BTV_CAP_REQUIRED 0x27
+#define BTV_STATE_READY 3
+#define BTV_STATE_DISCONNECTED 4
+#define BTV_STATE_FAILED 5
+#define BTV_STATE_CLOSING 6
+#define CONNECT_TIMEOUT_CS 3000u
+#define CLOSE_TIMEOUT_CS 1500u
+#define DEFAULT_SECONDS 10u
+#define PCM_RATE 8000u
+#define PCM_SAMPLES 160u
+
+static FILE *capture_file, *playback_file;
+static unsigned int session_handle;
+static unsigned int last_state;
+static unsigned char selected_address[6], pairing_pin[16];
+static unsigned int selected_address_valid, pairing_pin_bytes = 4;
+static unsigned int drain_handle;
+/* Route RISC OS system sound (SoundDMA/SharedSound) to the headset. */
+static unsigned int system_sound;
+
+/* Plain-language progress for someone watching the TaskWindow, keyed by the
+ * session-state nibble of the phase word. */
+static const char *stage_text(unsigned int session_state)
+{
+    switch (session_state)
+    {
+    case 1: return "Starting the Bluetooth controller";
+    case 2: return "Searching for headsets";
+    case 3: return "Calling the headset - it must be in pairing mode (light flashing)";
+    case 4: return "Pairing and encrypting";
+    case 5: return "Paired. Finding the hands-free service";
+    case 6: return "Opening the audio link";
+    case 7: return "Audio ready";
+    case 8: return "Closing";
+    default: return NULL;
+    }
+}
+
+static unsigned int monotonic_time(void);
+
+/* Breadcrumbs beside the report: each line is written and the file closed at
+ * once, so a network filing system holds everything up to a machine freeze. */
+static char trail_name[260];
+
+static void crumb(const char *format, ...)
+{
+    FILE *trail;
+    va_list arguments;
+    if (trail_name[0] == '\0') return;
+    trail = fopen(trail_name, "a");
+    if (trail == NULL) return;
+    fprintf(trail, "%u ", monotonic_time());
+    va_start(arguments, format);
+    vfprintf(trail, format, arguments);
+    va_end(arguments);
+    fputc('\n', trail);
+    fclose(trail);
+}
+
+static unsigned int monotonic_time(void)
+{
+    _kernel_swi_regs input, output;
+    memset(&input, 0, sizeof(input));
+    if (_kernel_swi(OS_ReadMonotonicTime, &input, &output) != NULL)
+        return 0;
+    return (unsigned int)output.r[0];
+}
+
+static _kernel_oserror *call_swi(int number, _kernel_swi_regs *registers)
+{
+    _kernel_swi_regs output;
+    _kernel_oserror *error;
+    error = _kernel_swi(number, registers, &output);
+    if (error == NULL)
+        *registers = output;
+    return error;
+}
+
+static int report_error(const char *operation, const _kernel_oserror *error)
+{
+    if (error == NULL)
+        return 0;
+    fprintf(stderr, "BluetoothVoice: %s failed (&%X): %s\n", operation,
+            error->errnum, error->errmess);
+    crumb("ERROR %s &%X: %s", operation, error->errnum, error->errmess);
+    return 1;
+}
+
+/* Status plus the module's bring-up packet trace (16 x 32-byte entries). */
+#define TRACE_ENTRIES 16u
+#define TRACE_ENTRY_BYTES 32u
+static unsigned int status_buffer[16 + (TRACE_ENTRIES * TRACE_ENTRY_BYTES) / 4];
+static unsigned int trace_printed;
+
+static void report_trace(unsigned int bytes)
+{
+    static const char *kinds[] = { "?", "EVT<", "ACL<", "ACL>", "CMD>" };
+    const unsigned char *base = (const unsigned char *)status_buffer + 64;
+    unsigned int pass, index, best, sequence, length, count, kind;
+    char text[3 * 24 + 1];
+    if (bytes < 64 + TRACE_ENTRIES * TRACE_ENTRY_BYTES) return;
+    /* Emit unseen entries in sequence order. */
+    for (pass = 0; pass < TRACE_ENTRIES; ++pass)
+    {
+        best = TRACE_ENTRIES;
+        for (index = 0; index < TRACE_ENTRIES; ++index)
+        {
+            const unsigned char *e = base + index * TRACE_ENTRY_BYTES;
+            memcpy(&sequence, e, 4);
+            if (sequence > trace_printed &&
+                (best == TRACE_ENTRIES ||
+                 sequence < (unsigned int)(base[best * TRACE_ENTRY_BYTES] |
+                     (base[best * TRACE_ENTRY_BYTES + 1] << 8) |
+                     (base[best * TRACE_ENTRY_BYTES + 2] << 16) |
+                     ((unsigned int)base[best * TRACE_ENTRY_BYTES + 3] << 24))))
+                best = index;
+        }
+        if (best == TRACE_ENTRIES) return;
+        {
+            const unsigned char *e = base + best * TRACE_ENTRY_BYTES;
+            memcpy(&sequence, e, 4);
+            length = (unsigned int)e[4] | ((unsigned int)e[5] << 8);
+            kind = e[6] < 5 ? e[6] : 0;
+            count = length < 24 ? length : 24;
+            for (index = 0; index < count; ++index)
+                sprintf(text + index * 3, "%02X ", e[8 + index]);
+            text[count * 3] = '\0';
+            crumb("  #%u %s %u: %s", sequence, kinds[kind], length, text);
+            trace_printed = sequence;
+        }
+    }
+}
+
+static _kernel_oserror *read_status(unsigned int status[16])
+{
+    _kernel_swi_regs registers;
+    _kernel_oserror *error;
+    memset(&registers, 0, sizeof(registers));
+    memset(status_buffer, 0, sizeof(status_buffer));
+    registers.r[1] = (int)session_handle;
+    registers.r[2] = (int)status_buffer;
+    registers.r[3] = sizeof(status_buffer);
+    error = call_swi(BluetoothVoice_Status, &registers);
+    memcpy(status, status_buffer, 64);
+    if (error == NULL) report_trace((unsigned int)registers.r[3]);
+    return error;
+}
+
+static void close_session(void)
+{
+    _kernel_swi_regs registers;
+    _kernel_oserror *error;
+    unsigned int status[16], start, close_phases, close_diagnostics;
+    if (session_handle == 0)
+        return;
+    close_phases = close_diagnostics = 0;
+    crumb("Disconnect in state %u", last_state);
+    memset(&registers, 0, sizeof(registers));
+    registers.r[1] = (int)session_handle;
+    error = call_swi(BluetoothVoice_Disconnect, &registers);
+    crumb("Disconnect returned %s", error != NULL ? error->errmess : "ok");
+    if (error != NULL)
+    {
+        report_error("Disconnect", error);
+        return;
+    }
+    if (last_state == BTV_STATE_DISCONNECTED)
+    {
+        session_handle = 0;
+        return;
+    }
+    start = monotonic_time();
+    do
+    {
+        error = read_status(status);
+        if (error != NULL)
+            break;
+        if (status[2] != last_state || status[15] != close_phases ||
+            status[11] != close_diagnostics)
+            crumb("closing: state %u phases &%08X diagnostics &%08X",
+                  status[2], status[15], status[11]);
+        close_phases = status[15];
+        close_diagnostics = status[11];
+        last_state = status[2];
+        if (last_state == BTV_STATE_DISCONNECTED)
+        {
+            memset(&registers, 0, sizeof(registers));
+            registers.r[1] = (int)session_handle;
+            error = call_swi(BluetoothVoice_Disconnect, &registers);
+            if (error == NULL)
+                session_handle = 0;
+            break;
+        }
+    } while (monotonic_time() - start < CLOSE_TIMEOUT_CS);
+    if (error != NULL)
+        report_error("drained Disconnect", error);
+    else if (session_handle != 0)
+        fputs("BluetoothVoice: timed out while closing the session\n", stderr);
+}
+
+static void make_tone(signed short *samples, unsigned int *phase)
+{
+    unsigned int index;
+    for (index = 0; index < PCM_SAMPLES; ++index)
+    {
+        samples[index] = *phase < PCM_RATE / 2 ? 4096 : -4096;
+        *phase += 440;
+        if (*phase >= PCM_RATE)
+            *phase -= PCM_RATE;
+    }
+}
+
+static int transfer_audio(unsigned int seconds)
+{
+    _kernel_swi_regs registers;
+    _kernel_oserror *error;
+    unsigned int status[16], start, phase, captured;
+    signed short playback[PCM_SAMPLES], capture[PCM_SAMPLES];
+    size_t playback_bytes, playback_offset;
+    int requested, playback_done;
+    unsigned int written, next_report;
+    start = monotonic_time();
+    written = 0;
+    next_report = 0;
+    phase = 0;
+    captured = 0;
+    playback_bytes = playback_offset = 0;
+    playback_done = 0;
+    while (monotonic_time() - start < seconds * 100u)
+    {
+        error = read_status(status);
+        if (report_error("Status", error))
+            return 0;
+        last_state = status[2];
+        if (monotonic_time() - start >= next_report)
+        {
+            crumb("audio %ucs: wrote %u captured %u queued out %u in %u overruns %u sound &%X",
+                  monotonic_time() - start, written, captured,
+                  status[9], status[10], status[12], status[14] >> 1);
+            next_report += 100u;
+        }
+        if (last_state != BTV_STATE_READY)
+        {
+            fprintf(stderr, "BluetoothVoice: session left ready state (%u), error &%X\n",
+                    last_state, status[13]);
+            crumb("left ready: state %u error &%X phases &%08X diagnostics &%08X",
+                  last_state, status[13], status[15], status[11]);
+            return 0;
+        }
+        if (system_sound)
+            playback_done = 1; /* SoundDMA feeds the headset instead */
+        if (playback_offset == playback_bytes && !playback_done)
+        {
+            playback_offset = 0;
+            if (playback_file == NULL)
+            {
+                make_tone(playback, &phase);
+                playback_bytes = sizeof(playback);
+            }
+            else
+            {
+                playback_bytes = fread(playback, 1, sizeof(playback), playback_file);
+                if ((playback_bytes & 1) != 0)
+                {
+                    fputs("BluetoothVoice: playback file ends in half a PCM frame\n", stderr);
+                    return 0;
+                }
+                if (playback_bytes == 0)
+                {
+                    if (ferror(playback_file))
+                    {
+                        fputs("BluetoothVoice: cannot read the playback file\n", stderr);
+                        return 0;
+                    }
+                    playback_done = 1;
+                }
+            }
+        }
+        if (playback_offset != playback_bytes)
+        {
+            memset(&registers, 0, sizeof(registers));
+            registers.r[1] = (int)session_handle;
+            registers.r[2] = (int)((unsigned char *)playback + playback_offset);
+            registers.r[3] = (int)(playback_bytes - playback_offset);
+            error = call_swi(BluetoothVoice_Write, &registers);
+            if (report_error("Write", error))
+                return 0;
+            playback_offset += (size_t)registers.r[3];
+            written += (unsigned int)registers.r[3];
+        }
+
+        if (capture_file != NULL)
+        {
+            do
+            {
+                memset(&registers, 0, sizeof(registers));
+                registers.r[1] = (int)session_handle;
+                registers.r[2] = (int)capture;
+                registers.r[3] = sizeof(capture);
+                error = call_swi(BluetoothVoice_Read, &registers);
+                if (report_error("Read", error))
+                    return 0;
+                requested = registers.r[3];
+                if (requested > 0)
+                {
+                    if (fwrite(capture, 1, (size_t)requested, capture_file) !=
+                        (size_t)requested)
+                    {
+                        fputs("BluetoothVoice: cannot write the capture file\n", stderr);
+                        return 0;
+                    }
+                    captured += (unsigned int)requested;
+                }
+            } while (requested == (int)sizeof(capture));
+        }
+        if (playback_done && playback_offset == playback_bytes && status[9] == 0)
+            break;
+    }
+    printf("Audio complete: %u centiseconds elapsed, %u microphone bytes captured\n",
+           monotonic_time() - start, captured);
+    crumb("audio complete: %ucs wrote %u captured %u",
+          monotonic_time() - start, written, captured);
+    return 1;
+}
+
+static int connect_headset(void)
+{
+    _kernel_swi_regs registers;
+    _kernel_oserror *error;
+    unsigned int endpoint[24], configuration[16], status[16], start;
+    unsigned int previous_state, previous_phases, previous_diagnostics;
+    unsigned int previous_stage;
+    const char *text;
+    unsigned char *configuration_bytes;
+    crumb("Version");
+    memset(&registers, 0, sizeof(registers));
+    error = call_swi(BluetoothVoice_Version, &registers);
+    if (report_error("Version", error))
+        return 0;
+    if ((unsigned int)registers.r[1] != BTV_ABI_VERSION)
+    {
+        fprintf(stderr, "BluetoothVoice: unsupported ABI &%X\n", registers.r[1]);
+        return 0;
+    }
+    if (((unsigned int)registers.r[2] & BTV_CAP_REQUIRED) != BTV_CAP_REQUIRED)
+    {
+        fputs("BluetoothVoice: native HFP playback/capture is unavailable\n", stderr);
+        return 0;
+    }
+    memset(endpoint, 0, sizeof(endpoint));
+    memset(&registers, 0, sizeof(registers));
+    registers.r[2] = (int)endpoint;
+    registers.r[3] = sizeof(endpoint);
+    error = call_swi(BluetoothVoice_Enumerate, &registers);
+    if (report_error("Enumerate", error))
+        return 0;
+    if (registers.r[3] != (int)sizeof(endpoint) || endpoint[0] != sizeof(endpoint))
+    {
+        fputs("BluetoothVoice: no controller endpoint is available\n", stderr);
+        return 0;
+    }
+    printf("Controller: %s\n", (const char *)endpoint + 20);
+    memset(configuration, 0, sizeof(configuration));
+    configuration[0] = 64;
+    configuration[1] = 2;
+    configuration[2] = 2;
+    configuration[3] = capture_file != NULL;
+    configuration[4] = selected_address_valid;
+    configuration[5] = pairing_pin_bytes;
+    configuration[12] = system_sound;
+    configuration_bytes = (unsigned char *)configuration;
+    memcpy(configuration_bytes + 24, selected_address, 6);
+    memcpy(configuration_bytes + 32, pairing_pin, pairing_pin_bytes);
+    memset(&registers, 0, sizeof(registers));
+    registers.r[1] = (int)endpoint[2];
+    registers.r[2] = (int)configuration;
+    crumb("Connect to controller &%X", endpoint[2]);
+    error = call_swi(BluetoothVoice_Connect, &registers);
+    if (report_error("Connect", error))
+        return 0;
+    session_handle = (unsigned int)registers.r[1];
+    crumb("Connect accepted, handle &%X", session_handle);
+    puts("Connecting to an HFP headset...");
+    start = monotonic_time();
+    previous_phases = previous_diagnostics = previous_state = 0xffffffffu;
+    previous_stage = 0xffffffffu;
+    do
+    {
+        error = read_status(status);
+        if (report_error("Status", error))
+            return 0;
+        if (status[2] != previous_state || status[15] != previous_phases ||
+            status[11] != previous_diagnostics)
+        {
+            crumb("state %u phases &%08X diagnostics &%08X error &%X",
+                  status[2], status[15], status[11], status[13]);
+            previous_state = status[2];
+            previous_phases = status[15];
+            previous_diagnostics = status[11];
+        }
+        if ((status[15] & 15u) != previous_stage)
+        {
+            previous_stage = status[15] & 15u;
+            text = stage_text(previous_stage);
+            if (text != NULL) printf("  %s...\n", text);
+        }
+        last_state = status[2];
+        if (last_state == BTV_STATE_READY)
+        {
+            printf("Ready: %u Hz, %u channel, %u bytes per frame\n",
+                   status[5], status[7], status[8]);
+            if (system_sound)
+                printf("System sound %s the headset.\n",
+                       (status[14] & 2u) ? "now plays through" :
+                       "could not be routed to");
+            return status[5] == PCM_RATE && status[7] == 1 && status[8] == 2;
+        }
+        if (last_state == BTV_STATE_FAILED ||
+            last_state == BTV_STATE_DISCONNECTED)
+        {
+            fprintf(stderr, "BluetoothVoice: connection failed in state %u, error &%X, phases &%08X, diagnostics &%08X\n",
+                    last_state, status[13], status[15], status[11]);
+            crumb("FAILED state %u error &%X phases &%08X diagnostics &%08X",
+                  last_state, status[13], status[15], status[11]);
+            if ((status[13] & 0xffu) == 0x18)
+                puts("  The headset refused pairing: put it in pairing mode.");
+            else if ((status[13] & 0xffu) == 0x04)
+                puts("  The headset did not answer: is it in pairing mode and nearby?");
+            return 0;
+        }
+    } while (monotonic_time() - start < CONNECT_TIMEOUT_CS);
+    fprintf(stderr, "BluetoothVoice: connection timed out; phases &%08X\n",
+            status[15]);
+    crumb("TIMEOUT phases &%08X diagnostics &%08X", status[15], status[11]);
+    return 0;
+}
+
+static void usage(void)
+{
+    puts("Usage: BTVoiceRun [-address XX:XX:XX:XX:XX:XX] [-pin <PIN>]");
+    puts("                  [-play <raw-file>] [-capture <raw-file>]");
+    puts("                  [-seconds <1..3600>] [-report <file>] [-sound]");
+    puts("-sound routes system sound to the headset for the session.");
+    puts("Plays raw signed 16-bit 8 kHz mono PCM, or a 440 Hz tone without -play.");
+}
+
+static int hexadecimal(char character)
+{
+    if (character >= '0' && character <= '9') return character - '0';
+    if (character >= 'A' && character <= 'F') return character - 'A' + 10;
+    if (character >= 'a' && character <= 'f') return character - 'a' + 10;
+    return -1;
+}
+
+static int parse_address(const char *text)
+{
+    unsigned int index;
+    int high, low;
+    if (strlen(text) != 17) return 0;
+    for (index = 0; index < 6; ++index)
+    {
+        high = hexadecimal(text[index * 3]);
+        low = hexadecimal(text[index * 3 + 1]);
+        if (high < 0 || low < 0 || (index < 5 && text[index * 3 + 2] != ':'))
+            return 0;
+        selected_address[5 - index] = (unsigned char)((high << 4) | low);
+    }
+    return text[17] == '\0';
+}
+
+int main(int argc, char **argv)
+{
+    const char *capture_name, *playback_name, *report_name, *trail_option;
+    unsigned int seconds, wait_seconds, attempt, started;
+    int index, ok;
+    capture_name = playback_name = report_name = trail_option = NULL;
+    wait_seconds = 0;
+    seconds = DEFAULT_SECONDS;
+    memcpy(pairing_pin, "0000", 4);
+    for (index = 1; index < argc; ++index)
+    {
+        if (strcmp(argv[index], "-capture") == 0 && index + 1 < argc)
+            capture_name = argv[++index];
+        else if (strcmp(argv[index], "-play") == 0 && index + 1 < argc)
+            playback_name = argv[++index];
+        else if (strcmp(argv[index], "-address") == 0 && index + 1 < argc)
+        {
+            if (!parse_address(argv[++index]))
+            {
+                usage();
+                return 2;
+            }
+            selected_address_valid = 1;
+        }
+        else if (strcmp(argv[index], "-pin") == 0 && index + 1 < argc)
+        {
+            const char *pin = argv[++index];
+            size_t length = strlen(pin);
+            if (length > 16)
+            {
+                usage();
+                return 2;
+            }
+            memset(pairing_pin, 0, sizeof(pairing_pin));
+            memcpy(pairing_pin, pin, length);
+            pairing_pin_bytes = (unsigned int)length;
+        }
+        else if (strcmp(argv[index], "-report") == 0 && index + 1 < argc)
+            report_name = argv[++index];
+        else if (strcmp(argv[index], "-trail") == 0 && index + 1 < argc)
+            trail_option = argv[++index];
+        else if (strcmp(argv[index], "-sound") == 0)
+            system_sound = 1;
+        else if (strcmp(argv[index], "-wait") == 0 && index + 1 < argc)
+            wait_seconds = (unsigned int)strtoul(argv[++index], NULL, 10);
+        else if (strcmp(argv[index], "-drain") == 0 && index + 1 < argc)
+            drain_handle = (unsigned int)strtoul(argv[++index], NULL, 0);
+        else if (strcmp(argv[index], "-seconds") == 0 && index + 1 < argc)
+        {
+            char *end;
+            unsigned long value = strtoul(argv[++index], &end, 10);
+            if (*end != '\0' || value < 1 || value > 3600)
+            {
+                usage();
+                return 2;
+            }
+            seconds = (unsigned int)value;
+        }
+        else
+        {
+            usage();
+            return 2;
+        }
+    }
+    if (trail_option != NULL && strlen(trail_option) + 1 < sizeof(trail_name))
+    {
+        FILE *trail;
+        strcpy(trail_name, trail_option);
+        trail = fopen(trail_name, "w");
+        if (trail != NULL) fclose(trail);
+    }
+    else if (report_name != NULL && strlen(report_name) + 2 < sizeof(trail_name))
+    {
+        FILE *trail;
+        strcpy(trail_name, report_name);
+        strcat(trail_name, "T");
+        trail = fopen(trail_name, "w");
+        if (trail != NULL) fclose(trail);
+    }
+    if (report_name != NULL && freopen(report_name, "w", stdout) == NULL)
+        return 2;
+    if (report_name != NULL)
+    {
+        if (dup2(fileno(stdout), fileno(stderr)) < 0)
+            return 2;
+        setvbuf(stdout, NULL, _IONBF, 0);
+    }
+    if (capture_name != NULL)
+    {
+        capture_file = fopen(capture_name, "wb");
+        if (capture_file == NULL)
+        {
+            fprintf(stderr, "BluetoothVoice: cannot open capture file %s\n", capture_name);
+            return 2;
+        }
+    }
+    if (playback_name != NULL)
+    {
+        playback_file = fopen(playback_name, "rb");
+        if (playback_file == NULL)
+        {
+            fprintf(stderr, "BluetoothVoice: cannot open playback file %s\n", playback_name);
+            if (capture_file != NULL) fclose(capture_file);
+            return 2;
+        }
+    }
+    if (drain_handle != 0)
+    {
+        /* Finish closing a session a previous client abandoned. */
+        session_handle = drain_handle;
+        last_state = 0;
+        close_session();
+        crumb("drain finished, handle &%X", session_handle);
+        printf("Drain %s\n", session_handle == 0 ? "complete" : "incomplete");
+        if (report_name != NULL) fclose(stdout);
+        return session_handle == 0 ? 0 : 1;
+    }
+    setvbuf(stdout, NULL, _IONBF, 0);
+    started = monotonic_time();
+    attempt = 1;
+    if (wait_seconds != 0)
+    {
+        puts("Bluetooth headset test");
+        puts("Put the headset in pairing mode NOW (AirPods: lid open, hold the");
+        puts("back button until the light flashes white). Keep it next to the machine.");
+        printf("Retrying for up to %u seconds.\n", wait_seconds);
+    }
+    for (;;)
+    {
+        if (wait_seconds != 0) printf("Attempt %u\n", attempt);
+        crumb("attempt %u", attempt);
+        ok = connect_headset();
+        if (ok || wait_seconds == 0 ||
+            monotonic_time() - started >= wait_seconds * 100u)
+            break;
+        close_session();
+        if (session_handle != 0) break;
+        ++attempt;
+        puts("  Not connected yet - retrying in 2 seconds.");
+        {
+            unsigned int pause = monotonic_time();
+            while (monotonic_time() - pause < 200u) usleep(20000);
+        }
+    }
+    if (ok)
+        ok = transfer_audio(seconds);
+    close_session();
+    crumb("session closed, handle &%X", session_handle);
+    if (capture_file != NULL && fclose(capture_file) != 0)
+        ok = 0;
+    if (playback_file != NULL && fclose(playback_file) != 0)
+        ok = 0;
+    crumb("finished: %s", ok ? "audio test complete" : "no audio session");
+    if (wait_seconds != 0)
+        puts(ok ? (system_sound ? "Done: system sound returned to the machine." :
+                   "Done: tone played and microphone captured.") :
+                  "Finished without an audio session. You can close this window.");
+    if (ok)
+        puts("BT-VOICE-RUN-DONE");
+    if (report_name != NULL && fclose(stdout) != 0)
+        ok = 0;
+    return ok ? 0 : 1;
+}

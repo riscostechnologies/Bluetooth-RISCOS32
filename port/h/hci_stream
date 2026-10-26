@@ -1,0 +1,45 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        hci_stream
+ * Purpose:     Assemble USB HCI fragments without assuming transfer boundaries.
+ ******************************************************************/
+#ifndef BTV_HCI_STREAM_H
+#define BTV_HCI_STREAM_H
+#include "hci_frame.h"
+
+typedef struct btv_hci_stream
+{
+    uint8_t *storage;
+    size_t capacity, used, expected, header;
+    unsigned int type;
+    int lost;
+} btv_hci_stream;
+
+/* Caller-owned storage must remain valid, and must not overlap feed input.
+ * Access is serialized by the transport owner. No allocation or callbacks.
+ * Capacity includes the HCI header, but excludes the H4 type byte. */
+int btv_hci_stream_init(btv_hci_stream *stream, unsigned int type,
+                        uint8_t *storage, size_t capacity);
+
+/* Consume at most one packet. COMPLETE retains it in storage until take;
+ * MORE retains a partial header/payload. consumed allows the caller to retry
+ * the unconsumed suffix after taking a packet. A retained complete packet
+ * consumes zero new bytes. Invalid arguments consume zero bytes.
+ * A declared packet exceeding capacity latches loss, returning INVALID.
+ * No packet is ever truncated and presented as a valid packet. */
+int btv_hci_stream_feed(btv_hci_stream *stream, const uint8_t *input,
+                        size_t bytes, size_t *consumed);
+
+/* Expose a complete packet until take/restart/loss. Returns NULL if incomplete.
+ * The H4 type octet is not present; type is available in stream->type. */
+const uint8_t *btv_hci_stream_packet(const btv_hci_stream *stream, size_t *bytes);
+int btv_hci_stream_take(btv_hci_stream *stream);
+
+/* Report a lost/failed USB frame. USB HCI has no universal sync marker:
+ * subsequent bytes are rejected until the transport establishes a new packet
+ * boundary and explicitly restarts. Merely seeing a plausible header is not
+ * sufficient to restart. Already delivered packets are unaffected. */
+void btv_hci_stream_loss(btv_hci_stream *stream);
+void btv_hci_stream_restart(btv_hci_stream *stream);
+#endif

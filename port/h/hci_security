@@ -1,0 +1,41 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#ifndef BTV_HCI_SECURITY_H
+#define BTV_HCI_SECURITY_H
+#include <stddef.h>
+#include <stdint.h>
+
+enum btv_security_state
+{
+    BTV_SEC_IDLE, BTV_SEC_AUTH_QUEUED, BTV_SEC_AUTH_WAIT,
+    BTV_SEC_ENCRYPT_QUEUED, BTV_SEC_ENCRYPT_WAIT,
+    BTV_SEC_SECURED, BTV_SEC_REJECTED, BTV_SEC_RECOVER
+};
+enum btv_security_error
+{
+    BTV_SEC_NO_ERROR, BTV_SEC_TIMEOUT, BTV_SEC_USB_ERROR,
+    BTV_SEC_COMMAND_ERROR, BTV_SEC_EVENT_ERROR, BTV_SEC_BAD_EVENT,
+    BTV_SEC_HARDWARE_ERROR
+};
+typedef struct btv_hci_security
+{
+    uint32_t started;
+    uint16_t handle;
+    unsigned int state, error;
+    uint8_t submitted, usb_done, status_seen, status;
+    uint8_t event_seen, event_status, encrypted;
+} btv_hci_security;
+
+void btv_hci_security_init(btv_hci_security *security);
+int btv_hci_security_start(btv_hci_security *security, uint16_t handle,
+                           uint32_t now);
+size_t btv_hci_security_command(btv_hci_security *security, uint8_t *output,
+                                size_t capacity, uint32_t now);
+int btv_hci_security_sent(btv_hci_security *security, uint32_t now);
+int btv_hci_security_usb_done(btv_hci_security *security, int success);
+int btv_hci_security_event(btv_hci_security *security, const uint8_t *event,
+                           size_t bytes, uint32_t now);
+void btv_hci_security_tick(btv_hci_security *security, uint32_t now);
+int btv_hci_security_ready(const btv_hci_security *security);
+
+#endif

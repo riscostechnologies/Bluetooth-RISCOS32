@@ -1,0 +1,52 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#ifndef BTV_BRIDGE_ACL_H
+#define BTV_BRIDGE_ACL_H
+#include "acl_link.h"
+#include "acl_receive.h"
+#include "acl_transmit.h"
+#include "hci_bootstrap.h"
+#include "hci_stream.h"
+#include "host_bridge.h"
+
+#define BTV_BRIDGE_ACL_STORAGE 4096u
+enum btv_bridge_acl_state
+{
+    BTV_BA_IDLE, BTV_BA_RUNNING, BTV_BA_STOPPING, BTV_BA_CLOSED,
+    BTV_BA_FAILED
+};
+typedef struct btv_bridge_acl
+{
+    btv_hci_stream stream;
+    btv_acl_receive receive;
+    btv_acl_transmit transmit;
+    btv_host_bridge_completion input_completion, output_completion;
+    uint8_t stream_storage[BTV_BRIDGE_ACL_STORAGE];
+    uint8_t receive_storage[BTV_BRIDGE_ACL_STORAGE];
+    uint8_t transmit_storage[BTV_BRIDGE_ACL_STORAGE];
+    uint8_t output_packet[BTV_HOST_BRIDGE_IO_BYTES];
+    size_t input_offset;
+    uint32_t input_ticket, output_ticket, transmit_ticket;
+    uint32_t output_bytes, windows_error;
+    uint16_t handle;
+    uint8_t input_cancelled, output_cancelled;
+    unsigned int state, error;
+} btv_bridge_acl;
+
+int btv_bridge_acl_start(btv_bridge_acl *acl,
+                         const btv_controller_info *controller,
+                         const btv_acl_link *link);
+int btv_bridge_acl_pump(btv_bridge_acl *acl);
+int btv_bridge_acl_event(btv_bridge_acl *acl, const uint8_t *event,
+                         size_t bytes);
+int btv_bridge_acl_queue(btv_bridge_acl *acl, const uint8_t *pdu,
+                         size_t bytes);
+const uint8_t *btv_bridge_acl_packet(const btv_bridge_acl *acl,
+                                     size_t *bytes);
+int btv_bridge_acl_take_packet(btv_bridge_acl *acl);
+int btv_bridge_acl_take_transmit(btv_bridge_acl *acl);
+/* Request cancellation once and retain all storage until both host tickets
+ * have delivered terminal poll results. 1 closed, 0 still draining, -1 error. */
+int btv_bridge_acl_stop(btv_bridge_acl *acl);
+
+#endif

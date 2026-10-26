@@ -1,0 +1,53 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        hci_version
+ * Purpose:     Decode Read Local Version replies using explicit wire offsets.
+ * Reference:   NetBSD hci.h hci_read_local_ver_rp, command completion/status.
+ ******************************************************************/
+#include "hci_version.h"
+#include "hci_frame.h"
+#include <string.h>
+
+static uint16_t read16(const uint8_t *value)
+{
+    return (uint16_t)((uint16_t)value[0] | ((uint16_t)value[1] << 8));
+}
+
+int btv_hci_version_event(const uint8_t *packet, size_t bytes, btv_hci_version *output)
+{
+    btv_hci_version version;
+    size_t expected;
+    uint8_t status;
+    if (output == NULL || btv_hci_frame_size(BTV_HCI_EVENT, packet, bytes, 255,
+                                             &expected) != BTV_HCI_COMPLETE || expected != bytes)
+        return BTV_VERSION_INVALID;
+    if (packet[0] == 0x0f)
+    {
+        if (bytes != 6) return BTV_VERSION_INVALID;
+        if (read16(packet + 4) != BTV_HCI_READ_LOCAL_VERSION) return BTV_VERSION_WAIT;
+        status = packet[2];
+        if (status == 0) return BTV_VERSION_WAIT;
+    }
+    else if (packet[0] == 0x0e)
+    {
+        if (bytes < 5) return BTV_VERSION_INVALID;
+        if (read16(packet + 3) != BTV_HCI_READ_LOCAL_VERSION) return BTV_VERSION_WAIT;
+        if (bytes < 6) return BTV_VERSION_INVALID;
+        status = packet[5];
+        if (status == 0 && bytes != 14) return BTV_VERSION_INVALID;
+    }
+    else return BTV_VERSION_WAIT;
+    memset(&version, 0, sizeof(version));
+    version.status = status;
+    if (status == 0)
+    {
+        version.hci_version = packet[6];
+        version.hci_revision = read16(packet + 7);
+        version.lmp_version = packet[9];
+        version.manufacturer = read16(packet + 10);
+        version.lmp_subversion = read16(packet + 12);
+    }
+    *output = version;
+    return status == 0 ? BTV_VERSION_READY : BTV_VERSION_FAILED;
+}

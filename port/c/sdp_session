@@ -1,0 +1,194 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/* Coordinates the port's channel manager, SDP query and record interpreter. */
+#include "sdp_session.h"
+#include <string.h>
+
+void btv_sdp_session_init(btv_sdp_session *session)
+{
+    if (session != NULL)
+        memset(session, 0, sizeof(*session));
+}
+
+int btv_sdp_session_start(btv_sdp_session *session, btv_l2cap_dispatch *dispatch,
+                         uint16_t service, uint16_t receive_mtu,
+                         uint8_t *storage, size_t capacity, uint32_t now)
+{
+    uint16_t cid;
+    if (session == NULL || session->state != BTV_DISCOVERY_IDLE || dispatch == NULL ||
+        service == 0 || storage == NULL || capacity < 2 || capacity > 65535U || receive_mtu < 48)
+        return 0;
+    cid = btv_l2cap_dispatch_connect(dispatch, 1, receive_mtu, now);
+    if (cid == 0)
+        return 0;
+    session->dispatch = dispatch;
+    session->local_cid = cid;
+    session->requested_service = service;
+    session->storage = storage;
+    session->capacity = capacity;
+    session->started = now;
+    session->state = BTV_DISCOVERY_OPENING;
+    return 1;
+}
+
+static void terminal(btv_sdp_session *session)
+{
+    session->state = (session->outcome == BTV_DISCOVERY_FOUND ||
+        session->outcome == BTV_DISCOVERY_NO_MATCH) ? BTV_DISCOVERY_DONE : BTV_DISCOVERY_FAILED;
+}
+
+void btv_sdp_session_tick(btv_sdp_session *session, uint32_t now)
+{
+    const btv_l2cap_channel *channel;
+    const uint8_t *data;
+    size_t bytes;
+    int found;
+    if (session == NULL || session->state == BTV_DISCOVERY_IDLE ||
+        session->state == BTV_DISCOVERY_DONE || session->state == BTV_DISCOVERY_FAILED)
+        return;
+    btv_l2cap_dispatch_tick(session->dispatch, now);
+    channel = btv_l2cap_dispatch_channel(session->dispatch, session->local_cid);
+    if (channel == NULL || session->dispatch->failed)
+    {
+        session->outcome = BTV_DISCOVERY_LINK_ERROR;
+        session->needs_acl_recovery = 1;
+        session->state = BTV_DISCOVERY_FAILED;
+        return;
+    }
+    if ((uint32_t)(now - session->started) >= 180000UL)
+    {
+        session->outcome = BTV_DISCOVERY_TIMEOUT;
+        session->needs_acl_recovery = 1;
+        session->state = BTV_DISCOVERY_FAILED;
+        btv_l2cap_dispatch_abort(session->dispatch);
+        return;
+    }
+    if (channel->state == BTV_CHANNEL_CLOSED)
+    {
+        if (session->outcome == BTV_DISCOVERY_PENDING)
+            session->outcome = BTV_DISCOVERY_LINK_ERROR;
+        terminal(session);
+        return;
+    }
+    if (session->state == BTV_DISCOVERY_CLOSING)
+    {
+        if (channel->state == BTV_CHANNEL_FAILED)
+        {
+            session->outcome = BTV_DISCOVERY_LINK_ERROR;
+            session->needs_acl_recovery = 1;
+            session->state = BTV_DISCOVERY_FAILED;
+        }
+        return;
+    }
+    if (channel->state == BTV_CHANNEL_CLOSING)
+    {
+        if (session->outcome == BTV_DISCOVERY_PENDING)
+            session->outcome = BTV_DISCOVERY_LINK_ERROR;
+        session->state = BTV_DISCOVERY_CLOSING;
+        return;
+    }
+    if (channel->state == BTV_CHANNEL_FAILED)
+    {
+        session->outcome = BTV_DISCOVERY_LINK_ERROR;
+        if (channel->remote_cid == 0)
+        {
+            session->needs_acl_recovery = channel->result < 2 || channel->result > 4;
+            session->state = BTV_DISCOVERY_FAILED;
+            return;
+        }
+    }
+    else if (session->state == BTV_DISCOVERY_OPENING && channel->state == BTV_CHANNEL_OPEN)
+    {
+        /* The newly allocated channel has no prior SDP transaction namespace. */
+        btv_sdp_query_init(&session->query);
+        if (!btv_sdp_query_start(&session->query, session->requested_service, 1,
+            channel->receive_mtu, session->storage, session->capacity, now))
+            session->outcome = BTV_DISCOVERY_QUERY_ERROR;
+        else
+            session->state = BTV_DISCOVERY_QUERY;
+    }
+    if (session->state == BTV_DISCOVERY_QUERY && session->outcome == BTV_DISCOVERY_PENDING)
+    {
+        btv_sdp_query_tick(&session->query, now);
+        if (session->query.state == BTV_SDP_FAILED)
+            session->outcome = BTV_DISCOVERY_QUERY_ERROR;
+        else if (session->query.state == BTV_SDP_DONE)
+        {
+            data = btv_sdp_query_result(&session->query, &bytes);
+            found = btv_sdp_record_find(data, bytes, session->requested_service, &session->service);
+            session->outcome = found == 1 ? BTV_DISCOVERY_FOUND :
+                (found == 0 ? BTV_DISCOVERY_NO_MATCH : BTV_DISCOVERY_BAD_RECORD);
+        }
+    }
+    if (session->outcome != BTV_DISCOVERY_PENDING)
+    {
+        if (btv_l2cap_dispatch_disconnect(session->dispatch, session->local_cid, now))
+            session->state = BTV_DISCOVERY_CLOSING;
+        else if (session->dispatch->next_identifier > 255)
+        {
+            session->outcome = BTV_DISCOVERY_LINK_ERROR;
+            session->needs_acl_recovery = 1;
+            session->state = BTV_DISCOVERY_FAILED;
+        }
+        /* Pending peer response may temporarily prevent queueing our close. */
+    }
+}
+
+size_t btv_sdp_session_output(btv_sdp_session *session, uint8_t *pdu,
+                              size_t capacity, uint32_t now)
+{
+    const btv_l2cap_channel *channel;
+    uint8_t request[43];
+    size_t bytes;
+    if (session == NULL || pdu == NULL)
+        return 0;
+    btv_sdp_session_tick(session, now);
+    if (session->state != BTV_DISCOVERY_QUERY || session->outcome != BTV_DISCOVERY_PENDING)
+        return 0;
+    channel = btv_l2cap_dispatch_channel(session->dispatch, session->local_cid);
+    bytes = btv_sdp_query_request(&session->query, request, sizeof(request), now);
+    if (bytes == 0)
+        return 0;
+    return btv_l2cap_channel_write(channel, pdu, capacity, request, bytes);
+}
+
+int btv_sdp_session_sent(btv_sdp_session *session)
+{
+    return session != NULL && session->state == BTV_DISCOVERY_QUERY &&
+        session->outcome == BTV_DISCOVERY_PENDING && btv_sdp_query_sent(&session->query);
+}
+
+int btv_sdp_session_receive(btv_sdp_session *session, const uint8_t *pdu,
+                            size_t bytes, uint32_t now)
+{
+    const btv_l2cap_channel *channel;
+    const uint8_t *data;
+    size_t length;
+    int result;
+    if (session == NULL)
+        return -1;
+    btv_sdp_session_tick(session, now);
+    if (session->state != BTV_DISCOVERY_QUERY || session->outcome != BTV_DISCOVERY_PENDING)
+        return 0;
+    channel = btv_l2cap_dispatch_channel(session->dispatch, session->local_cid);
+    result = btv_l2cap_channel_read(channel, pdu, bytes, &data, &length);
+    if (result == 0)
+        return 0;
+    if (result < 0)
+    {
+        btv_sdp_query_abort(&session->query);
+        btv_sdp_session_tick(session, now);
+        return -1;
+    }
+    result = btv_sdp_query_receive(&session->query, data, length, now);
+    btv_sdp_session_tick(session, now);
+    return result;
+}
+
+const btv_sdp_service *btv_sdp_session_result(const btv_sdp_session *session)
+{
+    if (session == NULL || session->state != BTV_DISCOVERY_DONE ||
+        session->outcome != BTV_DISCOVERY_FOUND)
+        return NULL;
+    return &session->service;
+}

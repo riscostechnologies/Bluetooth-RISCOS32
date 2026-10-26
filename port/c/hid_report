@@ -1,0 +1,408 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        hid_report
+ * Purpose:     HID report descriptor parser and input report decoder.
+ *              See hid_report.h.
+ * Licence:     BSD-2-Clause (see LICENSE).
+ ******************************************************************/
+#include "hid_report.h"
+#include <string.h>
+
+/* Item prefix: bits 0-1 size (3 means 4 octets), 2-3 type, 4-7 tag. */
+#define TYPE_MAIN 0
+#define TYPE_GLOBAL 1
+#define TYPE_LOCAL 2
+
+#define MAIN_INPUT 0x8
+#define MAIN_OUTPUT 0x9
+#define MAIN_COLLECTION 0xa
+#define MAIN_END 0xc
+
+#define GLOBAL_PAGE 0x0
+#define GLOBAL_MIN 0x1
+#define GLOBAL_MAX 0x2
+#define GLOBAL_SIZE 0x7
+#define GLOBAL_ID 0x8
+#define GLOBAL_COUNT 0x9
+#define GLOBAL_PUSH 0xa
+#define GLOBAL_POP 0xb
+
+#define LOCAL_USAGE 0x0
+#define LOCAL_MIN 0x1
+#define LOCAL_MAX 0x2
+
+#define PAGE_DESKTOP 0x01
+#define PAGE_KEYBOARD 0x07
+#define PAGE_LED 0x08
+#define PAGE_BUTTON 0x09
+#define PAGE_CONSUMER 0x0c
+
+#define USAGE_X 0x30
+#define USAGE_Y 0x31
+#define USAGE_WHEEL 0x38
+#define USAGE_AC_PAN 0x238
+
+void btv_hid_map_init(btv_hid_map *m)
+{
+    memset(m, 0, sizeof(*m));
+}
+
+static int32_t value_of(const uint8_t *data, unsigned int size, int is_signed)
+{
+    uint32_t v = 0;
+    unsigned int i;
+    for (i = 0; i < size; ++i) v |= (uint32_t)data[i] << (8u * i);
+    if (is_signed && size > 0 && size < 4 &&
+        (v & (1u << (8u * size - 1u))) != 0)
+        v |= ~0u << (8u * size);
+    return (int32_t)v;
+}
+
+/* The bit offset of the next input item of this report ID. */
+static uint16_t *bits_for(btv_hid_map *m, uint8_t id)
+{
+    unsigned int i;
+    for (i = 0; i < m->id_count; ++i)
+        if (m->ids[i] == id) return &m->bits[i];
+    if (m->id_count >= BTV_HIDMAP_IDS) return 0;
+    m->ids[m->id_count] = id;
+    m->bits[m->id_count] = 0;
+    return &m->bits[m->id_count++];
+}
+
+/* A usage as page<<16 | id: a bare id takes the current page. */
+static uint32_t full_usage(const btv_hid_map *m, uint32_t usage)
+{
+    return (usage >> 16) != 0 ? usage :
+           ((uint32_t)m->g.page << 16) | (usage & 0xffffu);
+}
+
+static uint32_t usage_of(const btv_hid_map *m, unsigned int element)
+{
+    if (m->usage_count > 0)
+        return full_usage(m, m->usages[element < m->usage_count ?
+                                       element : m->usage_count - 1u]);
+    if (m->have_range)
+    {
+        uint32_t min = full_usage(m, m->range_min);
+        uint32_t max = full_usage(m, m->range_max);
+        uint32_t u = min + element;
+        return u > max ? max : u;
+    }
+    return 0;
+}
+
+static void add_field(btv_hid_map *m, uint8_t kind, uint16_t offset,
+                      uint8_t size, uint8_t count, uint8_t relative,
+                      uint8_t aux)
+{
+    btv_hid_field *f;
+    if (m->fields_used >= BTV_HIDMAP_FIELDS)
+    {
+        m->overflow = 1;
+        return;
+    }
+    f = &m->fields[m->fields_used++];
+    f->report_id = m->g.report_id;
+    f->kind = kind;
+    f->size = size;
+    f->count = count;
+    f->is_signed = m->g.minimum < 0;
+    f->relative = relative;
+    f->aux = aux;
+    f->pad = 0;
+    f->offset = offset;
+    if (kind == BTV_HIDF_KEYS || kind == BTV_HIDF_MODIFIERS)
+        m->has_keyboard = 1;
+    else
+        m->has_pointer = 1;
+}
+
+/* Append one bit to the last field when it is the same kind and next to it. */
+static int extend_run(btv_hid_map *m, uint8_t kind, uint16_t offset,
+                      uint8_t aux_next)
+{
+    btv_hid_field *f;
+    if (m->fields_used == 0) return 0;
+    f = &m->fields[m->fields_used - 1u];
+    if (f->kind != kind || f->report_id != m->g.report_id ||
+        f->offset + f->count != offset || f->aux + f->count != aux_next ||
+        f->count == 255)
+        return 0;
+    ++f->count;
+    return 1;
+}
+
+/* A joystick, game pad or multi-axis controller: its buttons and axes are
+ * not a pointer's (hid_extras.c reads those). */
+static int controller_application(const btv_hid_map *m)
+{
+    return m->g.application == 4 || m->g.application == 5 ||
+           m->g.application == 8;
+}
+
+static void input_item(btv_hid_map *m, uint32_t flags)
+{
+    uint16_t *bits = bits_for(m, m->g.report_id);
+    unsigned int size = m->g.size, count = m->g.count, e;
+    uint16_t base;
+    if (bits == 0)
+    {
+        m->overflow = 1;
+        return;
+    }
+    base = *bits;
+    *bits = (uint16_t)(base + size * count);
+    if (flags & 1u) return;                 /* constant: padding */
+    if (flags & 2u)                         /* variable: one usage each */
+    {
+        for (e = 0; e < count; ++e)
+        {
+            uint32_t u = usage_of(m, e);
+            uint16_t page = (uint16_t)(u >> 16), id = (uint16_t)u;
+            uint16_t offset = (uint16_t)(base + e * size);
+            uint8_t relative = (uint8_t)((flags >> 2) & 1u);
+            if (controller_application(m) &&
+                ((page == PAGE_BUTTON) || (page == PAGE_DESKTOP &&
+                 (id == USAGE_X || id == USAGE_Y || id == USAGE_WHEEL))))
+                continue;
+            if (page == PAGE_BUTTON && id >= 1 && id <= 32 && size == 1)
+            {
+                if (!extend_run(m, BTV_HIDF_BUTTONS, offset, (uint8_t)id))
+                    add_field(m, BTV_HIDF_BUTTONS, offset, 1, 1, 0,
+                              (uint8_t)id);
+            }
+            else if (page == PAGE_KEYBOARD && id >= 0xe0 && id <= 0xe7 &&
+                     size == 1)
+            {
+                if (!extend_run(m, BTV_HIDF_MODIFIERS, offset,
+                                (uint8_t)(id - 0xe0)))
+                    add_field(m, BTV_HIDF_MODIFIERS, offset, 1, 1, 0,
+                              (uint8_t)(id - 0xe0));
+            }
+            else if (size <= 32 && page == PAGE_DESKTOP && id == USAGE_X)
+                add_field(m, BTV_HIDF_X, offset, (uint8_t)size, 1, relative, 0);
+            else if (size <= 32 && page == PAGE_DESKTOP && id == USAGE_Y)
+                add_field(m, BTV_HIDF_Y, offset, (uint8_t)size, 1, relative, 0);
+            else if (size <= 32 && page == PAGE_DESKTOP && id == USAGE_WHEEL)
+                add_field(m, BTV_HIDF_WHEEL, offset, (uint8_t)size, 1,
+                          relative, 0);
+            else if (size <= 32 && page == PAGE_CONSUMER && id == USAGE_AC_PAN)
+                add_field(m, BTV_HIDF_PAN, offset, (uint8_t)size, 1,
+                          relative, 0);
+        }
+    }
+    else if (size <= 16)                    /* array: key codes */
+    {
+        uint32_t u = usage_of(m, 0);
+        if ((u >> 16) == PAGE_KEYBOARD || m->g.page == PAGE_KEYBOARD)
+            add_field(m, BTV_HIDF_KEYS, base, (uint8_t)size,
+                      (uint8_t)(count > 255 ? 255 : count), 0, 0);
+    }
+}
+
+static void output_item(btv_hid_map *m, uint32_t flags)
+{
+    uint32_t u = usage_of(m, 0);
+    if (!(flags & 1u) && (flags & 2u) && (u >> 16) == PAGE_LED)
+    {
+        m->has_leds = 1;
+        m->led_id = m->g.report_id;
+    }
+}
+
+static void clear_locals(btv_hid_map *m)
+{
+    m->usage_count = 0;
+    m->have_range = 0;
+}
+
+static void process_item(btv_hid_map *m, uint8_t prefix, const uint8_t *data,
+                         unsigned int size)
+{
+    unsigned int type = (prefix >> 2) & 3u, tag = prefix >> 4;
+    if (type == TYPE_MAIN)
+    {
+        uint32_t flags = (uint32_t)value_of(data, size, 0);
+        if (tag == MAIN_INPUT) input_item(m, flags);
+        else if (tag == MAIN_OUTPUT) output_item(m, flags);
+        else if (tag == MAIN_COLLECTION)
+        {
+            if (m->collection_depth == 0)
+            {
+                uint32_t u = usage_of(m, 0);
+                m->g.application = (uint8_t)((u >> 16) == PAGE_DESKTOP ?
+                                             (u & 0xffu) : 0xffu);
+            }
+            ++m->collection_depth;
+        }
+        else if (tag == MAIN_END && m->collection_depth > 0)
+            --m->collection_depth;
+        clear_locals(m);
+    }
+    else if (type == TYPE_GLOBAL)
+    {
+        switch (tag)
+        {
+        case GLOBAL_PAGE: m->g.page = (uint16_t)value_of(data, size, 0); break;
+        case GLOBAL_MIN: m->g.minimum = value_of(data, size, 1); break;
+        case GLOBAL_MAX: m->g.maximum = value_of(data, size, 1); break;
+        case GLOBAL_SIZE: m->g.size = (uint16_t)value_of(data, size, 0); break;
+        case GLOBAL_ID: m->g.report_id = (uint8_t)value_of(data, size, 0); break;
+        case GLOBAL_COUNT: m->g.count = (uint16_t)value_of(data, size, 0); break;
+        case GLOBAL_PUSH:
+            if (m->depth < 2u) m->stack[m->depth++] = m->g;
+            break;
+        case GLOBAL_POP:
+            if (m->depth > 0) m->g = m->stack[--m->depth];
+            break;
+        default: break;
+        }
+    }
+    else if (type == TYPE_LOCAL)
+    {
+        uint32_t v = (uint32_t)value_of(data, size, 0);
+        if (size < 4) v &= 0xffffu;
+        if (tag == LOCAL_USAGE)
+        {
+            if (m->usage_count < BTV_HIDMAP_USAGES)
+                m->usages[m->usage_count++] = v;
+        }
+        else if (tag == LOCAL_MIN)
+        {
+            m->range_min = v;
+            m->have_range = 1;
+        }
+        else if (tag == LOCAL_MAX)
+        {
+            m->range_max = v;
+            m->have_range = 1;
+        }
+    }
+}
+
+void btv_hid_map_feed(btv_hid_map *m, const uint8_t *data, size_t bytes)
+{
+    size_t i;
+    for (i = 0; i < bytes; ++i)
+    {
+        uint8_t b = data[i];
+        if (m->skip > 0)
+        {
+            --m->skip;
+            continue;
+        }
+        if (m->item_have == 0)
+        {
+            unsigned int size = b & 3u;
+            if (b == 0xfe)                  /* long item: size follows */
+            {
+                m->item[0] = b;
+                m->item_have = 1;
+                m->item_need = 2;
+                continue;
+            }
+            m->item[0] = b;
+            m->item_have = 1;
+            m->item_need = (uint8_t)(1u + (size == 3 ? 4u : size));
+        }
+        else
+            m->item[m->item_have++] = b;
+        if (m->item[0] == 0xfe && m->item_have == 2)
+        {
+            m->skip = (uint8_t)(m->item[1] + 1u);   /* tag + data */
+            m->item_have = 0;
+            continue;
+        }
+        if (m->item_have >= m->item_need)
+        {
+            process_item(m, m->item[0], m->item + 1, (unsigned)m->item_have - 1u);
+            m->item_have = 0;
+        }
+    }
+}
+
+int btv_hid_map_finish(btv_hid_map *m)
+{
+    if (m->item_have != 0) m->error = 1;     /* ended inside an item */
+    return (m->has_pointer || m->has_keyboard) && !m->error;
+}
+
+int btv_hid_map_wants(const btv_hid_map *m, uint8_t id)
+{
+    unsigned int i;
+    for (i = 0; i < m->fields_used; ++i)
+        if (m->fields[i].report_id == id) return 1;
+    return 0;
+}
+
+static uint32_t get_bits(const uint8_t *report, size_t bytes, uint32_t offset,
+                         unsigned int size)
+{
+    uint32_t v = 0;
+    unsigned int i;
+    for (i = 0; i < size; ++i)
+    {
+        uint32_t bit = offset + i;
+        if ((bit >> 3) < bytes && (report[bit >> 3] >> (bit & 7u)) & 1u)
+            v |= 1u << i;
+    }
+    return v;
+}
+
+static int32_t signed_bits(const uint8_t *report, size_t bytes,
+                           const btv_hid_field *f)
+{
+    uint32_t v = get_bits(report, bytes, f->offset, f->size);
+    if (f->is_signed && f->size < 32 && (v & (1u << (f->size - 1u))) != 0)
+        v |= ~0u << f->size;
+    return (int32_t)v;
+}
+
+int btv_hid_map_decode(const btv_hid_map *m, uint8_t id, const uint8_t *report,
+                       size_t bytes, btv_hid_event *e)
+{
+    unsigned int i, k;
+    unsigned int nkeys = 0;
+    memset(e, 0, sizeof(*e));
+    for (i = 0; i < m->fields_used; ++i)
+    {
+        const btv_hid_field *f = &m->fields[i];
+        if (f->report_id != id) continue;
+        switch (f->kind)
+        {
+        case BTV_HIDF_BUTTONS:
+            e->pointer = 1;
+            for (k = 0; k < f->count; ++k)
+                if (get_bits(report, bytes, f->offset + k, 1) &&
+                    f->aux + k >= 1u && f->aux + k <= 32u)
+                    e->buttons |= 1u << (f->aux + k - 1u);
+            break;
+        case BTV_HIDF_X: e->pointer = 1; e->dx = signed_bits(report, bytes, f); break;
+        case BTV_HIDF_Y: e->pointer = 1; e->dy = signed_bits(report, bytes, f); break;
+        case BTV_HIDF_WHEEL: e->pointer = 1; e->wheel = signed_bits(report, bytes, f); break;
+        case BTV_HIDF_PAN: e->pointer = 1; e->pan = signed_bits(report, bytes, f); break;
+        case BTV_HIDF_MODIFIERS:
+            e->keyboard = 1;
+            for (k = 0; k < f->count; ++k)
+                if (get_bits(report, bytes, f->offset + k, 1) &&
+                    f->aux + k < 8u)
+                    e->modifiers |= (uint8_t)(1u << (f->aux + k));
+            break;
+        case BTV_HIDF_KEYS:
+            e->keyboard = 1;
+            for (k = 0; k < f->count; ++k)
+            {
+                uint32_t code = get_bits(report, bytes, f->offset + k * f->size,
+                                         f->size);
+                if (code != 0 && code < 0x100u && nkeys < 6u)
+                    e->keys[nkeys++] = (uint8_t)code;
+            }
+            break;
+        default:
+            break;
+        }
+    }
+    return e->pointer || e->keyboard;
+}

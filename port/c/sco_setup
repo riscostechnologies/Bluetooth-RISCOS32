@@ -1,0 +1,51 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/* Core HCI 7.1.26/7.7.35; packet layout also present in pinned NetBSD hci.h. */
+#include "sco_setup.h"
+#include <string.h>
+static void put16(uint8_t *p, uint16_t n) { p[0] = (uint8_t)n; p[1] = (uint8_t)(n >> 8); }
+static uint16_t get16(const uint8_t *p) { return (uint16_t)(p[0] | ((unsigned int)p[1] << 8)); }
+static void put32(uint8_t *p, uint32_t n)
+{
+    unsigned int i;
+    for (i = 0; i < 4; ++i) { p[i] = (uint8_t)n; n >>= 8; }
+}
+size_t btv_sco_setup_command(uint8_t *output, size_t capacity, const btv_sco_parameters *p)
+{
+    uint8_t data[17];
+    if (p == NULL || p->handle > 0x0eff || p->latency < 4 || p->voice > 0x03ff ||
+        p->packet_types > 0x03ff || (p->retransmission > 2 && p->retransmission != 255) ||
+        (!(p->packet_types & 0x3f) && (p->packet_types & 0x3c0) == 0x3c0)) return 0;
+    put16(data, p->handle);
+    put32(data + 2, p->transmit_bandwidth);
+    put32(data + 6, p->receive_bandwidth);
+    put16(data + 10, p->latency);
+    put16(data + 12, p->voice);
+    data[14] = p->retransmission;
+    put16(data + 15, p->packet_types);
+    return btv_hci_command(output, capacity, 0x0428, data, sizeof(data));
+}
+int btv_sco_setup_complete(const uint8_t *event, size_t bytes, btv_sco_complete *result)
+{
+    btv_sco_complete value;
+    size_t expected;
+    if (result == NULL || btv_hci_frame_size(BTV_HCI_EVENT, event, bytes, 255, &expected) != BTV_HCI_COMPLETE ||
+        expected != bytes) return -1;
+    if (event[0] != 0x2c) return 0;
+    if (bytes != 19) return -1;
+    memset(&value, 0, sizeof(value));
+    value.status = event[2];
+    memcpy(value.address, event + 5, 6);
+    if (!value.status)
+    {
+        value.handle = get16(event + 3) & 0x0fff;
+        if (value.handle > 0x0eff || (event[11] != 0 && event[11] != 2)) return -1;
+        value.link_type = event[11];
+        value.interval = event[12]; value.window = event[13];
+        value.receive_length = get16(event + 14);
+        value.transmit_length = get16(event + 16);
+        value.air_mode = event[18];
+    }
+    *result = value;
+    return 1;
+}

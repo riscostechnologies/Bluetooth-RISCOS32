@@ -1,0 +1,155 @@
+/*	$NetBSD: rfcomm.h,v 1.19 2022/05/28 21:14:57 andvar Exp $	*/
+
+/*-
+ * Copyright (c) 2006 Itronix Inc.
+ * All rights reserved.
+ *
+ * Written by Iain Hibbert for Itronix Inc.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. The name of Itronix Inc. may not be used to endorse
+ *    or promote products derived from this software without specific
+ *    prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY ITRONIX INC. ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL ITRONIX INC. BE LIABLE FOR ANY
+ * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+/*-
+ * Copyright (c) 2001-2003 Maksim Yevmenkin <m_evmenkin@yahoo.com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ *
+ * $Id: rfcomm.h,v 1.19 2022/05/28 21:14:57 andvar Exp $
+ * $FreeBSD: src/sys/netgraph/bluetooth/include/ng_btsocket_rfcomm.h,v 1.4 2005/01/11 01:39:53 emax Exp $
+ */
+
+/* RFCOMM wire adaptation from NetBSD rfcomm_session.c. Bitwise CRC is equivalent
+ * to its lookup table, avoiding a mutable dependency or table initialization. */
+#include "rfcomm_frame.h"
+#include <string.h>
+
+static uint8_t update(uint8_t crc, uint8_t value)
+{
+    unsigned int i, next;
+    next = crc ^ value;
+    for (i = 0; i < 8; ++i)
+        next = (next >> 1) ^ ((next & 1) ? 0xe0 : 0);
+    return (uint8_t)next;
+}
+
+static int known(uint8_t type)
+{
+    return type == 0x2f || type == 0x43 || type == 0x63 || type == 0x0f || type == 0xef;
+}
+
+int btv_rfcomm_frame_decode(const uint8_t *packet, size_t bytes,
+                            int credit_mode, btv_rfcomm_frame *frame)
+{
+    btv_rfcomm_frame result;
+    size_t header, length, i;
+    uint8_t crc;
+    if (packet == NULL || frame == NULL || bytes < 4 || !(packet[0] & 1) ||
+        (credit_mode != 0 && credit_mode != 1))
+        return -1;
+    memset(&result, 0, sizeof(result));
+    result.dlci = packet[0] >> 2;
+    result.cr = (packet[0] >> 1) & 1;
+    result.type = packet[1] & 0xef;
+    result.pf = (packet[1] >> 4) & 1;
+    if (!known(result.type))
+        return -1;
+    header = 3;
+    length = packet[2] >> 1;
+    if (!(packet[2] & 1))
+    {
+        if (bytes < 5)
+            return -1;
+        length |= (size_t)packet[3] << 7;
+        header = 4;
+    }
+    if (result.type != 0xef && length != 0)
+        return -1;
+    result.has_credit = result.type == 0xef && result.pf && result.dlci != 0 && credit_mode;
+    if (bytes != header + length + result.has_credit + 1)
+        return -1;
+    crc = 0xff;
+    for (i = 0; i < (result.type == 0xef ? 2 : header); ++i)
+        crc = update(crc, packet[i]);
+    if (update(crc, packet[bytes - 1]) != 0xcf)
+        return -1;
+    if (result.has_credit)
+        result.credit = packet[header++];
+    result.data = packet + header;
+    result.bytes = length;
+    *frame = result;
+    return 1;
+}
+
+size_t btv_rfcomm_frame_encode(uint8_t *packet, size_t capacity,
+                              uint8_t dlci, int cr, uint8_t type, int pf,
+                              int credit, const uint8_t *data, size_t bytes)
+{
+    size_t header, total, i, offset;
+    uint8_t crc;
+    if (packet == NULL || dlci > 63 || (cr != 0 && cr != 1) ||
+        (pf != 0 && pf != 1) || !known(type) || credit < -1 || credit > 255 ||
+        bytes > 32767 || (bytes != 0 && data == NULL) ||
+        (type != 0xef && bytes != 0) ||
+        (credit >= 0 && (type != 0xef || !pf || dlci == 0)))
+        return 0;
+    header = bytes < 128 ? 3 : 4;
+    total = header + bytes + (credit >= 0 ? 1 : 0) + 1;
+    if (capacity < total)
+        return 0;
+    packet[0] = (uint8_t)((dlci << 2) | (cr << 1) | 1);
+    packet[1] = (uint8_t)(type | (pf << 4));
+    packet[2] = (uint8_t)((bytes << 1) | (header == 3 ? 1 : 0));
+    if (header == 4)
+        packet[3] = (uint8_t)(bytes >> 7);
+    crc = 0xff;
+    for (i = 0; i < (type == 0xef ? 2 : header); ++i)
+        crc = update(crc, packet[i]);
+    offset = header;
+    if (credit >= 0)
+        packet[offset++] = (uint8_t)credit;
+    if (bytes != 0)
+        memcpy(packet + offset, data, bytes);
+    packet[total - 1] = (uint8_t)(0xff - crc);
+    return total;
+}

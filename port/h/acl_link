@@ -1,0 +1,54 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#ifndef BTV_ACL_LINK_H
+#define BTV_ACL_LINK_H
+#include <stddef.h>
+#include <stdint.h>
+enum btv_link_state
+{
+    BTV_LINK_IDLE, BTV_LINK_QUEUED, BTV_LINK_WAIT, BTV_LINK_OPEN,
+    BTV_LINK_CLOSED, BTV_LINK_REJECTED, BTV_LINK_RECOVER
+};
+enum btv_link_error
+{
+    BTV_LINK_NO_ERROR, BTV_LINK_COMMAND_ERROR, BTV_LINK_EVENT_ERROR,
+    BTV_LINK_TIMEOUT, BTV_LINK_USB_ERROR, BTV_LINK_BAD_EVENT, BTV_LINK_HARDWARE_ERROR
+};
+typedef struct btv_acl_link
+{
+    unsigned int state, operation, error;
+    uint8_t address[6], scan_mode;
+    uint16_t clock_offset, handle;
+    uint8_t submitted, usb_done, status_seen, event_seen;
+    uint8_t command_status, event_status, encryption, disconnect_reason;
+    uint32_t started;
+} btv_acl_link;
+
+/* Fresh per-peer state only; caller first drains all old transfers/events.
+ * The controller owner serializes operations and its global command credits.
+ * At most one Create Connection may await Command Status per controller;
+ * that event identifies only the opcode, not the peer. Route it to its owner.
+ * This component does not itself allocate credits or submit USB transfers. */
+void btv_acl_link_init(btv_acl_link *link);
+int btv_acl_link_connect(btv_acl_link *link, const uint8_t address[6],
+                         uint8_t scan_mode, uint16_t clock_offset, uint32_t now);
+int btv_acl_link_disconnect(btv_acl_link *link, uint32_t now);
+/* Uses baseline DM1/DH1 packets and no role switch. now is wrapping monotonic
+ * milliseconds. Queue/submission wait is limited to 30 seconds each.
+ * A timed-out accepted command requires controller recovery, never retry.
+ * command peeks without submission; sent must follow accepted USB submission
+ * immediately, before any completion/event is delivered. */
+size_t btv_acl_link_command(btv_acl_link *link, uint8_t *output, size_t capacity, uint32_t now);
+int btv_acl_link_sent(btv_acl_link *link, uint32_t now);
+int btv_acl_link_usb_done(btv_acl_link *link, int success);
+/* Complete HCI events, no H4 prefix. Returns 1 handled, 0 unrelated, -1 invalid
+ * or recovery required. Command credit fields must ALSO reach the controller
+ * command scheduler. This is not a general event dispatcher or incoming-link
+ * acceptor. Only the intended peer and assigned handle affect this link. */
+int btv_acl_link_event(btv_acl_link *link, const uint8_t *packet, size_t bytes, uint32_t now);
+void btv_acl_link_tick(btv_acl_link *link, uint32_t now);
+/* OPEN requires successful USB command, Command Status and Connection Complete.
+ * It means ACL transport established, not authentication or headset readiness.
+ * CLOSED/REJECTED may precede USB completion: retain the state until drained. */
+int btv_acl_link_handle(const btv_acl_link *link, uint16_t *handle);
+#endif

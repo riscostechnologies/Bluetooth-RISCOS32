@@ -1,0 +1,111 @@
+/*-
+ * Copyright (c) 2005 Iain Hibbert.
+ * Copyright (c) 2006 Itronix Inc.
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. The name of Itronix Inc. may not be used to endorse
+ *    or promote products derived from this software without specific
+ *    prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY ITRONIX INC. ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL ITRONIX INC. BE LIABLE FOR ANY
+ * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+/* Adapted from NetBSD hci_link.c 1.26, hci_acl_recv. Replaces mbuf chains
+ * with bounded caller storage, retained completion and per-link ownership.
+ * Unknown-link disconnection and L2CAP dispatch remain the owner's job. */
+#include "acl_receive.h"
+#include "hci_frame.h"
+#include <string.h>
+
+static uint16_t read16(const uint8_t *p)
+{
+    return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+}
+
+int btv_acl_receive_init(btv_acl_receive *rx, uint16_t handle, uint8_t *storage, size_t capacity)
+{
+    if (rx == NULL || storage == NULL || capacity < 4 || handle > 0x0fff)
+        return 0;
+    rx->storage = storage;
+    rx->capacity = capacity;
+    rx->handle = handle;
+    rx->used = rx->expected = 0;
+    rx->dropped = 0;
+    return 1;
+}
+
+void btv_acl_receive_loss(btv_acl_receive *rx)
+{
+    if (rx->used != 0 && rx->dropped != UINT32_MAX) ++rx->dropped;
+    rx->used = rx->expected = 0;
+}
+
+const uint8_t *btv_acl_receive_packet(const btv_acl_receive *rx, size_t *bytes)
+{
+    if (bytes == NULL) return NULL;
+    *bytes = 0;
+    if (rx->expected == 0 || rx->used != rx->expected) return NULL;
+    *bytes = rx->used;
+    return rx->storage;
+}
+
+int btv_acl_receive_take(btv_acl_receive *rx)
+{
+    size_t bytes;
+    if (btv_acl_receive_packet(rx, &bytes) == NULL) return 0;
+    rx->used = rx->expected = 0;
+    return 1;
+}
+
+int btv_acl_receive_feed(btv_acl_receive *rx, const uint8_t *packet, size_t bytes)
+{
+    size_t frame, payload, expected;
+    uint16_t flags;
+    unsigned int boundary;
+    if (packet == NULL || bytes < 4) return BTV_ACL_INVALID;
+    flags = read16(packet);
+    if ((flags & 0x0fff) != rx->handle) return BTV_ACL_OTHER_LINK;
+    if (rx->expected != 0 && rx->used == rx->expected) return BTV_ACL_BUSY;
+    if (btv_hci_frame_size(BTV_HCI_ACL, packet, bytes, 65535, &frame) != BTV_HCI_COMPLETE || frame != bytes)
+        goto bad;
+    if ((flags & 0xc000) != 0) goto bad;
+    boundary = (flags >> 12) & 3;
+    payload = bytes - 4;
+    if (boundary == 2)
+    {
+        btv_acl_receive_loss(rx);
+        if (payload < 4) goto bad;
+        expected = (size_t)read16(packet + 4) + 4;
+        if (expected > rx->capacity || payload > expected) goto bad;
+        rx->expected = expected;
+    }
+    else if (boundary == 1)
+    {
+        if (rx->expected == 0 || payload == 0 || payload > rx->expected - rx->used)
+            goto bad;
+    }
+    else goto bad;
+    memcpy(rx->storage + rx->used, packet + 4, payload);
+    rx->used += payload;
+    return rx->used == rx->expected ? BTV_ACL_COMPLETE : BTV_ACL_MORE;
+bad:
+    btv_acl_receive_loss(rx);
+    return BTV_ACL_INVALID;
+}

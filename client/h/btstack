@@ -1,0 +1,31 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        btstack
+ * Purpose:     Loads the modules the headset needs: the isochronous USB
+ *              stack (USBDriver 1.35 + EHCIDriver) and BluetoothVoice.
+ ******************************************************************/
+#ifndef BT_STACK_H
+#define BT_STACK_H
+
+/* Version * 100 from a module's help string, or -1 if not loaded. */
+int bt_module_version(const char *title);
+/* USBDriver 1.35 or later is in charge of USB. */
+int bt_usb_stack_ready(void);
+/* Replaces the USB stack from files under `directory` (…Modules.USBDriver,
+ * …Modules.EHCIDriver) and ensures BluetoothVoice (…Modules.BTVoice).
+ * Every file is read into memory before USB is touched, because the files
+ * may live on a USB disc that disappears while the stack restarts.
+ * On failure `problem` says why; ROM drivers are reinstated if needed. */
+int bt_stack_load(const char *directory, int replace_usb, char *problem,
+                  int problem_size);
+
+/* Is a Bluetooth adapter plugged in?  Asks the BluetoothVoice module, so
+ * it has to be loaded first (bt_stack_load with replace_usb = 0).
+ * Returns 1 present, 0 none, -1 when the module cannot say.  `ready`, if
+ * given, comes back 1 when the USB stack already suits the adapter.
+ * The desktop asks this before replacing the USB stack, so a machine with
+ * no adapter never has its keyboard and mouse restarted at start-up. */
+int bt_adapter_present(int *ready);
+
+#endif

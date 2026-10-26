@@ -1,0 +1,53 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        sound_device
+ * Purpose:     Presents a ready HFP voice link to SoundDMA as a software
+ *              HAL audio controller, so SharedSound output reaches the
+ *              headset.
+ ******************************************************************/
+#ifndef BTV_SOUND_DEVICE_H
+#define BTV_SOUND_DEVICE_H
+
+#include "bridge_pcm.h"
+
+/* Registers (and selects) the controller once `active` is set, and removes
+ * it, restoring the previous controller, once `active` is clear.  Only the
+ * voice link drains the queue, so it paces SoundDMA; `pcm` may be NULL
+ * when `active` is clear. */
+void btv_sound_device_sync(btv_bridge_pcm *pcm, int active);
+/* A2DP: register (or remove) a stereo controller at `rate` (44100 or
+ * 48000).  `now` is the core clock in milliseconds: SoundDMA fills its
+ * buffers in the background, so buffers are taken at the rate the sound
+ * actually plays.  Taking them faster re-reads one SoundDMA has not
+ * refilled yet, which repeats a fraction of a second of audio. */
+int btv_sound_device_stereo_sync(int active, uint32_t rate, uint32_t now);
+/* Copies up to `frames` interleaved stereo frames; returns how many. */
+unsigned int btv_sound_device_stereo_read(int16_t *output,
+                                          unsigned int frames);
+/* Bit 0 registered, bit 1 SoundDMA running, bits 8-31 buffers consumed. */
+uint32_t btv_sound_device_state(void);
+/* Low 16 bits: loudest sample since the last call (then reset);
+ * high 16 bits: buffers so far that held any sound. */
+uint32_t btv_sound_device_meter(void);
+int btv_sound_device_test_tone(uint32_t milliseconds);
+/* Nonzero while SoundDMA owns the playback queue. */
+int btv_sound_device_running(void);
+/* Nonzero while SoundDMA still holds this module's audio device: the
+ * module must refuse to be killed until this is clear. */
+int btv_sound_device_registered(void);
+/* Make a device that cannot be removed harmless: its entries become a
+ * refusal stub inside its own (never freed) block, so the kernel can walk
+ * its device list even once this module has gone. */
+void btv_sound_device_orphan(void);
+
+
+/* 64-bit core interface additions. */
+void btv_sound_device_autoselect(int on);
+void btv_sound_device_external_volume(int on);
+int btv_sound_device_stereo_audible(void);
+void btv_sound_device_flush(void);
+void btv_sound_device_counts(uint32_t *refused, uint32_t *dropped, uint32_t *queued);
+uint32_t btv_sound_device_sink(const int16_t *frames, uint32_t count);
+
+#endif

@@ -1,0 +1,32 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#ifndef BTV_RFCOMM_TX_H
+#define BTV_RFCOMM_TX_H
+#include "rfcomm_dlc.h"
+#include "rfcomm_msc.h"
+typedef struct btv_rfcomm_tx
+{
+    btv_rfcomm_dlc *dlc;
+    btv_rfcomm_msc *msc;
+    uint8_t *storage;
+    size_t capacity, length, offset, prepared_bytes;
+    uint16_t frame_limit;
+    unsigned int prepared, prepared_grant;
+} btv_rfcomm_tx;
+/* Credit-mode sender, sharing the DLC credit window with rfcomm_rx. Parent
+ * provides the peer L2CAP MTU as frame_limit and exclusive ownership of sending
+ * data/credit grants on this DLC. Caller storage holds one copied byte block.
+ * All buffers/state must be nonoverlapping except queue input may overlap its
+ * own storage. One serialized owner; backing RX slots must already exist. */
+int btv_rfcomm_tx_init(btv_rfcomm_tx *tx, btv_rfcomm_dlc *dlc, btv_rfcomm_msc *msc,
+                       uint8_t *storage, size_t capacity, uint16_t frame_limit);
+int btv_rfcomm_tx_queue(btv_rfcomm_tx *tx, const uint8_t *data, size_t bytes);
+/* Complete RFCOMM UIH frame. Peeks reserve stable data/grant counts but debit
+ * nothing. Waits for OPEN DLC, MSC readiness and peer credit. Can emit a pure
+ * grant without peer credit. Call sent immediately after ordered L2CAP/ACL
+ * acceptance of copied output; no sent on BUSY or failed submission. */
+size_t btv_rfcomm_tx_output(btv_rfcomm_tx *tx, uint8_t *output, size_t capacity, uint32_t now);
+int btv_rfcomm_tx_sent(btv_rfcomm_tx *tx);
+/* Bytes not yet accepted by the lower transmit queue, not remote delivery. */
+size_t btv_rfcomm_tx_pending(const btv_rfcomm_tx *tx);
+#endif

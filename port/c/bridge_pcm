@@ -1,0 +1,135 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/* Bounded signed-16 PCM queues above bridge SCO packet transport. */
+#include "bridge_pcm.h"
+#include <string.h>
+
+static int active(btv_bridge_pcm *pcm)
+{
+    if (pcm == 0 || pcm->failed || pcm->voice == 0 ||
+        pcm->voice->state != BTV_BV_AUDIO_RUNNING)
+    {
+        if (pcm != 0) pcm->failed = 1;
+        return 0;
+    }
+    return 1;
+}
+
+int btv_bridge_pcm_init(btv_bridge_pcm *pcm, btv_bridge_voice *voice,
+                        uint16_t packet_bytes, int capture)
+{
+    if (pcm == 0 || voice == 0 || voice->state != BTV_BV_AUDIO_RUNNING ||
+        packet_bytes == 0 || packet_bytes > sizeof(pcm->playback_packet) ||
+        (packet_bytes & 1) || packet_bytes > voice->transmit_mtu ||
+        (capture != 0 && capture != 1)) return 0;
+    memset(pcm, 0, sizeof(*pcm));
+    pcm->voice = voice;
+    pcm->packet_bytes = packet_bytes;
+    pcm->capture_enabled = (uint8_t)capture;
+    pcm->next_sequence = 1;
+    return btv_pcm_init(&pcm->playback, pcm->playback_storage,
+                        sizeof(pcm->playback_storage), 2) &&
+           btv_pcm_init(&pcm->capture, pcm->capture_storage,
+                        sizeof(pcm->capture_storage), 2);
+}
+
+static int capture_step(btv_bridge_pcm *pcm)
+{
+    size_t bytes, space;
+    int result;
+    if (!pcm->capture_pending)
+    {
+        result = btv_bridge_voice_read(pcm->voice, pcm->capture_packet,
+                    sizeof(pcm->capture_packet), &pcm->capture_info);
+        if (result < 0) return -1;
+        if (result == 0) return 0;
+        if ((pcm->capture_info.bytes & 1) ||
+            pcm->capture_info.sequence < pcm->next_sequence) return -1;
+        pcm->capture_pending = 1;
+    }
+    if (!pcm->capture_enabled)
+    {
+        pcm->next_sequence = pcm->capture_info.sequence + 1;
+        pcm->capture_pending = 0;
+        return 1;
+    }
+    if (pcm->capture_info.sequence > pcm->next_sequence)
+    {
+        bytes = pcm->packet_bytes;
+        space = pcm->capture.capacity - pcm->capture.used;
+        if (space < bytes)
+        {
+            if (pcm->capture_overruns != 0xffffffffUL)
+                ++pcm->capture_overruns;
+            ++pcm->next_sequence;
+            return 1;
+        }
+        if (btv_pcm_write(&pcm->capture, pcm->silence, bytes) != bytes)
+            return -1;
+        ++pcm->next_sequence;
+        if (pcm->concealed != 0xffffffffUL) ++pcm->concealed;
+        return 1;
+    }
+    bytes = pcm->capture_info.bytes;
+    if (pcm->capture_info.status != BTV_SCO_GOOD && bytes == 0)
+        bytes = pcm->packet_bytes;
+    space = pcm->capture.capacity - pcm->capture.used;
+    if (space < bytes)
+    {
+        if (pcm->capture_overruns != 0xffffffffUL) ++pcm->capture_overruns;
+    }
+    else if (bytes != 0 && btv_pcm_write(&pcm->capture,
+             pcm->capture_info.status == BTV_SCO_GOOD ?
+             pcm->capture_packet : pcm->silence, bytes) != bytes)
+        return -1;
+    if (pcm->capture_info.status != BTV_SCO_GOOD &&
+        pcm->concealed != 0xffffffffUL) ++pcm->concealed;
+    pcm->next_sequence = pcm->capture_info.sequence + 1;
+    pcm->capture_pending = 0;
+    return 1;
+}
+
+static int playback_step(btv_bridge_pcm *pcm)
+{
+    int result;
+    if (!pcm->playback_pending)
+    {
+        if (pcm->playback.used < pcm->packet_bytes) return 0;
+        if (btv_pcm_read(&pcm->playback, pcm->playback_packet,
+                         pcm->packet_bytes) != pcm->packet_bytes) return -1;
+        pcm->playback_pending = 1;
+    }
+    result = btv_bridge_voice_write(pcm->voice, pcm->playback_packet,
+                                     pcm->packet_bytes);
+    if (result < 0) return -1;
+    if (result == 0) return 0;
+    pcm->playback_pending = 0;
+    return 1;
+}
+
+int btv_bridge_pcm_pump(btv_bridge_pcm *pcm)
+{
+    int captured, played;
+    if (!active(pcm)) return -1;
+    captured = capture_step(pcm);
+    if (captured < 0) goto failed;
+    played = playback_step(pcm);
+    if (played < 0) goto failed;
+    return captured || played ? 1 : 0;
+failed:
+    pcm->failed = 1;
+    return -1;
+}
+
+size_t btv_bridge_pcm_write(btv_bridge_pcm *pcm,
+                            const void *data, size_t bytes)
+{
+    return active(pcm) ? btv_pcm_write(&pcm->playback, data, bytes) : 0;
+}
+
+size_t btv_bridge_pcm_read(btv_bridge_pcm *pcm,
+                           void *data, size_t bytes)
+{
+    return active(pcm) && pcm->capture_enabled ?
+           btv_pcm_read(&pcm->capture, data, bytes) : 0;
+}

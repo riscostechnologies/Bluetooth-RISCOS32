@@ -1,0 +1,10 @@
+| SPDX-License-Identifier: BSD-2-Clause
+| Copyright (c) 2026 RISC OS Technologies
+| !Run for Bluetooth: the icon bar task.  It loads BluetoothVoice and the
+| USB driver from <Bluetooth$Dir>.Modules when the loaded copies are older.
+Set Bluetooth$Dir <Obey$Dir>
+IconSprites <Bluetooth$Dir>.!Sprites
+RMEnsure SharedUnixLibrary 1.16 RMLoad <Bluetooth$Dir>.Modules.SharedULib
+RMEnsure SharedUnixLibrary 1.16 Error Bluetooth needs SharedUnixLibrary 1.16 or later
+WimpSlot -min 1024K -max 1024K
+Run <Bluetooth$Dir>.!RunImage %*0

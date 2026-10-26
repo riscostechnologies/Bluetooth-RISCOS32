@@ -1,0 +1,251 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/* Ticketed SCO input/output workers over the guest host bridge. */
+#include "bridge_sco.h"
+#include <string.h>
+
+static int dimensions(uint32_t bytes, uint32_t packets)
+{
+    return bytes != 0 && bytes <= BTV_HOST_BRIDGE_IO_BYTES &&
+        packets != 0 && packets <= BTV_HOST_BRIDGE_ISO_PACKETS &&
+        bytes % packets == 0;
+}
+
+static int worker_init(btv_bridge_sco_worker *worker,
+                       const btv_sco_link *link, int output,
+                       uint16_t mtu, uint32_t bytes, uint32_t packets)
+{
+    if (worker == 0 || !dimensions(bytes, packets)) return 0;
+    memset(worker, 0, sizeof(*worker));
+    worker->bytes = bytes;
+    worker->packets = packets;
+    worker->output = (unsigned int)output;
+    if (output)
+    {
+        if (!btv_sco_transmit_init(&worker->transmitter, link, mtu, bytes))
+            return 0;
+    }
+    else if (!btv_sco_usb_receive_init(&worker->receiver, link))
+        return 0;
+    worker->state = BTV_BSW_RUNNING;
+    return 1;
+}
+
+static int input_completion(btv_bridge_sco_worker *worker, uint32_t now)
+{
+    uint32_t index, end, previous_end;
+    btv_host_bridge_completion *completion;
+    completion = &worker->completion;
+    if (completion->kind != BTV_HOST_BRIDGE_SCO_IN ||
+        completion->error != 0 ||
+        completion->bytes > BTV_HOST_BRIDGE_IO_BYTES ||
+        completion->packet_count == 0 ||
+        completion->packet_count > BTV_HOST_BRIDGE_ISO_PACKETS)
+        return -1;
+    previous_end = 0;
+    for (index = 0; index < completion->packet_count; ++index)
+    {
+        end = completion->packets[index].offset;
+        if (completion->packets[index].status != 0 ||
+            end > completion->bytes ||
+            completion->packets[index].bytes > completion->bytes - end ||
+            (completion->packets[index].bytes != 0 && end < previous_end))
+            return -1;
+        if (completion->packets[index].bytes != 0)
+            previous_end = end + completion->packets[index].bytes;
+    }
+    for (index = 0; index < completion->packet_count; ++index)
+        if (btv_sco_usb_receive_frame(&worker->receiver,
+                completion->data + completion->packets[index].offset,
+                completion->packets[index].bytes, 0, now) < 0)
+            return -1;
+    return 1;
+}
+
+static void worker_stop(btv_bridge_sco_worker *worker)
+{
+    if (worker == 0 || worker->state == BTV_BSW_DRAINED) return;
+    worker->state = BTV_BSW_STOPPING;
+    if (worker->output)
+        btv_sco_transmit_abort(&worker->transmitter);
+    else
+        btv_sco_usb_receive_frame(&worker->receiver, 0, 0, 1, 0);
+}
+
+static unsigned int worker_pump(btv_bridge_sco_worker *worker, uint32_t now)
+{
+    uint32_t ticket;
+    unsigned int index, slot;
+    size_t bytes;
+    int result;
+    if (worker == 0 || worker->state == BTV_BSW_IDLE ||
+        worker->state == BTV_BSW_DRAINED) return worker == 0 ? 0 : worker->state;
+    if (worker->state == BTV_BSW_STOPPING)
+        for (index = 0; index < worker->count; ++index)
+        {
+            slot = (worker->head + index) % 4;
+            if (!worker->cancelled[slot])
+            {
+                result = btv_host_bridge_cancel(worker->tickets[slot],
+                                                 &worker->windows_error);
+                if (result != BTV_HOST_BRIDGE_OK)
+                {
+                    worker->failed = 1;
+                    return worker->state;
+                }
+                worker->cancelled[slot] = 1;
+            }
+        }
+    for (index = 0; index < 4 && worker->count != 0; ++index)
+    {
+        slot = worker->head;
+        result = btv_host_bridge_poll(worker->tickets[slot],
+                                      &worker->completion);
+        if (result == BTV_HOST_BRIDGE_PENDING) break;
+        if (result != BTV_HOST_BRIDGE_OK)
+        {
+            worker->failed = 1;
+            worker_stop(worker);
+            break;
+        }
+        worker->tickets[slot] = 0;
+        worker->cancelled[slot] = 0;
+        worker->head = (worker->head + 1) % 4;
+        --worker->count;
+        if (worker->state == BTV_BSW_RUNNING)
+        {
+            if ((!worker->output && input_completion(worker, now) < 0) ||
+                (worker->output &&
+                 (worker->completion.kind != BTV_HOST_BRIDGE_SCO_OUT ||
+                  worker->completion.error != 0 ||
+                  worker->completion.bytes != worker->bytes ||
+                  worker->completion.packet_count != 0)))
+            {
+                worker->failed = 1;
+                worker_stop(worker);
+            }
+        }
+    }
+    while (worker->state == BTV_BSW_RUNNING && worker->count < 4)
+    {
+        bytes = 0;
+        if (worker->output)
+        {
+            bytes = btv_sco_transmit_peek(&worker->transmitter,
+                    worker->completion.data, sizeof(worker->completion.data));
+            if (bytes == 0) break;
+        }
+        result = btv_host_bridge_submit(worker->output ?
+                    BTV_HOST_BRIDGE_SCO_OUT : BTV_HOST_BRIDGE_SCO_IN,
+                    worker->output ? worker->completion.data : 0,
+                    worker->bytes, worker->packets, &ticket,
+                    &worker->windows_error);
+        if (result == BTV_HOST_BRIDGE_BUSY) break;
+        if (result != BTV_HOST_BRIDGE_OK || ticket == 0)
+        {
+            worker->failed = 1;
+            worker_stop(worker);
+            break;
+        }
+        slot = (worker->head + worker->count) % 4;
+        worker->tickets[slot] = ticket;
+        worker->cancelled[slot] = 0;
+        ++worker->count;
+        if (worker->output && !btv_sco_transmit_sent(&worker->transmitter))
+        {
+            worker->failed = 1;
+            worker_stop(worker);
+            break;
+        }
+    }
+    if (worker->state == BTV_BSW_STOPPING && worker->count == 0)
+        worker->state = BTV_BSW_DRAINED;
+    return worker->state;
+}
+
+int btv_bridge_sco_start(btv_bridge_sco *duplex, const btv_sco_link *link,
+                         uint8_t alternate, uint16_t transmit_mtu,
+                         uint32_t input_bytes, uint32_t input_packets,
+                         uint32_t output_bytes, uint32_t output_packets)
+{
+    int result;
+    uint32_t error;
+    if (duplex == 0 || alternate == 0 || transmit_mtu == 0 ||
+        !dimensions(input_bytes, input_packets) ||
+        !dimensions(output_bytes, output_packets) ||
+        btv_sco_link_result(link) == 0)
+        return 0;
+    memset(duplex, 0, sizeof(*duplex));
+    error = 0;
+    result = btv_host_bridge_voice(alternate, &error);
+    if (result != BTV_HOST_BRIDGE_OK)
+    {
+        duplex->windows_error = error;
+        duplex->state = BTV_BSD_FAILED;
+        return 0;
+    }
+    duplex->alternate = alternate;
+    if (!worker_init(&duplex->input, link, 0, 0,
+                     input_bytes, input_packets) ||
+        !worker_init(&duplex->output, link, 1, transmit_mtu,
+                     output_bytes, output_packets))
+    {
+        btv_host_bridge_voice(0, &duplex->windows_error);
+        duplex->state = BTV_BSD_FAILED;
+        return 0;
+    }
+    duplex->state = BTV_BSD_RUNNING;
+    return 1;
+}
+
+void btv_bridge_sco_stop(btv_bridge_sco *duplex)
+{
+    if (duplex == 0 || duplex->state != BTV_BSD_RUNNING) return;
+    duplex->state = BTV_BSD_STOPPING;
+    worker_stop(&duplex->input);
+    worker_stop(&duplex->output);
+}
+
+unsigned int btv_bridge_sco_pump(btv_bridge_sco *duplex, uint32_t now)
+{
+    unsigned int input, output;
+    int result;
+    if (duplex == 0 || duplex->state == BTV_BSD_IDLE ||
+        duplex->state == BTV_BSD_CLOSED || duplex->state == BTV_BSD_FAILED)
+        return duplex == 0 ? BTV_BSD_FAILED : duplex->state;
+    input = worker_pump(&duplex->input, now);
+    output = worker_pump(&duplex->output, now);
+    if (duplex->state == BTV_BSD_RUNNING &&
+        (duplex->input.failed || duplex->output.failed))
+    {
+        btv_bridge_sco_stop(duplex);
+        input = worker_pump(&duplex->input, now);
+        output = worker_pump(&duplex->output, now);
+    }
+    if (duplex->state == BTV_BSD_STOPPING &&
+        input == BTV_BSW_DRAINED && output == BTV_BSW_DRAINED)
+    {
+        result = btv_host_bridge_voice(0, &duplex->windows_error);
+        if (result == BTV_HOST_BRIDGE_OK)
+            duplex->state = duplex->input.failed || duplex->output.failed ?
+                            BTV_BSD_FAILED : BTV_BSD_CLOSED;
+        else if (result != BTV_HOST_BRIDGE_BUSY)
+            duplex->state = BTV_BSD_FAILED;
+    }
+    return duplex->state;
+}
+
+int btv_bridge_sco_write(btv_bridge_sco *duplex,
+                         const uint8_t *audio, size_t bytes)
+{
+    return duplex != 0 && duplex->state == BTV_BSD_RUNNING ?
+        btv_sco_transmit_queue(&duplex->output.transmitter, audio, bytes) : -1;
+}
+
+int btv_bridge_sco_read(btv_bridge_sco *duplex, uint8_t *audio,
+                        size_t capacity, btv_sco_packet_info *info)
+{
+    return duplex != 0 && duplex->state == BTV_BSD_RUNNING ?
+        btv_sco_receive_read(&duplex->input.receiver.queue,
+                             audio, capacity, info) : -1;
+}

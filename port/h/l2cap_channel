@@ -1,0 +1,71 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#ifndef BTV_L2CAP_CHANNEL_H
+#define BTV_L2CAP_CHANNEL_H
+#include "l2cap_signal.h"
+
+enum btv_channel_state
+{
+    BTV_CHANNEL_IDLE, BTV_CHANNEL_CONNECTING, BTV_CHANNEL_CONFIGURING,
+    BTV_CHANNEL_OPEN, BTV_CHANNEL_CLOSING, BTV_CHANNEL_CLOSED,
+    BTV_CHANNEL_FAILED
+};
+
+typedef struct btv_l2cap_channel
+{
+    unsigned int state;
+    uint16_t local_cid, remote_cid, receive_mtu, transmit_mtu, result, receive_limit;
+    uint8_t connect_id, config_id, disconnect_id;
+    uint8_t awaiting, local_configured, peer_configured, response_opens;
+    uint8_t retry_pending, retries, identifiers[32];
+    uint32_t started;
+    uint8_t request[16], response[52];
+    size_t request_bytes, response_bytes;
+} btv_l2cap_channel;
+
+/* Outgoing classic Basic Mode channel. Owner provides a unique dynamic local
+ * CID and reserves BOTH nonzero, distinct identifiers on the parent ACL link.
+ * Lifetime, peer CID uniqueness and identifier reuse are parent-owned. Fresh
+ * init is permitted only after all old traffic and callbacks are drained. */
+void btv_l2cap_channel_init(btv_l2cap_channel *channel);
+int btv_l2cap_channel_connect(btv_l2cap_channel *channel, uint16_t psm,
+                             uint16_t local_cid, uint16_t receive_mtu,
+                             uint8_t connect_id, uint8_t config_id, uint32_t now);
+/* Queue a close, including cleanup after FAILED with an assigned remote CID.
+ * The new identifier must be reserved by the parent. */
+int btv_l2cap_channel_disconnect(btv_l2cap_channel *channel,
+                                uint8_t identifier, uint32_t now);
+/* A valid MTU counteroffer sets retry_pending without allocating a link-wide
+ * identifier. Parent reserves a fresh identifier and calls retry. At most three
+ * retries; all attempts share the original setup deadline and storage limit. */
+int btv_l2cap_channel_retry(btv_l2cap_channel *channel,
+                           uint8_t identifier, uint32_t now);
+/* Copy the next signaling PDU. token is 1 request or 2 response, not a durable
+ * IO ticket. After ACL TX has accepted its own copy, call sent immediately,
+ * before any other channel operation. On TX BUSY retain channel state and retry.
+ * A downstream transport failure requires abort; sent is not USB completion. */
+size_t btv_l2cap_channel_output(btv_l2cap_channel *channel, uint8_t *output,
+                               size_t capacity, unsigned int *token, uint32_t now);
+int btv_l2cap_channel_sent(btv_l2cap_channel *channel, unsigned int token);
+/* Route commands from a validated signaling iterator on this channel's ACL
+ * link. 1 consumed, 0 not owned, 2 response slot busy (NOT consumed), -1 invalid
+ * or channel failure. Retry BUSY without advancing the parent command queue.
+ * Parent handles unowned requests (including incoming Connection Requests). */
+int btv_l2cap_channel_receive(btv_l2cap_channel *channel,
+                             const btv_l2cap_command *command, uint32_t now);
+void btv_l2cap_channel_tick(btv_l2cap_channel *channel, uint32_t now);
+void btv_l2cap_channel_abort(btv_l2cap_channel *channel);
+/* Basic Mode data boundary for an OPEN channel. write copies a complete L2CAP
+ * PDU for ACL TX, returns bytes or 0 without partial output. Data and output
+ * must not overlap. read accepts a complete ACL-reassembled PDU and returns
+ * 1 borrowed payload, 0 different CID, -1 invalid/not open. Outputs unchanged
+ * on error. Both directions enforce the independently negotiated MTUs. */
+size_t btv_l2cap_channel_write(const btv_l2cap_channel *channel,
+                              uint8_t *pdu, size_t capacity,
+                              const uint8_t *data, size_t bytes);
+int btv_l2cap_channel_read(const btv_l2cap_channel *channel,
+                          const uint8_t *pdu, size_t bytes,
+                          const uint8_t **data, size_t *length);
+/* OPEN means both Basic Mode configuration directions completed. It implies
+ * neither authentication nor any upper-layer service/voice connection. */
+#endif

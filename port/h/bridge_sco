@@ -1,0 +1,47 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#ifndef BTV_BRIDGE_SCO_H
+#define BTV_BRIDGE_SCO_H
+#include "host_bridge.h"
+#include "sco_receive.h"
+#include "sco_transmit.h"
+
+enum btv_bridge_sco_worker_state
+{
+    BTV_BSW_IDLE, BTV_BSW_RUNNING, BTV_BSW_STOPPING, BTV_BSW_DRAINED
+};
+typedef struct btv_bridge_sco_worker
+{
+    btv_sco_usb_receive receiver;
+    btv_sco_transmit transmitter;
+    btv_host_bridge_completion completion;
+    uint32_t tickets[4], bytes, packets, windows_error;
+    uint8_t cancelled[4];
+    unsigned int head, count, state, failed, output;
+} btv_bridge_sco_worker;
+
+enum btv_bridge_sco_state
+{
+    BTV_BSD_IDLE, BTV_BSD_RUNNING, BTV_BSD_STOPPING,
+    BTV_BSD_CLOSED, BTV_BSD_FAILED
+};
+typedef struct btv_bridge_sco
+{
+    btv_bridge_sco_worker input, output;
+    uint32_t windows_error;
+    uint8_t alternate;
+    unsigned int state;
+} btv_bridge_sco;
+
+int btv_bridge_sco_start(btv_bridge_sco *duplex, const btv_sco_link *link,
+                         uint8_t alternate, uint16_t transmit_mtu,
+                         uint32_t input_bytes, uint32_t input_packets,
+                         uint32_t output_bytes, uint32_t output_packets);
+unsigned int btv_bridge_sco_pump(btv_bridge_sco *duplex, uint32_t now);
+void btv_bridge_sco_stop(btv_bridge_sco *duplex);
+int btv_bridge_sco_write(btv_bridge_sco *duplex,
+                         const uint8_t *audio, size_t bytes);
+int btv_bridge_sco_read(btv_bridge_sco *duplex, uint8_t *audio,
+                        size_t capacity, btv_sco_packet_info *info);
+
+#endif

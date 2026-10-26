@@ -1,0 +1,31 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#ifndef BTV_RFCOMM_CONTROL_H
+#define BTV_RFCOMM_CONTROL_H
+#include "rfcomm_mcc.h"
+typedef struct btv_rfcomm_control
+{
+    uint8_t *storage;
+    size_t capacity, pending;
+    unsigned int failed, peer_flow_enabled;
+    uint8_t rejected_type;
+} btv_rfcomm_control;
+/* Generic MCC owner on an OPEN, role-checked multiplexer. Storage must fit
+ * the largest permitted incoming TEST MCC and its response, and at least ten
+ * bytes for an RPN reply. Parent routes RPN/RLS only for an eligible DLC.
+ * RPN advertises a fixed virtual 8N1 port; it does not configure hardware.
+ * All buffers and
+ * state are nonoverlapping, with a single serialized owner. */
+int btv_rfcomm_control_init(btv_rfcomm_control *control, uint8_t *storage, size_t capacity);
+/* Complete MCC input: 1 handled, 0 belongs to PN/MSC, 2 busy (retain
+ * and retry unchanged), -1 invalid, rejected mandatory command or capacity
+ * failure requiring parent session teardown. Unknown responses are ignored,
+ * not answered, to prevent response loops. NSC fails the session, as NetBSD
+ * sends only mandatory commands. No originating optional TEST is supported. */
+int btv_rfcomm_control_receive(btv_rfcomm_control *control, const uint8_t *data, size_t bytes);
+/* MCC bytes only. Parent wraps role-correct UIH and obeys peer L2CAP MTU.
+ * sent immediately follows ordered acceptance of copied output, not USB IO.
+ * peer_flow_enabled applies to non-credit data only, not control responses. */
+size_t btv_rfcomm_control_output(const btv_rfcomm_control *control, uint8_t *output, size_t capacity);
+int btv_rfcomm_control_sent(btv_rfcomm_control *control);
+#endif

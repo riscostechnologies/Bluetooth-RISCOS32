@@ -1,0 +1,41 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        usb_transport
+ * Purpose:     Select the standard Bluetooth USB endpoint layout.
+ ******************************************************************/
+#ifndef BTV_USB_TRANSPORT_H
+#define BTV_USB_TRANSPORT_H
+#include <stddef.h>
+#include <stdint.h>
+
+typedef struct btv_usb_endpoints
+{
+    uint8_t configuration;
+    uint8_t event_in;
+    uint8_t acl_in;
+    uint8_t acl_out;
+    uint8_t voice_alternate;
+    uint8_t sco_in;
+    uint8_t sco_out;
+    uint16_t event_packet;
+    uint16_t acl_in_packet;
+    uint16_t acl_out_packet;
+    uint16_t sco_in_packet;
+    uint16_t sco_out_packet;
+} btv_usb_endpoints;
+
+enum btv_usb_result
+{
+    BTV_USB_INVALID = -1,
+    BTV_USB_UNSUPPORTED = 0,
+    BTV_USB_READY = 1
+};
+
+/* Standard USB Bluetooth layout: HCI on interface 0 alternate 0, SCO on
+ * interface 1 at the requested alternate. READY at alternate 0 may describe
+ * zero-bandwidth SCO endpoints; it does not establish active voice support.
+ * On failure output is unchanged. No input pointer is retained. */
+int btv_usb_select(const uint8_t *configuration, size_t bytes,
+                    uint8_t alternate, btv_usb_endpoints *output);
+#endif

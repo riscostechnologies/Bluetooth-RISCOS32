@@ -1,0 +1,382 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        bt_info
+ * Purpose:     The text *BTInfo prints: one look at it says which step of
+ *              a scan, a pairing, a connection or a reconnection went
+ *              wrong, and what became of a keyboard's or mouse's reports.
+ *              Pure apart from reading the core: the host checks run it.
+ * Licence:     BSD-2-Clause (see LICENSE).
+ ******************************************************************/
+#include "bt_info.h"
+#include "bt_profiles.h"
+#include "bt_reconnect.h"
+#include "hid_riscos.h"
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
+
+extern btv_hid_riscos btp_hid_riscos;
+extern uint32_t btc_passkey;
+
+typedef struct writer
+{
+    char *out;
+    size_t room, at;
+} writer;
+
+static void say(writer *w, const char *format, ...) __attribute__((format(printf, 2, 3)));
+
+static void say(writer *w, const char *format, ...)
+{
+    va_list args;
+    int n;
+    if (w->at + 1 >= w->room) return;
+    va_start(args, format);
+    n = vsnprintf(w->out + w->at, w->room - w->at, format, args);
+    va_end(args);
+    if (n < 0) return;
+    w->at += (size_t)n;
+    if (w->at >= w->room) w->at = w->room - 1;
+}
+
+/* HCI status codes (Core Vol 1 Part F), the ones that turn up. */
+const char *btinfo_status(unsigned int status)
+{
+    switch (status)
+    {
+    case 0x00: return "success";
+    case 0x01: return "unknown command";
+    case 0x02: return "unknown connection";
+    case 0x04: return "page timeout (no answer)";
+    case 0x05: return "authentication failure";
+    case 0x06: return "PIN or key missing";
+    case 0x07: return "memory capacity exceeded";
+    case 0x08: return "connection timeout";
+    case 0x09: return "connection limit exceeded";
+    case 0x0b: return "connection already exists";
+    case 0x0c: return "command disallowed";
+    case 0x0d: return "rejected, limited resources";
+    case 0x0e: return "rejected, security reasons";
+    case 0x0f: return "rejected, unacceptable address";
+    case 0x10: return "connection accept timeout";
+    case 0x13: return "remote user terminated";
+    case 0x14: return "remote low resources";
+    case 0x15: return "remote power off";
+    case 0x16: return "local host terminated";
+    case 0x18: return "pairing not allowed";
+    case 0x1a: return "unsupported remote feature";
+    case 0x1e: return "unsupported security";
+    case 0x22: return "LMP response timeout";
+    case 0x23: return "LMP/LL collision";
+    case 0x28: return "instant passed";
+    case 0x29: return "pairing with unit key not supported";
+    case 0x3d: return "MIC failure";
+    case 0x3e: return "failed to be established";
+    case 0xff: return "no answer from the controller";
+    default: return "?";
+    }
+}
+
+static const char *state_name(unsigned int state)
+{
+    static const char *names[] = { "off", "booting", "configuring", "ready",
+                                   "stopping", "FAILED" };
+    return state < 6 ? names[state] : "?";
+}
+
+static const char *link_state_name(unsigned int state)
+{
+    static const char *names[] = { "free", "connecting", "open", "closing" };
+    return state < 4 ? names[state] : "?";
+}
+
+static const char *security_name(unsigned int security)
+{
+    static const char *names[] = { "none", "authenticating", "encrypting",
+                                   "LE pairing", "encrypted", "FAILED" };
+    return security < 6 ? names[security] : "?";
+}
+
+static const char *hid_state_name(unsigned int state)
+{
+    static const char *names[] = { "idle", "securing", "opening control",
+                                   "opening interrupt", "waiting for device",
+                                   "READY", "FAILED", "reading descriptor" };
+    return state < 8 ? names[state] : "?";
+}
+
+static const char *le_state_name(unsigned int state)
+{
+    static const char *names[] = { "idle", "encrypting (stored key)",
+                                   "pairing", "receiving keys",
+                                   "finding service", "finding characteristics",
+                                   "finding descriptors", "reading report map",
+                                   "subscribing", "READY", "FAILED" };
+    return state < 11 ? names[state] : "?";
+}
+
+static const char *problem_area(unsigned int area)
+{
+    switch (area)
+    {
+    case 0x02: return "Create Connection refused";
+    case 0x03: return "connection failed";
+    case 0x04: return "connect timed out";
+    case 0x05: return "authentication failed";
+    case 0x06: return "encryption failed";
+    case 0x07: return "pairing failed";
+    case 0x08: return "authentication request refused";
+    case 0x09: return "inquiry refused";
+    case 0x0a: return "command not answered (opcode low byte)";
+    case 0x0b: return "LE own code (bt_le.c fail)";
+    case 0x0c: return "LE encryption (HCI status)";
+    case 0x0d: return "trying again (attempt number)";
+    default: return "?";
+    }
+}
+
+static void address_text(const uint8_t a[6], char out[18])
+{
+    snprintf(out, 18, "%02x:%02x:%02x:%02x:%02x:%02x", a[5], a[4], a[3], a[2],
+             a[1], a[0]);
+}
+
+static void kind_text(uint16_t flags, char *out, size_t room)
+{
+    out[0] = 0;
+#define ADD(bit, text) \
+    if ((flags & (bit)) != 0 && strlen(out) + strlen(text) + 2 < room) \
+    { if (out[0] != 0) strcat(out, "+"); strcat(out, text); }
+    ADD(BTC_DEV_KEYBOARD, "keyboard")
+    ADD(BTC_DEV_MOUSE, "mouse")
+    ADD(BTC_DEV_GAMEPAD, "gamepad")
+    ADD(BTC_DEV_HID, "HID")
+    ADD(BTC_DEV_AUDIO_SINK, "audio")
+    ADD(BTC_DEV_HANDSFREE, "handsfree")
+    ADD(BTC_DEV_LE, "LE")
+    ADD(BTC_DEV_CLASSIC, "classic")
+#undef ADD
+    if (out[0] == 0) snprintf(out, room, "unknown");
+}
+
+static const char *name_source_text(const btc_device *d)
+{
+    if (!(d->flags & BTC_DEV_NAMED)) return "no name";
+    return d->name_source == 1 ? "advertised" : d->name_source == 2 ?
+           "asked for" : d->name_source == 3 ? "remembered" : "named";
+}
+
+static void device_lines(writer *w, btc_core *core)
+{
+    unsigned int index, shown = 0;
+    char address[18], kind[48];
+    say(w, "Scan list: %u of %u entries\n", core->device_count, BTC_DEVICES);
+    for (index = 0; index < core->device_count; ++index)
+    {
+        const btc_device *d = &core->devices[index];
+        address_text(d->address, address);
+        kind_text(d->flags, kind, sizeof kind);
+        say(w, "  %s \"%s\" %s class %02x%02x%02x rssi %d [%s]%s%s",
+            address, d->name, kind, d->device_class[2], d->device_class[1],
+            d->device_class[0], d->rssi, name_source_text(d),
+            (d->flags & BTC_DEV_PAIRED) ? " paired" : "",
+            (d->flags & BTC_DEV_CONNECTED) ? " connected" : "");
+        if (d->name_tried != 0)
+            say(w, " (name requests %u, last status %02x %s)", d->name_tried,
+                d->name_status, btinfo_status(d->name_status));
+        say(w, "\n");
+        if (++shown >= 24)
+        {
+            say(w, "  ... %u more\n", core->device_count - shown);
+            break;
+        }
+    }
+}
+
+static const btc_rc_entry *rc_entry(const btc_core *core, const uint8_t a[6])
+{
+    unsigned int i;
+    for (i = 0; i < core->rc_count; ++i)
+        if (memcmp(core->rc[i].address, a, 6) == 0) return &core->rc[i];
+    return 0;
+}
+
+static const char *rc_state(unsigned int s)
+{
+    static const char *names[] = { "waiting", "trying", "connected",
+                                   "GAVE UP" };
+    return s < 4 ? names[s] : "?";
+}
+
+static void hid_lines(writer *w, btc_core *core, unsigned int link)
+{
+    const btp_hid *h;
+    const btp_le *l;
+    if (core->profiles == 0) return;
+    h = &core->profiles->hid[link];
+    l = &core->profiles->le[link];
+    if (core->links[link].le)
+    {
+        if (!l->active) return;
+        say(w, "      LE HID: %s, report mode %u, reports %u, keyboard %s, mouse %s, "
+               "error %x, battery %u\n", le_state_name(l->state),
+            l->report_mode, (unsigned)l->reports, l->keyboard ? "attached" : "no",
+            l->mouse ? "attached" : "no", (unsigned)l->error, l->battery);
+        return;
+    }
+    if (!h->active) return;
+    say(w, "      HID: %s; protocol %s%s; descriptor %s; channels control %s, "
+           "interrupt %s\n", hid_state_name(h->state),
+        h->protocol_set ? (h->report_mode ? "report" : "boot") : "not chosen",
+        h->boot_after_handshake ? " (device refused report)" : "",
+        h->from_cache ? "from the bond" : h->sdp == BTP_HID_SDP_DONE ? "read (SDP)" :
+        h->sdp == BTP_HID_SDP_FAILED ? "not read, boot" :
+        h->sdp == BTP_HID_SDP_RUNNING ? "being read" : "not asked for yet",
+        h->control >= 0 ? "open" : "no", h->interrupt >= 0 ? "open" : "no");
+    say(w, "      reports %u, decoded %u, unmatched %u, boot-format fallbacks %u; "
+           "last id %u (%u bytes); SET_PROTOCOL handshake %s%u; keyboard %s, mouse %s%s\n",
+        (unsigned)h->reports, (unsigned)h->decoded, (unsigned)h->unmatched,
+        (unsigned)h->fallbacks, h->last_report_id, h->last_report_bytes,
+        (h->handshake & 0x80u) ? "result " : "none ", h->handshake & 0x0fu,
+        h->keyboard ? "attached" : "no", h->mouse ? "attached" : "no",
+        h->attach_failed ? " (KeyV claim FAILED)" : "");
+}
+
+size_t btinfo_text(btc_core *core, char *out, size_t room)
+{
+    writer w;
+    unsigned int index;
+    char address[18], kind[48];
+    const btc_stats *s = &core->stats;
+    w.out = out;
+    w.room = room;
+    w.at = 0;
+    if (room == 0) return 0;
+    out[0] = 0;
+    say(&w, "BluetoothVoice: %s (state %u), error %x\n",
+        state_name(core->state), core->state, (unsigned)core->error);
+    if (core->last_problem == 0)
+        say(&w, "Last problem: none\n");
+    else
+    {
+        say(&w, "Last problem: area %02x (%s), code %02x (%s), device ",
+            (unsigned)(core->last_problem >> 8) & 0xffu,
+            problem_area((core->last_problem >> 8) & 0xffu),
+            (unsigned)core->last_problem & 0xffu,
+            btinfo_status(core->last_problem & 0xffu));
+        address_text(core->problem_address, address);
+        say(&w, "%s\n", address);
+    }
+    say(&w, "Controller: ACL buffers %u x %u (free %u), command credits %u, "
+            "queued %u, event-stream resyncs %u\n", core->acl_max, core->acl_mtu,
+        core->acl_free, core->credits, core->command_count,
+        (unsigned)core->resyncs);
+    say(&w, "Scan: %u scans, %u inquiry results, %u EIR names, %u LE reports "
+            "(%u LE names)\n", (unsigned)s->scans, (unsigned)s->inquiry_results,
+        (unsigned)s->eir_names, (unsigned)s->le_reports, (unsigned)s->le_names);
+    say(&w, "Background LE scan for bonded devices: %s, restarted %u times\n",
+        (core->le_scanning && core->le_scan_background) ? "running" : "not running",
+        (unsigned)s->le_scan_restarts);
+    say(&w, "Names: %u requests, %u found, %u failed (last status %02x %s); "
+            "scan refused %u times (last %02x %s)\n",
+        (unsigned)s->name_requests, (unsigned)s->names_found,
+        (unsigned)s->name_failures, (unsigned)s->name_last_status,
+        btinfo_status(s->name_last_status), (unsigned)s->scan_failures,
+        (unsigned)s->scan_last_status, btinfo_status(s->scan_last_status));
+    {
+        unsigned int cached = 0;
+        for (index = 0; index < BTC_NAME_CACHE; ++index)
+            if (core->names[index].used) ++cached;
+        say(&w, "Scan list: %u evicted for better, %u results dropped; %u names "
+                "remembered\n", (unsigned)s->devices_evicted,
+            (unsigned)s->devices_dropped, cached);
+    }
+    say(&w, "Connections out: %u started, %u failed (last status %02x %s), %u "
+            "retried\n", (unsigned)s->connects, (unsigned)s->connect_failures,
+        (unsigned)s->connect_last_status, btinfo_status(s->connect_last_status),
+        (unsigned)s->connect_retries);
+    address_text(s->last_incoming_address, address);
+    say(&w, "Connections in: %u requests, %u accepted (%u while we were paging "
+            "the same device), %u refused; last from %s: %s\n",
+        (unsigned)s->incoming, (unsigned)s->incoming_accepted,
+        (unsigned)s->incoming_crossed, (unsigned)s->incoming_rejected, address,
+        s->last_incoming_reason == 0 ? "accepted" :
+        s->last_incoming_reason == 1 ? "refused: not a bonded device" :
+        s->last_incoming_reason == 2 ? "refused: not an ACL link" :
+        s->last_incoming_reason == 3 ? "refused: bonded for Low Energy only" :
+        s->last_incoming_reason == 4 ? "refused: already linked" :
+        "refused: no free link");
+    say(&w, "Security: authentication failed %u (last %02x %s), encryption "
+            "failed %u (last %02x %s); link keys stored %u, supplied %u, "
+            "refused %u\n", (unsigned)s->auth_failures,
+        (unsigned)s->auth_last_status, btinfo_status(s->auth_last_status),
+        (unsigned)s->enc_failures, (unsigned)s->enc_last_status,
+        btinfo_status(s->enc_last_status), (unsigned)s->link_keys_stored,
+        (unsigned)s->link_keys_replied, (unsigned)s->link_keys_refused);
+    say(&w, "Pairing question: %s; passkey shown %06u; discoverable %s; "
+            "reconnect at start-up %s (%s)\n",
+        core->prompt_kind == 0 ? "none" : core->prompt_kind == 1 ?
+        "compare six digits" : "type the passkey",
+        (unsigned)btc_passkey, core->discoverable ? "yes" : "no",
+        btc_rc_enabled() ? "on" : "off",
+        core->rc_active ? "still trying" : "finished");
+    say(&w, "Pointer: type in use %u (7 = USB mouse, which Bluetooth mice "
+            "use), %u moves and %u presses dropped for another type; "
+            "keyboards announced %u\n", (unsigned)btp_hid_riscos.pointer_type,
+        (unsigned)btp_hid_riscos.moves_dropped,
+        (unsigned)btp_hid_riscos.presses_dropped, btp_hid_riscos.keyboards);
+    say(&w, "Bonded devices:\n");
+    {
+        unsigned int count = 0;
+        for (index = 0; index < BTC_KEYS; ++index)
+        {
+            const btc_key *k = &core->keys[index];
+            const btc_device *d;
+            const btc_rc_entry *rc;
+            btc_link *link;
+            if (!k->used) continue;
+            ++count;
+            d = btc_device_find(core, k->address);
+            address_text(k->address, address);
+            kind_text(k->flags, kind, sizeof kind);
+            link = btc_link_by_address(core, k->address);
+            say(&w, "  %s \"%s\" %s, %s key, descriptor %s, reconnect %s",
+                address, d != 0 ? d->name : "", kind,
+                k->le ? "LE" : "BR/EDR",
+                k->gatt.valid == 0 ? "not kept" : "kept",
+                btc_rc_auto(k->address) ? "automatic" : "off");
+            rc = rc_entry(core, k->address);
+            if (rc != 0)
+                say(&w, " (%s, %u tries)", rc_state(rc->state), rc->tries);
+            if (link != 0)
+                say(&w, "; link %s, security %s", link_state_name(link->state),
+                    security_name(link->security));
+            else
+                say(&w, "; not connected");
+            say(&w, "\n");
+        }
+        if (count == 0) say(&w, "  none\n");
+    }
+    say(&w, "Links:\n");
+    {
+        unsigned int count = 0;
+        for (index = 0; index < BTC_LINKS; ++index)
+        {
+            const btc_link *l = &core->links[index];
+            if (l->state == BTC_LINK_FREE) continue;
+            ++count;
+            address_text(l->address, address);
+            say(&w, "  [%u] %s %s %s, %s, security %s, handle %03x, last "
+                    "disconnect reason %02x %s\n", index, address,
+                l->le ? "LE" : "BR/EDR", l->outgoing ? "outgoing" : "incoming",
+                link_state_name(l->state), security_name(l->security),
+                l->handle, l->disconnect_reason,
+                btinfo_status(l->disconnect_reason));
+            hid_lines(&w, core, index);
+        }
+        if (count == 0) say(&w, "  none\n");
+    }
+    device_lines(&w, core);
+    return w.at;
+}

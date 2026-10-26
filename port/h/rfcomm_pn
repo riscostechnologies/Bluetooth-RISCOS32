@@ -1,0 +1,32 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#ifndef BTV_RFCOMM_PN_H
+#define BTV_RFCOMM_PN_H
+#include "rfcomm_mcc.h"
+enum btv_pn_state { BTV_PN_IDLE, BTV_PN_READY, BTV_PN_WAIT, BTV_PN_DONE, BTV_PN_FAILED };
+typedef struct btv_rfcomm_pn
+{
+    unsigned int state;
+    uint8_t dlci, receive_credits, transmit_credits, credit_mode;
+    int session_mode;
+    uint16_t offered_mtu, mtu;
+    uint32_t started;
+} btv_rfcomm_pn;
+/* Outgoing PN on an OPEN multiplexer. Parent reserves the DLCI and serializes
+ * first negotiation of session-wide credit mode. mode=-1 unknown, 0 disabled,
+ * 1 enabled. receive_credits is caller-backed packet capacity (0..7), not an
+ * arbitrary credit grant. MTU must already fit L2CAP and receive storage. */
+void btv_rfcomm_pn_init(btv_rfcomm_pn *pn);
+int btv_rfcomm_pn_start(btv_rfcomm_pn *pn, uint8_t dlci, uint16_t mtu,
+                        uint8_t receive_credits, int mode, uint32_t now);
+/* MCC bytes for a DLCI-0 UIH frame. sent immediately follows ordered ACL
+ * acceptance of its copied, wrapped output. No sent on backpressure. */
+size_t btv_rfcomm_pn_output(btv_rfcomm_pn *pn, uint8_t *output,
+                            size_t capacity, uint32_t now);
+int btv_rfcomm_pn_sent(btv_rfcomm_pn *pn);
+/* Input from validated MCC decoder and role-checked UIH. 1 matched/accepted,
+ * 0 unowned/stale/not waiting, -1 failed. DONE gives negotiated parameters,
+ * not an OPEN DLC. Parent performs security checks and SABM/UA establishment. */
+int btv_rfcomm_pn_receive(btv_rfcomm_pn *pn, const btv_rfcomm_mcc *mcc, uint32_t now);
+void btv_rfcomm_pn_tick(btv_rfcomm_pn *pn, uint32_t now);
+#endif

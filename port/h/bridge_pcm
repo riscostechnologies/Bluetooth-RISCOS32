@@ -1,0 +1,30 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#ifndef BTV_BRIDGE_PCM_H
+#define BTV_BRIDGE_PCM_H
+#include "bridge_voice.h"
+#include "pcm_queue.h"
+
+#define BTV_BRIDGE_PCM_STORAGE 4096u
+typedef struct btv_bridge_pcm
+{
+    btv_bridge_voice *voice;
+    btv_pcm_queue playback, capture;
+    uint8_t playback_storage[BTV_BRIDGE_PCM_STORAGE];
+    uint8_t capture_storage[BTV_BRIDGE_PCM_STORAGE];
+    uint8_t playback_packet[254], capture_packet[255], silence[254];
+    btv_sco_packet_info capture_info;
+    uint32_t next_sequence, concealed, capture_overruns;
+    uint16_t packet_bytes;
+    uint8_t playback_pending, capture_pending, capture_enabled, failed;
+} btv_bridge_pcm;
+
+int btv_bridge_pcm_init(btv_bridge_pcm *pcm, btv_bridge_voice *voice,
+                        uint16_t packet_bytes, int capture);
+int btv_bridge_pcm_pump(btv_bridge_pcm *pcm);
+size_t btv_bridge_pcm_write(btv_bridge_pcm *pcm,
+                            const void *data, size_t bytes);
+size_t btv_bridge_pcm_read(btv_bridge_pcm *pcm,
+                           void *data, size_t bytes);
+
+#endif

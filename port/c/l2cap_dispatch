@@ -1,0 +1,348 @@
+/*-
+ * Copyright (c) 2005 Iain Hibbert.
+ * Copyright (c) 2006 Itronix Inc.
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. The name of Itronix Inc. may not be used to endorse
+ *    or promote products derived from this software without specific
+ *    prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY ITRONIX INC. ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL ITRONIX INC. BE LIABLE FOR ANY
+ * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+/* Per-ACL classic signaling dispatcher. Generic responses follow the pinned
+ * NetBSD l2cap_signal.c; bounded copied buffers replace mbufs and global lists. */
+#include "l2cap_dispatch.h"
+#include <string.h>
+
+static uint16_t read16(const uint8_t *p)
+{
+    return (uint16_t)((unsigned int)p[0] | ((unsigned int)p[1] << 8));
+}
+
+static void write16(uint8_t *p, uint16_t value)
+{
+    p[0] = (uint8_t)value;
+    p[1] = (uint8_t)(value >> 8);
+}
+
+void btv_l2cap_dispatch_init(btv_l2cap_dispatch *dispatch)
+{
+    if (dispatch != NULL)
+    {
+        memset(dispatch, 0, sizeof(*dispatch));
+        dispatch->next_identifier = 1;
+    }
+}
+
+void btv_l2cap_dispatch_abort(btv_l2cap_dispatch *dispatch)
+{
+    unsigned int i;
+    if (dispatch == NULL)
+        return;
+    dispatch->failed = 1;
+    dispatch->input_bytes = dispatch->response_bytes = 0;
+    for (i = 0; i < BTV_L2CAP_CHANNELS; ++i)
+        if (dispatch->channels[i].state != BTV_CHANNEL_IDLE)
+            btv_l2cap_channel_abort(&dispatch->channels[i]);
+}
+
+const btv_l2cap_channel *btv_l2cap_dispatch_channel(const btv_l2cap_dispatch *dispatch,
+                                                  uint16_t local_cid)
+{
+    unsigned int slot;
+    if (dispatch == NULL || local_cid < 0x40)
+        return NULL;
+    slot = (unsigned int)local_cid - 0x40;
+    if (slot >= BTV_L2CAP_CHANNELS || dispatch->channels[slot].state == BTV_CHANNEL_IDLE)
+        return NULL;
+    return &dispatch->channels[slot];
+}
+
+uint16_t btv_l2cap_dispatch_connect(btv_l2cap_dispatch *dispatch,
+                                   uint16_t psm, uint16_t receive_mtu, uint32_t now)
+{
+    unsigned int i;
+    if (dispatch == NULL || dispatch->failed || dispatch->next_identifier > 254)
+        return 0;
+    for (i = 0; i < BTV_L2CAP_CHANNELS; ++i)
+        if (dispatch->channels[i].state == BTV_CHANNEL_IDLE)
+        {
+            if (!btv_l2cap_channel_connect(&dispatch->channels[i], psm,
+                (uint16_t)(0x40 + i), receive_mtu,
+                (uint8_t)dispatch->next_identifier,
+                (uint8_t)(dispatch->next_identifier + 1), now))
+                return 0;
+            dispatch->next_identifier += 2;
+            return (uint16_t)(0x40 + i);
+        }
+    return 0;
+}
+
+int btv_l2cap_dispatch_disconnect(btv_l2cap_dispatch *dispatch,
+                                 uint16_t local_cid, uint32_t now)
+{
+    unsigned int slot;
+    if (dispatch == NULL || dispatch->failed || dispatch->next_identifier > 255 ||
+        btv_l2cap_dispatch_channel(dispatch, local_cid) == NULL)
+        return 0;
+    slot = (unsigned int)local_cid - 0x40;
+    if (!btv_l2cap_channel_disconnect(&dispatch->channels[slot],
+        (uint8_t)dispatch->next_identifier, now))
+        return 0;
+    ++dispatch->next_identifier;
+    return 1;
+}
+
+static int generic_response(btv_l2cap_dispatch *dispatch, const btv_l2cap_command *cmd)
+{
+    uint8_t parameters[12];
+    const uint8_t *data;
+    size_t bytes;
+    uint8_t code;
+    uint16_t type;
+    /* Unmatched responses are discarded, never answered with another reject. */
+    if (cmd->code == 1 || cmd->code == 3 || cmd->code == 5 ||
+        cmd->code == 7 || cmd->code == 9 || cmd->code == 11)
+        return 1;
+    if (dispatch->response_bytes != 0)
+        return 2;
+    memset(parameters, 0, sizeof(parameters));
+    data = parameters;
+    code = 1;
+    bytes = 2; /* Default: Command Not Understood. */
+    if (cmd->code == 2)
+    {
+        code = 3;
+        bytes = 8;
+        write16(parameters + 2, read16(cmd->parameters + 2));
+        write16(parameters + 4, 2); /* No incoming PSM listener yet. */
+    }
+    else if (cmd->code == 4 || cmd->code == 6)
+    {
+        bytes = 6;
+        write16(parameters, 2); /* Invalid CID, wire destination then source. */
+        if (cmd->code == 6)
+        {
+            write16(parameters + 2, read16(cmd->parameters));
+            write16(parameters + 4, read16(cmd->parameters + 2));
+        }
+        else
+            write16(parameters + 4, read16(cmd->parameters));
+    }
+    else if (cmd->code == 8)
+    {
+        code = 9;
+        bytes = 0; /* NetBSD also sends an empty Echo Response. */
+    }
+    else if (cmd->code == 10)
+    {
+        code = 11;
+        type = read16(cmd->parameters);
+        write16(parameters, type);
+        bytes = 4;
+        write16(parameters + 2, 1); /* Not supported. */
+        if (type == 2)
+        {
+            bytes = 8;
+            write16(parameters + 2, 0);
+            parameters[4] = 0x80; /* Fixed Channels information supported. */
+        }
+        else if (type == 3)
+        {
+            bytes = 12;
+            write16(parameters + 2, 0);
+            parameters[4] = 2; /* Only classic signaling fixed channel. */
+        }
+    }
+    dispatch->response_bytes = btv_l2cap_signal_encode(dispatch->response,
+        sizeof(dispatch->response), code, cmd->identifier, data, bytes);
+    return dispatch->response_bytes != 0 ? 1 : -1;
+}
+
+static int route(btv_l2cap_dispatch *dispatch, const btv_l2cap_command *cmd, uint32_t now)
+{
+    unsigned int i, j;
+    btv_l2cap_channel *channel;
+    int result;
+    for (i = 0; i < BTV_L2CAP_CHANNELS; ++i)
+    {
+        channel = &dispatch->channels[i];
+        if (channel->state == BTV_CHANNEL_IDLE)
+            continue;
+        if (cmd->code == 3 && cmd->bytes == 8 &&
+            channel->state == BTV_CHANNEL_CONNECTING && channel->awaiting == 2 &&
+            cmd->identifier == channel->connect_id &&
+            read16(cmd->parameters + 2) == channel->local_cid &&
+            read16(cmd->parameters + 4) == 0 && read16(cmd->parameters) >= 0x40)
+        {
+            for (j = 0; j < BTV_L2CAP_CHANNELS; ++j)
+                if (j != i && dispatch->channels[j].state != BTV_CHANNEL_CLOSED &&
+                    dispatch->channels[j].remote_cid == read16(cmd->parameters))
+                {
+                    btv_l2cap_dispatch_abort(dispatch);
+                    return -1; /* Ambiguous remote CID requires link recovery. */
+                }
+        }
+        result = btv_l2cap_channel_receive(channel, cmd, now);
+        if (result == 2)
+            return 2;
+        if (result != 0)
+            return 1; /* A channel failure is observable through its state. */
+    }
+    return generic_response(dispatch, cmd);
+}
+
+static void pump(btv_l2cap_dispatch *dispatch, uint32_t now)
+{
+    btv_l2cap_signal iterator;
+    btv_l2cap_command command;
+    int result;
+    if (dispatch->failed || dispatch->input_bytes == 0)
+        return;
+    iterator.data = dispatch->input;
+    iterator.bytes = dispatch->input_bytes;
+    iterator.offset = dispatch->input_offset;
+    while ((result = btv_l2cap_signal_next(&iterator, &command)) == 1)
+    {
+        result = route(dispatch, &command, now);
+        if (result == 2)
+            return; /* Stored cursor still points at this unconsumed command. */
+        if (result < 0)
+        {
+            btv_l2cap_dispatch_abort(dispatch);
+            return;
+        }
+        dispatch->input_offset = iterator.offset;
+    }
+    if (result < 0)
+        btv_l2cap_dispatch_abort(dispatch);
+    else
+        dispatch->input_bytes = 0;
+}
+
+void btv_l2cap_dispatch_tick(btv_l2cap_dispatch *dispatch, uint32_t now)
+{
+    unsigned int i;
+    btv_l2cap_channel *channel;
+    if (dispatch == NULL || dispatch->failed)
+        return;
+    for (i = 0; i < BTV_L2CAP_CHANNELS; ++i)
+        btv_l2cap_channel_tick(&dispatch->channels[i], now);
+    pump(dispatch, now);
+    if (dispatch->failed)
+        return;
+    for (i = 0; i < BTV_L2CAP_CHANNELS; ++i)
+    {
+        channel = &dispatch->channels[i];
+        if (channel->retry_pending)
+        {
+            if (dispatch->next_identifier > 255)
+                btv_l2cap_channel_abort(channel);
+            else if (btv_l2cap_channel_retry(channel, (uint8_t)dispatch->next_identifier, now))
+                ++dispatch->next_identifier;
+        }
+    }
+}
+
+int btv_l2cap_dispatch_receive(btv_l2cap_dispatch *dispatch,
+                              const uint8_t *pdu, size_t bytes, uint32_t now)
+{
+    btv_l2cap_signal iterator;
+    uint8_t parameters[4];
+    int result;
+    if (dispatch == NULL || dispatch->failed)
+        return -1;
+    result = btv_l2cap_signal_open(&iterator, pdu, bytes);
+    if (result != 1)
+        return result;
+    btv_l2cap_dispatch_tick(dispatch, now);
+    if (dispatch->failed)
+        return -1;
+    if (dispatch->input_bytes != 0)
+        return 2;
+    if (bytes > sizeof(dispatch->input))
+    {
+        if (dispatch->response_bytes != 0)
+            return 2;
+        write16(parameters, 1);
+        write16(parameters + 2, BTV_L2CAP_SIGNAL_MTU);
+        dispatch->response_bytes = btv_l2cap_signal_encode(dispatch->response,
+            sizeof(dispatch->response), 1, pdu[5], parameters, 4);
+        return 1;
+    }
+    memcpy(dispatch->input, pdu, bytes);
+    dispatch->input_bytes = bytes;
+    dispatch->input_offset = 4;
+    pump(dispatch, now);
+    return dispatch->failed ? -1 : 1;
+}
+
+size_t btv_l2cap_dispatch_output(btv_l2cap_dispatch *dispatch, uint8_t *output,
+                                size_t capacity, unsigned int *token, uint32_t now)
+{
+    unsigned int n, i, kind;
+    size_t bytes;
+    if (dispatch == NULL || output == NULL || token == NULL)
+        return 0;
+    btv_l2cap_dispatch_tick(dispatch, now);
+    if (dispatch->failed)
+        return 0;
+    if (dispatch->response_bytes != 0)
+    {
+        if (capacity < dispatch->response_bytes)
+            return 0;
+        memcpy(output, dispatch->response, dispatch->response_bytes);
+        *token = 1;
+        return dispatch->response_bytes;
+    }
+    for (n = 0; n < BTV_L2CAP_CHANNELS; ++n)
+    {
+        i = (dispatch->next_channel + n) % BTV_L2CAP_CHANNELS;
+        bytes = btv_l2cap_channel_output(&dispatch->channels[i], output, capacity, &kind, now);
+        if (bytes != 0)
+        {
+            *token = 2 + 2 * i + kind - 1;
+            return bytes;
+        }
+    }
+    return 0;
+}
+
+int btv_l2cap_dispatch_sent(btv_l2cap_dispatch *dispatch, unsigned int token)
+{
+    unsigned int slot, kind;
+    if (dispatch == NULL || dispatch->failed || token == 0)
+        return 0;
+    if (token == 1)
+    {
+        if (dispatch->response_bytes == 0)
+            return 0;
+        dispatch->response_bytes = 0;
+        return 1;
+    }
+    slot = (token - 2) / 2;
+    kind = (token - 2) % 2 + 1;
+    if (slot >= BTV_L2CAP_CHANNELS || dispatch->response_bytes != 0 ||
+        !btv_l2cap_channel_sent(&dispatch->channels[slot], kind))
+        return 0;
+    dispatch->next_channel = (slot + 1) % BTV_L2CAP_CHANNELS;
+    return 1;
+}

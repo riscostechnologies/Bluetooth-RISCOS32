@@ -1,0 +1,46 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        bt_reconnect
+ * Purpose:     Automatic reconnection of the bonded devices, in the core:
+ *              as soon as the controller is ready, before the desktop
+ *              exists, and with no application involved. Low Energy input
+ *              devices first (mouse, keyboard), then classic input
+ *              devices, then speakers; one at a time (the controller
+ *              pages one at a time), each retried with growing gaps for a
+ *              couple of minutes since a device may simply be switched
+ *              off. A device already connected is left alone.
+ * Licence:     BSD-2-Clause (see LICENSE).
+ ******************************************************************/
+#ifndef BTC_RECONNECT_H
+#define BTC_RECONNECT_H
+
+#include "bt_core.h"
+
+#define BTC_RC_FIRST_MS 1000u      /* after the controller is ready */
+#define BTC_RC_ATTEMPT_MS 12000u   /* a classic attempt not answered by now failed */
+#define BTC_RC_LE_ATTEMPT_MS 7000u /* and a Low Energy one: it connects fast or not at all */
+#define BTC_RC_WINDOW_MS 300000u   /* give up on everything after this */
+#define BTC_RC_TRIES 12u
+
+enum { BTC_RC_WAITING, BTC_RC_TRYING, BTC_RC_DONE, BTC_RC_GAVE_UP,
+       BTC_RC_DROPPED };            /* the user disconnected or forgot it */
+/* After the first attempts a classic device (a speaker that was off) is
+ * paged once a minute until it answers, unless audio is playing. */
+#define BTC_RC_SLOW_MS 60000u
+
+/* The settings: "reconnect my devices at start-up" and, per device,
+ * "reconnect automatically". They outlive a core restart. */
+void btc_rc_set_enabled(int on);
+int btc_rc_enabled(void);
+void btc_rc_set_auto(const uint8_t address[6], int on);
+int btc_rc_auto(const uint8_t address[6]);
+
+/* The controller has just become ready: list the devices to bring back. */
+void btc_rc_ready(btc_core *core);
+/* From the pump while ready. */
+void btc_rc_pump(btc_core *core);
+/* The user disconnected or forgot this device: stop bringing it back. */
+void btc_rc_user_dropped(btc_core *core, const uint8_t address[6]);
+
+#endif

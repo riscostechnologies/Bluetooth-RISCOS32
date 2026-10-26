@@ -1,0 +1,112 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/* Reuses the port's SABM/UA/DISC lifecycle, projecting its virtual endpoint
+ * onto the negotiated DLCI and the actual multiplexer role. */
+#include "rfcomm_dlc.h"
+#include <string.h>
+
+void btv_rfcomm_dlc_init(btv_rfcomm_dlc *dlc)
+{
+    if (dlc != NULL)
+        memset(dlc, 0, sizeof(*dlc));
+}
+
+int btv_rfcomm_dlc_start(btv_rfcomm_dlc *dlc, const btv_rfcomm_pn *pn,
+                         int initiator, uint16_t receive_slots, uint32_t now)
+{
+    if (dlc == NULL || pn == NULL || dlc->control.state != BTV_MUX_IDLE ||
+        pn->state != BTV_PN_DONE || (initiator != 0 && initiator != 1) ||
+        pn->dlci < 2 || pn->dlci > 61 || (pn->dlci & 1) != (unsigned int)!initiator ||
+        pn->mtu < 23 || pn->mtu > 32767 || pn->credit_mode > 1 || receive_slots == 0)
+        return 0;
+    if (pn->credit_mode && !btv_rfcomm_credit_init(&dlc->credits, pn->mtu,
+        receive_slots, pn->receive_credits, pn->transmit_credits))
+        return 0;
+    dlc->dlci = pn->dlci;
+    dlc->mtu = pn->mtu;
+    dlc->credit_mode = pn->credit_mode;
+    dlc->initiator = (uint8_t)initiator;
+    /* Always outgoing: the shared handshake starts as a virtual initiator.
+     * C/R translation below preserves the actual RFCOMM multiplexer role. */
+    return btv_rfcomm_mux_start(&dlc->control, 1, now);
+}
+
+void btv_rfcomm_dlc_abort(btv_rfcomm_dlc *dlc)
+{
+    if (dlc != NULL)
+    {
+        btv_rfcomm_mux_abort(&dlc->control);
+        btv_rfcomm_credit_abort(&dlc->credits);
+    }
+}
+
+void btv_rfcomm_dlc_tick(btv_rfcomm_dlc *dlc, uint32_t now)
+{
+    if (dlc == NULL)
+        return;
+    btv_rfcomm_mux_tick(&dlc->control, now);
+    if (dlc->control.state == BTV_MUX_FAILED || dlc->control.state == BTV_MUX_CLOSED ||
+        dlc->control.state == BTV_MUX_CLOSING)
+        btv_rfcomm_credit_abort(&dlc->credits);
+}
+
+int btv_rfcomm_dlc_close(btv_rfcomm_dlc *dlc, uint32_t now)
+{
+    int result;
+    if (dlc == NULL)
+        return 0;
+    result = btv_rfcomm_mux_close(&dlc->control, now);
+    btv_rfcomm_dlc_tick(dlc, now);
+    return result;
+}
+
+size_t btv_rfcomm_dlc_output(btv_rfcomm_dlc *dlc, uint8_t *output,
+                             size_t capacity, unsigned int *token, uint32_t now)
+{
+    uint8_t virtual_packet[4];
+    unsigned int selected;
+    btv_rfcomm_frame frame;
+    if (dlc == NULL || output == NULL || token == NULL || capacity < 4)
+        return 0;
+    btv_rfcomm_dlc_tick(dlc, now);
+    if (btv_rfcomm_mux_output(&dlc->control, virtual_packet, 4, &selected, now) == 0)
+        return 0;
+    if (btv_rfcomm_frame_decode(virtual_packet, 4, 0, &frame) != 1)
+        return 0;
+    if (btv_rfcomm_frame_encode(output, capacity, dlc->dlci,
+        frame.cr ^ !dlc->initiator, frame.type, frame.pf, -1, NULL, 0) != 4)
+        return 0;
+    *token = selected;
+    return 4;
+}
+
+int btv_rfcomm_dlc_sent(btv_rfcomm_dlc *dlc, unsigned int token)
+{
+    return dlc != NULL && btv_rfcomm_mux_sent(&dlc->control, token);
+}
+
+int btv_rfcomm_dlc_receive(btv_rfcomm_dlc *dlc, const btv_rfcomm_frame *frame, uint32_t now)
+{
+    btv_rfcomm_frame translated;
+    int result;
+    if (dlc == NULL || frame == NULL)
+        return -1;
+    if (frame->dlci != dlc->dlci)
+        return 0;
+    btv_rfcomm_dlc_tick(dlc, now);
+    if (frame->type == 0xef)
+    {
+        if (dlc->control.state != BTV_MUX_OPEN || frame->cr != !dlc->initiator)
+        {
+            btv_rfcomm_dlc_abort(dlc);
+            return -1;
+        }
+        return 0; /* Data owner applies negotiated credits and copies payload. */
+    }
+    translated = *frame;
+    translated.dlci = 0;
+    translated.cr ^= !dlc->initiator;
+    result = btv_rfcomm_mux_receive(&dlc->control, &translated, now);
+    btv_rfcomm_dlc_tick(dlc, now);
+    return result;
+}

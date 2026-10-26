@@ -1,0 +1,96 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        native_usb
+ * Purpose:     Native RISC OS USBDriver discovery and stream ownership.
+ ******************************************************************/
+#ifndef BTV_NATIVE_USB_H
+#define BTV_NATIVE_USB_H
+#include <stdint.h>
+#include <usb_service.h>
+#include <host_bridge.h>
+
+#define BTV_NATIVE_USB_TICKETS 24u
+#define BTV_NATIVE_USB_LINKS 4u
+#define BTV_NATIVE_USB_TRACE 48u
+#define BTV_NATIVE_USB_TRACE_BYTES 24u
+
+/* Bring-up packet trace: the most recent transfers, oldest overwritten. */
+typedef struct btv_native_usb_trace
+{
+    uint32_t sequence;          /* 0 = unused */
+    uint16_t length;            /* full transfer length */
+    uint8_t kind;               /* 1 event in, 2 ACL in, 3 ACL out, 4 command */
+    uint8_t reserved;
+    uint8_t data[BTV_NATIVE_USB_TRACE_BYTES];
+} btv_native_usb_trace;
+
+typedef struct btv_native_usb_ticket
+{
+    uint32_t id;
+    uint32_t kind;
+    uint32_t limit;
+    uint32_t used;
+    uint32_t packets;
+    volatile uint8_t *control_status;
+    uint8_t cancelled;
+    uint8_t data[BTV_HOST_BRIDGE_IO_BYTES];
+} btv_native_usb_ticket;
+
+typedef struct btv_native_usb
+{
+    btv_usb_device device;
+    int event_handle;
+    int acl_in_handle;
+    int acl_out_handle;
+    int sco_in_handle;
+    int sco_out_handle;
+    uint32_t devicefs_handle;
+    /* USBDriver's own stream for ACL IN, from GetHandles2 R5. Bulk pipes do
+     * not repeat: a read starts only on WakeUpRX, so polling issues it. */
+    uint32_t acl_in_stream;
+    uint32_t acl_out_stream;
+    uint32_t sco_in_stream;   /* same, for the isochronous SCO input */
+    /* ACL links the controller reported open. Close disconnects each one
+     * before releasing the streams: the CSR-clone controller stops sending
+     * events for good if it is later reset with a link still up. */
+    uint16_t links[BTV_NATIVE_USB_LINKS];
+    uint8_t link_open[BTV_NATIVE_USB_LINKS];
+    uint8_t close_phase, close_link;
+    uint8_t close_command[6];
+    volatile uint8_t *close_status;
+    uint32_t close_started;
+    uint8_t close_event[260];
+    uint32_t close_event_used;
+    uint32_t close_polls;       /* calls into close since it began */
+    btv_native_usb_trace trace[BTV_NATIVE_USB_TRACE];
+    uint32_t trace_sequence;
+    uint32_t next_ticket;
+    btv_native_usb_ticket tickets[BTV_NATIVE_USB_TICKETS];
+    /* Bring-up counters: completed ACL reads/writes and bytes moved. */
+    uint32_t acl_in_count, acl_out_count, acl_in_bytes, acl_out_bytes;
+    uint8_t detected;
+    uint8_t opened;
+    uint8_t async_control;
+    uint8_t removed;
+} btv_native_usb;
+
+/* Discovery copies provider-owned data before releasing every service record.
+ * Open is transactional and retains no caller pointer. */
+int btv_native_usb_inspect(btv_native_usb *transport);
+int btv_native_usb_open(btv_native_usb *transport);
+int btv_native_usb_voice(btv_native_usb *transport, uint8_t alternate);
+int btv_native_usb_submit(btv_native_usb *transport, unsigned int kind,
+                          const uint8_t *data, uint32_t bytes,
+                          uint32_t packets, uint32_t *ticket);
+int btv_native_usb_poll(btv_native_usb *transport, uint32_t ticket,
+                        btv_host_bridge_completion *completion);
+int btv_native_usb_cancel(btv_native_usb *transport, uint32_t ticket);
+int btv_native_usb_close(btv_native_usb *transport);
+void btv_native_usb_device_dead(btv_native_usb *transport,
+                                uint32_t service, uint32_t handle,
+                                const char *name);
+void btv_native_usb_output_diag(btv_native_usb *transport, uint32_t values[6]);
+uint32_t btv_native_usb_monitor_output(btv_native_usb *transport);
+
+#endif

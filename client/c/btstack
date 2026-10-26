@@ -1,0 +1,323 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#define _POSIX_C_SOURCE 200809L
+/*******************************************************************
+ * File:        btstack
+ * Purpose:     Module loading for the Bluetooth icon bar task.
+ ******************************************************************/
+#include "btstack.h"
+#include <kernel.h>
+#include <swis.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define SWI_CORE 0x000d7bc8
+#define CORE_OFF 0
+#define MODULE_KILL 4
+#define MODULE_REINIT 3
+#define MODULE_INSERT_COPY 11
+#define MODULE_LOOKUP 18
+#define USB_VERSION_NEEDED 135
+#define VOICE_VERSION_NEEDED 92
+
+typedef struct image
+{
+    char *data;
+    int size;
+} image;
+
+static _kernel_oserror *module_call(int reason, const char *name,
+                                    int address, int size,
+                                    _kernel_swi_regs *out)
+{
+    _kernel_swi_regs regs;
+    memset(&regs, 0, sizeof(regs));
+    regs.r[0] = reason;
+    regs.r[1] = name != NULL ? (int)name : address;
+    regs.r[2] = size;
+    return _kernel_swi(OS_Module, &regs, out != NULL ? out : &regs);
+}
+
+int bt_module_version(const char *title)
+{
+    _kernel_swi_regs out;
+    const char *base, *help, *digits;
+    int whole = 0, fraction = 0, places = 0;
+    if (module_call(MODULE_LOOKUP, title, 0, 0, &out) != NULL) return -1;
+    base = (const char *)out.r[3];
+    if (base == NULL || ((const unsigned int *)base)[5] == 0) return 0;
+    help = base + ((const unsigned int *)base)[5];
+    /* "Title<tab(s)>1.35 (date)" */
+    digits = help;
+    while (*digits != '\0' && *digits != '\t') ++digits;
+    while (*digits == '\t' || *digits == ' ') ++digits;
+    while (*digits >= '0' && *digits <= '9')
+        whole = whole * 10 + (*digits++ - '0');
+    if (*digits == '.')
+    {
+        ++digits;
+        while (*digits >= '0' && *digits <= '9' && places < 2)
+        {
+            fraction = fraction * 10 + (*digits++ - '0');
+            ++places;
+        }
+        if (places == 1) fraction *= 10;
+    }
+    return whole * 100 + fraction;
+}
+
+int bt_usb_stack_ready(void)
+{
+    /* USBDriver 1.35 is only swapped in on a Raspberry Pi (DWCDriver), where
+     * the controller driver is reloaded straight after it.  Elsewhere (a
+     * Pinebook Pro's EHCI/OHCI/XHCI) the ROM's USBDriver serves A2DP and
+     * HID, and replacing it would leave those controllers unregistered. */
+    if (bt_module_version("DWCDriver") < 0) return 1;
+    return bt_module_version("USBDriver") >= USB_VERSION_NEEDED;
+}
+
+int bt_adapter_present(int *ready)
+{
+    _kernel_swi_regs regs;
+    if (ready != NULL) *ready = 0;
+    memset(&regs, 0, sizeof(regs));
+    regs.r[1] = 15;                     /* Adapter */
+    if (_kernel_swi(SWI_CORE + 7, &regs, &regs) != NULL) return -1;
+    if (ready != NULL) *ready = regs.r[2];
+    return regs.r[1] != 0;
+}
+
+static int load_image(const char *directory, const char *leaf, image *out,
+                      char *problem, int problem_size)
+{
+    char path[300];
+    _kernel_swi_regs regs;
+    snprintf(path, sizeof(path), "%s.Modules.%s", directory, leaf);
+    memset(&regs, 0, sizeof(regs));
+    regs.r[0] = 17;
+    regs.r[1] = (int)path;
+    if (_kernel_swi(OS_File, &regs, &regs) != NULL || regs.r[0] != 1)
+    {
+        snprintf(problem, (size_t)problem_size, "Cannot find %s", path);
+        return 0;
+    }
+    out->size = regs.r[4];
+    out->data = malloc((size_t)out->size);
+    if (out->data == NULL)
+    {
+        snprintf(problem, (size_t)problem_size, "No memory for %s", leaf);
+        return 0;
+    }
+    memset(&regs, 0, sizeof(regs));
+    regs.r[0] = 16;
+    regs.r[1] = (int)path;
+    regs.r[2] = (int)out->data;
+    regs.r[3] = 0;
+    if (_kernel_swi(OS_File, &regs, &regs) != NULL)
+    {
+        snprintf(problem, (size_t)problem_size, "Cannot read %s", path);
+        return 0;
+    }
+    return 1;
+}
+
+static int insert(const image *module, const char *title, char *problem,
+                  int problem_size)
+{
+    _kernel_oserror *error = module_call(MODULE_INSERT_COPY, NULL,
+                                         (int)module->data, module->size, NULL);
+    if (error == NULL) return 1;
+    snprintf(problem, (size_t)problem_size, "%s: %s", title, error->errmess);
+    return 0;
+}
+
+/* Stops the core and waits for it to let go.  A running core holds an
+ * audio device inside SoundDMA; killing the module then strands a pointer
+ * into freed workspace, which aborts inside SoundDMA and locks the
+ * machine hard (seen on the Titanium, 23 Sep 2026). */
+static void stop_core_and_wait(void)
+{
+    _kernel_swi_regs regs;
+    int start, state = 1;
+    memset(&regs, 0, sizeof(regs));
+    regs.r[1] = 1;                      /* stop */
+    if (_kernel_swi(SWI_CORE, &regs, &regs) != NULL) return;
+    memset(&regs, 0, sizeof(regs));
+    regs.r[0] = 0;
+    if (_kernel_swi(OS_ReadMonotonicTime, &regs, &regs) != NULL) return;
+    start = regs.r[0];
+    while (state != CORE_OFF)
+    {
+        memset(&regs, 0, sizeof(regs));
+        regs.r[1] = 2;                  /* read state */
+        if (_kernel_swi(SWI_CORE, &regs, &regs) != NULL) return;
+        state = regs.r[1];
+        memset(&regs, 0, sizeof(regs));
+        regs.r[0] = 0;
+        if (_kernel_swi(OS_ReadMonotonicTime, &regs, &regs) != NULL) return;
+        if (regs.r[0] - start > 500) return;    /* 5 seconds */
+    }
+}
+
+/* Brings the ROM copy back when a replacement would not start. */
+static void reinstate(const char *title)
+{
+    if (bt_module_version(title) < 0)
+        (void)module_call(MODULE_REINIT, title, 0, 0, NULL);
+}
+
+/* Host controller drivers, in the order they are restarted.  A replaced
+ * USBDriver forgets every device, so each controller driver that was
+ * running has to register again: with our own copy where the package has
+ * one (the iMX6 needs Colin Granville's EHCIDriver for isochronous SCO),
+ * otherwise by reinitialising the one already loaded (the Titanium's
+ * XHCIDriver, the Pi's DWCDriver).
+ *
+ * DWCDriver matters: the Pi 4's USB is DWC OTG, and leaving it out meant
+ * the swap killed USBDriver and then found nothing to restart, so the
+ * keyboard and mouse never came back and the machine needed the power
+ * pulled.  A controller that is not running is skipped, so naming one
+ * that a given machine does not have costs nothing. */
+static const char *const controllers[] = { "EHCIDriver", "OHCIDriver",
+                                           "XHCIDriver", "DWCDriver" };
+#define CONTROLLER_COUNT 4
+
+/* The CM4/Pi's ROM DWCDriver 0.37 loses a busy CSR adapter behind a hub:
+ * its FIQ split state machine stalls the bulk pipe, then three transaction
+ * errors fail a control transfer and USBDriver drops the device.  0.38
+ * (shipped in Modules) runs control and bulk splits on the C path instead.
+ * Swapping it re-enumerates every USB device, so only when it is older. */
+#define DWC_VERSION_WANTED 40
+static void update_dwc(const char *directory)
+{
+    image dwc = { NULL, 0 };
+    char ignored[200];
+    int version = bt_module_version("DWCDriver");
+    if (version < 0 || version >= DWC_VERSION_WANTED) return;
+    if (!load_image(directory, "DWCDriver", &dwc, ignored,
+                    (int)sizeof(ignored)))
+        return;
+    if (bt_module_version("BluetoothVoice") >= 0) stop_core_and_wait();
+    (void)module_call(MODULE_KILL, "DWCDriver", 0, 0, NULL);
+    if (!insert(&dwc, "DWCDriver", ignored, (int)sizeof(ignored)))
+        reinstate("DWCDriver");
+    free(dwc.data);
+}
+
+int bt_stack_load(const char *directory, int replace_usb, char *problem,
+                  int problem_size)
+{
+    image usb = { NULL, 0 }, voice = { NULL, 0 };
+    image controller_image[CONTROLLER_COUNT];
+    int controller_loaded[CONTROLLER_COUNT];
+    int voice_version = bt_module_version("BluetoothVoice");
+    int want_voice = voice_version < VOICE_VERSION_NEEDED;
+    int ok = 1, index, restarted = 0;
+    problem[0] = '\0';
+    update_dwc(directory);
+    /* Before 0.34, finalising a never-started module could abort. Do not
+     * attempt an in-place replacement of such a copy during desktop start. */
+    if (voice_version >= 0 && voice_version < 34)
+    {
+        snprintf(problem, (size_t)problem_size,
+                 "BluetoothVoice 0.%02d is loaded; remove its boot entry and reboot before updating.",
+                 voice_version);
+        return 0;
+    }
+    for (index = 0; index < CONTROLLER_COUNT; ++index)
+    {
+        char ignored[8];
+        controller_image[index].data = NULL;
+        controller_image[index].size = 0;
+        controller_loaded[index] = bt_module_version(controllers[index]) >= 0;
+        if (replace_usb && controller_loaded[index])
+            (void)load_image(directory, controllers[index],
+                             controller_image + index, ignored,
+                             (int)sizeof(ignored));
+    }
+    if (replace_usb &&
+        !load_image(directory, "USBDriver", &usb, problem, problem_size))
+        ok = 0;
+    if (ok && (want_voice || replace_usb) &&
+        !load_image(directory, "BTVoice", &voice, problem, problem_size))
+        ok = 0;
+    if (ok && replace_usb)
+    {
+        /* The same order the tested Obey loader used.  BluetoothVoice holds
+         * DeviceFS streams, so it goes first; it refuses while in use. */
+        if (voice_version >= 0) stop_core_and_wait();
+        if (voice_version >= 0 &&
+            module_call(MODULE_KILL, "BluetoothVoice", 0, 0, NULL) != NULL)
+        {
+            snprintf(problem, (size_t)problem_size,
+                     "BluetoothVoice is in use; disconnect the headset first.");
+            ok = 0;
+        }
+        if (ok)
+        {
+            (void)module_call(MODULE_KILL, "USBDriver", 0, 0, NULL);
+            if (!insert(&usb, "USBDriver", problem, problem_size))
+            {
+                reinstate("USBDriver");
+                ok = 0;
+            }
+        }
+        for (index = 0; ok && index < CONTROLLER_COUNT; ++index)
+        {
+            if (!controller_loaded[index]) continue;
+            if (controller_image[index].data != NULL)
+            {
+                (void)module_call(MODULE_KILL, controllers[index], 0, 0, NULL);
+                if (!insert(controller_image + index, controllers[index],
+                            problem, problem_size))
+                {
+                    reinstate(controllers[index]);
+                    ok = 0;
+                    break;
+                }
+            }
+            else
+            {
+                /* Reinitialising alone leaves the Titanium's second XHCI
+                 * controller unregistered (its keyboard and mouse never
+                 * come back); killing first makes both register again. */
+                (void)module_call(MODULE_KILL, controllers[index], 0, 0, NULL);
+                if (module_call(MODULE_REINIT, controllers[index], 0, 0,
+                                NULL) != NULL)
+                {
+                    snprintf(problem, (size_t)problem_size,
+                             "%s did not restart.", controllers[index]);
+                    ok = 0;
+                    break;
+                }
+            }
+            ++restarted;
+        }
+        if (ok && restarted == 0)
+        {
+            snprintf(problem, (size_t)problem_size,
+                     "No USB host controller driver could be restarted.");
+            ok = 0;
+        }
+        want_voice = 1;
+    }
+    if (ok && want_voice)
+    {
+        if (bt_module_version("BluetoothVoice") >= 0) stop_core_and_wait();
+        if (bt_module_version("BluetoothVoice") >= 0 &&
+            module_call(MODULE_KILL, "BluetoothVoice", 0, 0, NULL) != NULL)
+        {
+            snprintf(problem, (size_t)problem_size,
+                     "An older BluetoothVoice is in use.");
+            ok = 0;
+        }
+        else if (!insert(&voice, "BluetoothVoice", problem, problem_size))
+            ok = 0;
+    }
+    free(usb.data);
+    for (index = 0; index < CONTROLLER_COUNT; ++index)
+        free(controller_image[index].data);
+    free(voice.data);
+    return ok;
+}

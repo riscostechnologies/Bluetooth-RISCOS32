@@ -1,0 +1,106 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        le_crypto
+ * Purpose:     Bluetooth LE Security Manager crypto toolbox.
+ * Reference:   Bluetooth Core Spec Vol 3 Part H 2.2 (legacy c1, s1, ah and
+ *              LE Secure Connections f4, f5, f6, g2, h6); FIPS-197;
+ *              RFC 4493 (AES-CMAC).
+ ******************************************************************/
+#ifndef BTV_LE_CRYPTO_H
+#define BTV_LE_CRYPTO_H
+
+#include <stdint.h>
+
+/* Byte order.
+ *
+ * The spec defines every toolbox function on MSB-first values (the first
+ * octet written is the most significant), which is also the standard AES
+ * byte order. SMP PDUs and HCI carry the same values LSB-first. Apart from
+ * btv_aes128_encrypt and btv_aes_cmac, which use standard AES order, EVERY
+ * array below is LSB-first: it can be copied straight out of or into an SMP
+ * PDU or an HCI parameter (e.g. HCI_LE_Encrypt's result needs no swapping
+ * before it is used as an LTK in HCI_LE_Enable_Encryption).
+ * Addresses are 6 octets LSB-first as in HCI; address types are 0 public,
+ * 1 random. Output buffers may alias input buffers only where noted.
+ *
+ * None of these functions allocate, use floating point, division, or any
+ * library routine other than memset/memcpy. Largest local array is 80
+ * octets; worst-case call chain stays well under 512 octets of stack. */
+
+/* AES-128 single-block encrypt. key/in/out in FIPS-197 order.
+ * out may alias in. */
+void btv_aes128_encrypt(const uint8_t key[16], const uint8_t in[16],
+                        uint8_t out[16]);
+
+/* AES-CMAC (RFC 4493), 128-bit tag. key/message/out in standard AES
+ * order (MSB-first), message of any length. */
+void btv_aes_cmac(const uint8_t key[16], const uint8_t *message,
+                  unsigned int length, uint8_t out[16]);
+
+/* Legacy pairing confirm c1 (2.2.3). All LSB-first:
+ *   k = TK, r = Mrand/Srand as in the Pairing Random PDU,
+ *   preq/pres = the 7 octets of the Pairing Request/Response PDUs in PDU
+ *   order, starting with the code octet (0x01 / 0x02),
+ *   iat/rat = initiator/responder address type, ia/ra = addresses.
+ * out = confirm value as carried in the Pairing Confirm PDU. */
+void btv_smp_c1(const uint8_t k[16], const uint8_t r[16],
+                const uint8_t preq[7], const uint8_t pres[7],
+                uint8_t iat, const uint8_t ia[6],
+                uint8_t rat, const uint8_t ra[6], uint8_t out[16]);
+
+/* Legacy key generation s1 (2.2.4). All LSB-first: k = TK; out is usable
+ * directly as the HCI LTK. The STK is s1(TK, Srand, Mrand): r1 is the
+ * RESPONDER's random, r2 the initiator's (2.2.5). */
+void btv_smp_s1(const uint8_t k[16], const uint8_t r1[16],
+                const uint8_t r2[16], uint8_t out[16]);
+
+/* Random address hash ah (2.2.2). irk 16 octets LSB-first (as in the
+ * Identity Information PDU); r = prand, the 3 most significant octets of
+ * the resolvable private address as they appear in HCI order, i.e.
+ * address[3..5]; out = 3-octet hash LSB-first, compare with address[0..2]. */
+void btv_smp_ah(const uint8_t irk[16], const uint8_t r[3], uint8_t out[3]);
+
+/* LE Secure Connections confirm f4 (2.2.6). u, v = 32-octet public key
+ * X coordinates LSB-first (as in the Pairing Public Key PDU), x = 16-octet
+ * nonce LSB-first, z = 0 for numeric comparison / OOB, 0x80|bit for
+ * passkey entry. out = confirm value LSB-first. */
+void btv_smp_f4(const uint8_t u[32], const uint8_t v[32],
+                const uint8_t x[16], uint8_t z, uint8_t out[16]);
+
+/* LE Secure Connections key generation f5 (2.2.7). w = 32-octet DHKey
+ * LSB-first (as returned by HCI_LE_Generate_DHKey_Complete), n1/n2 = nonces
+ * LSB-first, a1t/a1 and a2t/a2 = initiator/responder address type and
+ * address. mackey and ltk are LSB-first outputs; they must not alias
+ * any input. */
+void btv_smp_f5(const uint8_t w[32], const uint8_t n1[16],
+                const uint8_t n2[16], uint8_t a1t, const uint8_t a1[6],
+                uint8_t a2t, const uint8_t a2[6],
+                uint8_t mackey[16], uint8_t ltk[16]);
+
+/* LE Secure Connections check value f6 (2.2.8). All 16-octet values
+ * LSB-first. iocap = 3 octets in Pairing Request/Response PDU order:
+ * iocap[0] = IO Capability, iocap[1] = OOB data flag, iocap[2] = AuthReq
+ * (so a PDU pointer + 1 can be passed; the spec's MSB-first value is
+ * AuthReq || OOB || IOcap). out = DHKey check value LSB-first. */
+void btv_smp_f6(const uint8_t w[16], const uint8_t n1[16],
+                const uint8_t n2[16], const uint8_t r[16],
+                const uint8_t iocap[3], uint8_t a1t, const uint8_t a1[6],
+                uint8_t a2t, const uint8_t a2[6], uint8_t out[16]);
+
+/* LE Secure Connections numeric comparison g2 (2.2.9). u, v 32 octets
+ * and x, y 16 octets, LSB-first. Returns the full 32-bit value; the
+ * displayed six digits are btv_smp_g2_digits() of it. */
+uint32_t btv_smp_g2(const uint8_t u[32], const uint8_t v[32],
+                    const uint8_t x[16], const uint8_t y[16]);
+
+/* value mod 1000000 without a division helper. */
+uint32_t btv_smp_g2_digits(uint32_t value);
+
+/* Link key conversion h6 (2.2.10). w = 16-octet key LSB-first,
+ * key_id = 4 octets LSB-first (e.g. "lebr" is 0x6c656272, passed as
+ * 72 62 65 6c). out LSB-first. */
+void btv_smp_h6(const uint8_t w[16], const uint8_t key_id[4],
+                uint8_t out[16]);
+
+#endif

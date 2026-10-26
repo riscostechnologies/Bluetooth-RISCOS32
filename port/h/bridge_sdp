@@ -1,0 +1,30 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#ifndef BTV_BRIDGE_SDP_H
+#define BTV_BRIDGE_SDP_H
+#include "bridge_acl.h"
+#include "l2cap_dispatch.h"
+#include "sdp_session.h"
+
+#define BTV_BRIDGE_SDP_STORAGE 1024u
+enum btv_bridge_sdp_state
+{
+    BTV_BS_IDLE, BTV_BS_RUNNING, BTV_BS_DONE, BTV_BS_FAILED
+};
+typedef struct btv_bridge_sdp
+{
+    btv_bridge_acl *acl;
+    btv_l2cap_dispatch dispatch;
+    btv_sdp_session session;
+    uint8_t storage[BTV_BRIDGE_SDP_STORAGE];
+    uint8_t output[BTV_L2CAP_SIGNAL_MTU + 4];
+    unsigned int output_owner, output_token, state, error;
+} btv_bridge_sdp;
+
+int btv_bridge_sdp_start(btv_bridge_sdp *discovery, btv_bridge_acl *acl,
+                         uint16_t service, uint32_t now);
+int btv_bridge_sdp_pump(btv_bridge_sdp *discovery, uint32_t now);
+const btv_sdp_service *btv_bridge_sdp_result(
+                         const btv_bridge_sdp *discovery);
+
+#endif

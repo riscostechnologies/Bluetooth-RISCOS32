@@ -1,0 +1,35 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#ifndef BTV_ACL_RECEIVE_H
+#define BTV_ACL_RECEIVE_H
+#include <stddef.h>
+#include <stdint.h>
+typedef struct btv_acl_receive
+{
+    uint8_t *storage;
+    size_t capacity, used, expected;
+    uint16_t handle;
+    uint32_t dropped;
+} btv_acl_receive;
+enum btv_acl_result
+{
+    BTV_ACL_INVALID = -1, BTV_ACL_OTHER_LINK = -2, BTV_ACL_BUSY = -3,
+    BTV_ACL_MORE = 0, BTV_ACL_COMPLETE = 1
+};
+/* One instance per established classic ACL connection, with caller-owned
+ * storage. Serialized deferred context, no allocations. Capacity includes
+ * the four-byte L2CAP header. The link owner validates the assigned handle.
+ * A reused controller handle needs a fresh instance after old traffic drains. */
+int btv_acl_receive_init(btv_acl_receive *rx, uint16_t handle, uint8_t *storage, size_t capacity);
+/* Supply a complete USB HCI ACL packet without H4 prefix, not USB fragments.
+ * Input must not overlap storage. Implements the pinned NetBSD classic receive
+ * START(2)/FRAGMENT(1) flags, point-to-point only. OTHER_LINK and BUSY consume
+ * nothing and preserve state. BUSY requires retaining/retrying the input.
+ * A new START replaces incomplete data. Invalid data for this link discards
+ * its partial PDU; continuation cannot recover until a valid START arrives.
+ * A header too short to identify a link leaves its state unchanged. */
+int btv_acl_receive_feed(btv_acl_receive *rx, const uint8_t *packet, size_t bytes);
+const uint8_t *btv_acl_receive_packet(const btv_acl_receive *rx, size_t *bytes);
+int btv_acl_receive_take(btv_acl_receive *rx);
+void btv_acl_receive_loss(btv_acl_receive *rx);
+#endif

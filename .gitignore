@@ -1,0 +1,4 @@
+build/
+*.err
+__pycache__/
+desktop/modules/*,ffa

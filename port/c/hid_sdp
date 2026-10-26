@@ -1,0 +1,112 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        hid_sdp
+ * Purpose:     See hid_sdp.h.
+ * Licence:     BSD-2-Clause (see LICENSE).
+ ******************************************************************/
+#include "hid_sdp.h"
+#include "sdp_data.h"
+#include <string.h>
+
+static uint32_t uint_value(const btv_sdp_element *e)
+{
+    uint32_t v = 0;
+    size_t i;
+    for (i = 0; i < e->bytes && i < 4; ++i) v = (v << 8) | e->data[i];
+    return v;
+}
+
+/* HIDDescriptorList: a sequence of sequences { type, string }. */
+static void descriptors(const btv_sdp_element *list, btv_hid_sdp_info *info)
+{
+    size_t off = 0;
+    while (off < list->bytes && info->descriptor == 0)
+    {
+        btv_sdp_element entry, type, text;
+        size_t inner;
+        if (!btv_sdp_element_read(list->data + off, list->bytes - off, &entry))
+            return;
+        off += entry.total;
+        if ((entry.descriptor & 0xf8u) != 0x30u) continue;
+        if (!btv_sdp_element_read(entry.data, entry.bytes, &type)) continue;
+        inner = type.total;
+        if (inner >= entry.bytes ||
+            !btv_sdp_element_read(entry.data + inner, entry.bytes - inner, &text))
+            continue;
+        /* ClassDescriptorType 0x22: the report descriptor; the other kind
+         * (0x23, physical) is of no use. */
+        if ((type.descriptor & 0xf8u) == 0x08u && uint_value(&type) == 0x22u &&
+            (text.descriptor & 0xf8u) == 0x20u && text.bytes != 0)
+        {
+            info->descriptor = text.data;
+            info->descriptor_bytes = text.bytes;
+        }
+    }
+}
+
+static void one_record(const btv_sdp_element *record, btv_hid_sdp_info *info)
+{
+    size_t off = 0;
+    while (off < record->bytes)
+    {
+        btv_sdp_element id, value;
+        uint16_t attribute;
+        if (!btv_sdp_element_read(record->data + off, record->bytes - off, &id))
+            return;
+        off += id.total;
+        if (off >= record->bytes ||
+            !btv_sdp_element_read(record->data + off, record->bytes - off, &value))
+            return;
+        off += value.total;
+        attribute = (uint16_t)uint_value(&id);
+        switch (attribute)
+        {
+        case BTV_HIDSDP_DESCRIPTORS:
+            if ((value.descriptor & 0xf8u) == 0x30u) descriptors(&value, info);
+            break;
+        case BTV_HIDSDP_BOOT:
+            info->boot_known = 1;
+            info->boot_device = uint_value(&value) != 0;
+            break;
+        case BTV_HIDSDP_SUBCLASS:
+            info->subclass_known = 1;
+            info->subclass = (uint8_t)uint_value(&value);
+            break;
+        case BTV_HIDSDP_RECONNECT:
+            info->reconnect_known = 1;
+            info->reconnect_initiate = uint_value(&value) != 0;
+            break;
+        default:
+            break;
+        }
+    }
+}
+
+int btv_hid_sdp_parse(const uint8_t *result, size_t bytes,
+                      btv_hid_sdp_info *info)
+{
+    btv_sdp_element all;
+    size_t off = 0;
+    memset(info, 0, sizeof *info);
+    if (!btv_sdp_data_valid(result, bytes)) return -1;
+    if (!btv_sdp_element_read(result, bytes, &all) ||
+        (all.descriptor & 0xf8u) != 0x30u)
+        return -1;
+    while (off < all.bytes)
+    {
+        btv_sdp_element record;
+        btv_hid_sdp_info one;
+        if (!btv_sdp_element_read(all.data + off, all.bytes - off, &record))
+            return -1;
+        off += record.total;
+        memset(&one, 0, sizeof one);
+        one_record(&record, &one);
+        if (one.descriptor != 0)
+        {
+            *info = one;
+            return 1;
+        }
+    }
+    return 0;
+}

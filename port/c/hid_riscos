@@ -1,0 +1,318 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        hid_riscos
+ * Purpose:     hid_input sinks that call KeyV and PointerV, keyboard
+ *              announcement and the LED/EnableDrivers KeyV claim.
+ *
+ * Behaviour follows RISC OS 5 USBDriver build/c/usbkboard and
+ * build/c/usbmouse (Copyright 2003 Tematic Ltd, Apache License 2.0,
+ * http://www.apache.org/licenses/LICENSE-2.0).  KeyV and PointerV are
+ * called with IRQs disabled, as the kernel calls them.
+ *
+ * The 64-bit build: the KeyV claimant is btm_keyv_entry (s/boundaries),
+ * whose two arms below count NotifyLEDState and EnableDrivers in the block
+ * it was claimed with; the vectors are called through the tree's wrappers.
+ ******************************************************************/
+#include "hid_riscos.h"
+#include <stddef.h>
+#include <string.h>
+
+#include "riscos/deskswi.h"
+#include "riscos/irqs.h"
+#include "riscos/kernelops.h"
+#include "riscos/keyboard.h"
+#include "riscos/pointer.h"
+#include "riscos/pointervops.h"
+#include "riscos/swi.h"
+
+#include "bt_veneers.h"
+
+#define KEYBOARD_ID_PC 2u
+#define MAGIC_NO_DEBOUNCE 0x4e6f4b64u /* "NoKd" */
+#define POINTER_DEVICE_USB 7u
+
+__attribute__((visibility("hidden"))) extern void btm_keyv_entry(void);
+
+/* KeyV, claimed with the btv_hid_riscos block: entered with IRQs off. */
+const struct os_error *btm_keyv_leds(uint32_t flags, void *pw,
+                                     uint32_t *answered)
+{
+    btv_hid_riscos *r = pw;
+    r->led_flags = flags;
+    ++r->led_count;
+    *answered = 0;
+    return NULL;
+}
+
+const struct os_error *btm_keyv_enable(void *pw, uint32_t *answered)
+{
+    btv_hid_riscos *r = pw;
+    ++r->enable_count;
+    *answered = 0;
+    return NULL;
+}
+
+const struct os_error *btm_keyv_other(void *pw, uint32_t *answered)
+{
+    (void)pw;
+    *answered = 0;
+    return NULL;
+}
+
+static void keyv(uint32_t reason, uint32_t a, uint32_t b)
+{
+    uint32_t state = os_irqs_off();
+    (void)os_call_a_vector_3(KEYV, reason, a, b);
+    os_irqs_restore(state);
+}
+
+static int keyv_claim(btv_hid_riscos *r, int claim)
+{
+    if (claim)
+        return os_claim(KEYV, (void *)btm_keyv_entry, r) == NULL;
+    return os_release(KEYV, (void *)btm_keyv_entry, r) == NULL;
+}
+
+static void keyboard_key(void *context, int down, unsigned int key)
+{
+    (void)context;
+    keyv(down ? KeyV_KeyDown : KeyV_KeyUp, key, 0);
+}
+
+/* usbmouse only passes button changes while its device is selected;
+ * releases always go through here so a button can never stick. */
+static void mouse_key(void *context, int down, unsigned int key)
+{
+    btv_hid_riscos *r = context;
+    if (down && !r->pointer_selected)
+    {
+        ++r->presses_dropped;
+        return;
+    }
+    keyv(down ? KeyV_KeyDown : KeyV_KeyUp, key, 0);
+}
+
+static void mouse_pointer(void *context, int dx, int dy)
+{
+    btv_hid_riscos *r = context;
+    uint32_t state;
+    if (!r->pointer_selected)
+    {
+        ++r->moves_dropped;
+        return;
+    }
+    state = os_irqs_off();
+    (void)pointer_v_report(POINTER_DEVICE_USB, dx, dy, 0);
+    os_irqs_restore(state);
+}
+
+/* Y scroll (negative up/away), the extra buttons, X scroll. */
+static void mouse_wheel(void *context, int dz, int dw, unsigned int extra)
+{
+    const btv_hid_riscos *r = context;
+    uint32_t state;
+    if (!r->pointer_selected) return;
+    state = os_irqs_off();
+    (void)pointer_v_wheel_change(dz, extra, dw);
+    os_irqs_restore(state);
+}
+
+static void keyboard_sink(btv_hid_riscos *r, btv_hid_sink *sink)
+{
+    sink->context = r;
+    sink->key = keyboard_key;
+    sink->pointer = NULL;
+    sink->wheel = NULL;
+    sink->launch = NULL;
+}
+
+static void mouse_launch(void *context, unsigned int button)
+{
+    btv_hid_riscos *r = context;
+    if (r->launch_in - r->launch_out < sizeof r->launches)
+        r->launches[r->launch_in++ % sizeof r->launches] = (uint8_t)button;
+}
+
+void btv_hid_riscos_set_mapped_buttons(btv_hid_riscos *r, uint32_t mask)
+{
+    r->mapped_buttons = mask;
+}
+
+void btv_hid_riscos_options_changed(btv_hid_riscos *r)
+{
+    ++r->options_epoch;
+}
+
+unsigned int btv_hid_riscos_next_launch(btv_hid_riscos *r)
+{
+    if (r->launch_out == r->launch_in) return 0;
+    return r->launches[r->launch_out++ % sizeof r->launches];
+}
+
+static void mouse_sink(btv_hid_riscos *r, btv_hid_sink *sink)
+{
+    sink->launch = mouse_launch;
+    sink->context = r;
+    sink->key = mouse_key;
+    sink->pointer = mouse_pointer;
+    sink->wheel = mouse_wheel;
+}
+
+void btv_hid_riscos_init(btv_hid_riscos *r)
+{
+    memset(r, 0, sizeof(*r));
+}
+
+int btv_hid_riscos_keyboard_attach(btv_hid_riscos *r)
+{
+    if (r->keyboards == 0 && !keyv_claim(r, 1)) return 0;
+    ++r->keyboards;
+    keyv(KeyV_KeyboardPresent, KEYBOARD_ID_PC, MAGIC_NO_DEBOUNCE);
+    return 1;
+}
+
+static void drop_keyboard(btv_hid_riscos *r);
+
+void btv_hid_riscos_keyboard_detach(btv_hid_riscos *r, btv_hid_keyboard *k)
+{
+    btv_hid_sink sink;
+    keyboard_sink(r, &sink);
+    btv_hid_keyboard_release_all(k, &sink);
+    drop_keyboard(r);
+}
+
+static void drop_keyboard(btv_hid_riscos *r)
+{
+    if (r->keyboards == 0) return;
+    if (--r->keyboards != 0) return;
+    (void)keyv_claim(r, 0);
+    /* Tells e.g. PandoraKey there is (probably) no PC keyboard now. */
+    keyv(KeyV_KeyboardRemoved, KEYBOARD_ID_PC, 0);
+}
+
+void btv_hid_riscos_keyboard_report(btv_hid_riscos *r, btv_hid_keyboard *k,
+                                    const uint8_t *report, size_t bytes)
+{
+    btv_hid_sink sink;
+    keyboard_sink(r, &sink);
+    btv_hid_keyboard_report(k, report, bytes, &sink);
+}
+
+unsigned int btv_hid_riscos_poll(btv_hid_riscos *r, uint32_t *led_flags)
+{
+    unsigned int events = 0;
+    /* Read the count before the flags: a newer write in between only
+     * makes the next poll send the same flags again. */
+    uint32_t count = r->led_count;
+    if (led_flags != NULL) *led_flags = r->led_flags;
+    if (count != r->led_seen)
+    {
+        r->led_seen = count;
+        events |= BTV_HID_RISCOS_LEDS;
+    }
+    count = r->enable_count;
+    if (count != r->enable_seen)
+    {
+        r->enable_seen = count;
+        events |= BTV_HID_RISCOS_RESET;
+    }
+    return events;
+}
+
+void btv_hid_riscos_mouse_attach(btv_hid_riscos *r)
+{
+    (void)os_pointer_set_type(POINTER_DEVICE_USB);
+    r->pointer_selected = 1;
+}
+
+void btv_hid_riscos_mouse_detach(btv_hid_riscos *r, btv_hid_mouse *m)
+{
+    btv_hid_sink sink;
+    mouse_sink(r, &sink);
+    btv_hid_mouse_release_all(m, &sink);
+}
+
+void btv_hid_riscos_mouse_report(btv_hid_riscos *r, btv_hid_mouse *m,
+                                 const uint8_t *report, size_t bytes)
+{
+    btv_hid_sink sink;
+    uint32_t type = 0;
+    r->pointer_selected = os_pointer_get_type(&type) == NULL &&
+                          type == POINTER_DEVICE_USB;
+    r->pointer_type = type;
+    mouse_sink(r, &sink);
+    btv_hid_mouse_report(m, report, bytes, &sink);
+}
+
+/* A number from an OS variable, or `fallback`. */
+static int32_t variable_number(const char *name, int32_t fallback)
+{
+    char buf[16];
+    uint32_t len = sizeof buf - 1, i;
+    int32_t v = 0;
+    if (kernel_read_var_val(name, buf, &len) != NULL || len == 0 ||
+        len >= sizeof buf)
+        return fallback;
+    for (i = 0; i < len && buf[i] >= '0' && buf[i] <= '9'; ++i)
+        v = v * 10 + (buf[i] - '0');
+    return i == 0 ? fallback : v;
+}
+
+/* The feel of a report-mode mouse is set with system variables, read when
+ * its first report arrives: Bluetooth$MouseScale (percent, 100),
+ * Bluetooth$MouseAccel (1), Bluetooth$MouseNatural (0),
+ * Bluetooth$MouseHScroll (1), Bluetooth$WheelUnit (counts to a notch, 1).
+ * The speed from Configure > Mouse is applied by the kernel to all mice. */
+#define MOUSE_OPTIONS_LOADED 0x80u
+
+static void load_options(btv_hid_riscos *r, btv_hid_mouse *m)
+{
+    m->flags |= MOUSE_OPTIONS_LOADED;
+    m->options_epoch = r->options_epoch;
+    m->opt.scale_q8 = variable_number("Bluetooth$MouseScale", 100) * 256 / 100;
+    if (m->opt.scale_q8 < 16) m->opt.scale_q8 = 16;
+    m->opt.accel = variable_number("Bluetooth$MouseAccel", 1) != 0;
+    m->opt.natural = variable_number("Bluetooth$MouseNatural", 0) != 0;
+    m->opt.hscroll = variable_number("Bluetooth$MouseHScroll", 1) != 0;
+    m->opt.wheel_unit = variable_number("Bluetooth$WheelUnit", 1);
+    if (m->opt.wheel_unit < 1) m->opt.wheel_unit = 1;
+}
+
+void btv_hid_riscos_mouse_event(btv_hid_riscos *r, btv_hid_mouse *m,
+                                uint32_t buttons, int32_t dx, int32_t dy,
+                                int32_t wheel, int32_t pan)
+{
+    btv_hid_sink sink;
+    uint32_t type = 0;
+    if (!(m->flags & MOUSE_OPTIONS_LOADED) ||
+        m->options_epoch != r->options_epoch)
+        load_options(r, m);
+    m->opt.mapped = r->mapped_buttons;
+    r->pointer_selected = os_pointer_get_type(&type) == NULL &&
+                          type == POINTER_DEVICE_USB;
+    r->pointer_type = type;
+    mouse_sink(r, &sink);
+    btv_hid_mouse_event(m, buttons, dx, dy, wheel, pan, &sink);
+}
+
+void btv_hid_riscos_pad_event(btv_hid_riscos *r, btv_hid_pad *pad,
+                              const btv_hid_extra_event *e)
+{
+    btv_hid_sink sink;
+    keyboard_sink(r, &sink);
+    btv_hid_pad_event(pad, e, &sink);
+}
+
+void btv_hid_riscos_pad_detach(btv_hid_riscos *r, btv_hid_pad *pad)
+{
+    btv_hid_sink sink;
+    keyboard_sink(r, &sink);
+    btv_hid_pad_release_all(pad, &sink);
+    drop_keyboard(r);
+}
+
+int btv_hid_riscos_prefer_boot(void)
+{
+    return variable_number("Bluetooth$HIDBoot", 0) == 1;
+}

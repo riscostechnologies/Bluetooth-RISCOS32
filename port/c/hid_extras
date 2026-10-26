@@ -1,0 +1,392 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        hid_extras
+ * Purpose:     See hid_extras.h.
+ * Licence:     BSD-2-Clause (see LICENSE).
+ ******************************************************************/
+#include "hid_extras.h"
+#include <string.h>
+
+#define TYPE_MAIN 0
+#define TYPE_GLOBAL 1
+#define TYPE_LOCAL 2
+#define MAIN_INPUT 0x8
+#define MAIN_COLLECTION 0xa
+#define MAIN_END 0xc
+#define GLOBAL_PAGE 0x0
+#define GLOBAL_MIN 0x1
+#define GLOBAL_MAX 0x2
+#define GLOBAL_SIZE 0x7
+#define GLOBAL_ID 0x8
+#define GLOBAL_COUNT 0x9
+#define GLOBAL_PUSH 0xa
+#define GLOBAL_POP 0xb
+#define LOCAL_USAGE 0x0
+#define LOCAL_MIN 0x1
+#define LOCAL_MAX 0x2
+
+#define PAGE_DESKTOP 0x01
+#define PAGE_BUTTON 0x09
+#define PAGE_CONSUMER 0x0c
+#define APP_JOYSTICK 4
+#define APP_GAMEPAD 5
+#define APP_MULTIAXIS 8
+#define APP_CONSUMER 0x100           /* 0x0C page, usage 1 */
+
+void btv_hid_extras_init(btv_hid_extras *x, btv_hid_extras_parser *p)
+{
+    memset(x, 0, sizeof *x);
+    memset(p, 0, sizeof *p);
+}
+
+static int32_t value_of(const uint8_t *data, unsigned int size, int is_signed)
+{
+    uint32_t v = 0;
+    unsigned int i;
+    for (i = 0; i < size; ++i) v |= (uint32_t)data[i] << (8u * i);
+    if (is_signed && size > 0 && size < 4 &&
+        (v & (1u << (8u * size - 1u))) != 0)
+        v |= ~0u << (8u * size);
+    return (int32_t)v;
+}
+
+static uint16_t *bits_for(btv_hid_extras_parser *p, uint8_t id)
+{
+    unsigned int i;
+    for (i = 0; i < p->id_slots; ++i)
+        if (p->id_list[i] == id) return &p->id_bits[i];
+    if (p->id_slots >= 8) return 0;
+    p->id_list[p->id_slots] = id;
+    p->id_bits[p->id_slots] = 0;
+    return &p->id_bits[p->id_slots++];
+}
+
+static uint32_t usage_of(const btv_hid_extras_parser *p, unsigned int element)
+{
+    uint32_t u = 0;
+    if (p->usage_count > 0)
+        u = p->usages[element < p->usage_count ? element : p->usage_count - 1u];
+    else if (p->have_range)
+    {
+        u = p->range_min + element;
+        if (u > p->range_max) u = p->range_max;
+    }
+    return (u >> 16) != 0 ? u : (((uint32_t)p->page << 16) | (u & 0xffffu));
+}
+
+static btv_x_consumer *consumer_slot(btv_hid_extras *x, uint8_t id)
+{
+    unsigned int i;
+    for (i = 0; i < x->consumer_used; ++i)
+        if (x->consumer[i].id == id && x->consumer[i].kind != BTV_XC_NONE)
+            return 0;                       /* one input per report ID */
+    if (x->consumer_used >= 2) return 0;
+    return &x->consumer[x->consumer_used++];
+}
+
+static void axis_set(btv_x_axis *a, uint16_t offset, uint16_t size,
+                     int32_t minimum, int32_t maximum)
+{
+    if (a->used || size == 0 || size > 32) return;
+    a->used = 1;
+    a->offset = offset;
+    a->size = (uint8_t)size;
+    a->minimum = minimum;
+    a->maximum = maximum;
+}
+
+static void input_item(btv_hid_extras *x, btv_hid_extras_parser *p,
+                       uint32_t flags)
+{
+    uint16_t *bits = bits_for(p, p->report_id);
+    unsigned int size = p->size, count = p->count, e;
+    uint16_t base;
+    if (bits == 0) return;
+    base = *bits;
+    *bits = (uint16_t)(base + size * count);
+    if (flags & 1u) return;                       /* constant */
+    if (p->application == APP_CONSUMER || p->page == PAGE_CONSUMER)
+    {
+        btv_x_consumer *c;
+        if (!(flags & 2u))                        /* an array of usages */
+        {
+            if (size == 0 || size > 16) return;
+            c = consumer_slot(x, p->report_id);
+            if (c == 0) return;
+            c->id = p->report_id;
+            c->kind = BTV_XC_ARRAY;
+            c->size = (uint8_t)size;
+            c->count = (uint8_t)(count > BTV_XCONSUMER_MAX ? BTV_XCONSUMER_MAX : count);
+            c->offset = base;
+            return;
+        }
+        if (size == 1 && count <= BTV_XCONSUMER_BITS)   /* one bit per usage */
+        {
+            c = consumer_slot(x, p->report_id);
+            if (c == 0) return;
+            c->id = p->report_id;
+            c->kind = BTV_XC_BITS;
+            c->size = 1;
+            c->count = (uint8_t)count;
+            c->offset = base;
+            for (e = 0; e < count; ++e)
+                c->usage[e] = (uint16_t)usage_of(p, e);
+        }
+        return;
+    }
+    if (p->application != APP_JOYSTICK && p->application != APP_GAMEPAD &&
+        p->application != APP_MULTIAXIS)
+        return;
+    if (!(flags & 2u)) return;                    /* variable items only */
+    if (x->pad_used && x->pad_id != p->report_id) return;
+    for (e = 0; e < count; ++e)
+    {
+        uint32_t u = usage_of(p, e);
+        uint16_t page = (uint16_t)(u >> 16), id = (uint16_t)u;
+        uint16_t offset = (uint16_t)(base + e * size);
+        if (page == PAGE_BUTTON && size == 1 && id >= 1)
+        {
+            if (x->pad_buttons == 0)
+                x->pad_button_offset = (uint16_t)(offset - (id - 1u));
+            if (id <= 32 && x->pad_buttons < id) x->pad_buttons = (uint8_t)id;
+            x->pad_used = 1; x->pad_id = p->report_id;
+        }
+        else if (page == PAGE_DESKTOP && id >= 0x30 && id <= 0x35)
+        {
+            axis_set(&x->axis[id - 0x30], offset, (uint16_t)size, p->minimum,
+                     p->maximum);
+            x->pad_used = 1; x->pad_id = p->report_id;
+        }
+        else if (page == PAGE_DESKTOP && id == 0x39)
+        {
+            axis_set(&x->hat, offset, (uint16_t)size, p->minimum, p->maximum);
+            x->pad_used = 1; x->pad_id = p->report_id;
+        }
+    }
+    x->pad_application = (uint8_t)p->application;
+}
+
+static void process_item(btv_hid_extras *x, btv_hid_extras_parser *p,
+                         uint8_t prefix, const uint8_t *data, unsigned int size)
+{
+    unsigned int type = (prefix >> 2) & 3u, tag = prefix >> 4;
+    if (type == TYPE_MAIN)
+    {
+        uint32_t flags = (uint32_t)value_of(data, size, 0);
+        if (tag == MAIN_INPUT) input_item(x, p, flags);
+        else if (tag == MAIN_COLLECTION)
+        {
+            if (p->collection_depth == 0)
+            {
+                /* The application collection: its usage says what the
+                 * device is. */
+                uint32_t u = usage_of(p, 0);
+                p->application = (u >> 16) == PAGE_DESKTOP ?
+                                 (uint16_t)(u & 0xffu) :
+                                 (u >> 16) == PAGE_CONSUMER ? APP_CONSUMER : 0;
+            }
+            ++p->collection_depth;
+        }
+        else if (tag == MAIN_END && p->collection_depth > 0)
+            --p->collection_depth;
+        p->usage_count = 0;
+        p->have_range = 0;
+    }
+    else if (type == TYPE_GLOBAL)
+    {
+        switch (tag)
+        {
+        case GLOBAL_PAGE: p->page = (uint16_t)value_of(data, size, 0); break;
+        case GLOBAL_MIN: p->minimum = value_of(data, size, 1); break;
+        case GLOBAL_MAX: p->maximum = value_of(data, size, 1); break;
+        case GLOBAL_SIZE: p->size = (uint16_t)value_of(data, size, 0); break;
+        case GLOBAL_ID: p->report_id = (uint8_t)value_of(data, size, 0); break;
+        case GLOBAL_COUNT: p->count = (uint16_t)value_of(data, size, 0); break;
+        case GLOBAL_PUSH:
+            if (p->depth < 2u)
+            {
+                p->stack[p->depth].page = p->page;
+                p->stack[p->depth].size = p->size;
+                p->stack[p->depth].count = p->count;
+                p->stack[p->depth].minimum = p->minimum;
+                p->stack[p->depth].maximum = p->maximum;
+                p->stack[p->depth].report_id = p->report_id;
+                ++p->depth;
+            }
+            break;
+        case GLOBAL_POP:
+            if (p->depth > 0)
+            {
+                --p->depth;
+                p->page = p->stack[p->depth].page;
+                p->size = p->stack[p->depth].size;
+                p->count = p->stack[p->depth].count;
+                p->minimum = p->stack[p->depth].minimum;
+                p->maximum = p->stack[p->depth].maximum;
+                p->report_id = p->stack[p->depth].report_id;
+            }
+            break;
+        default: break;
+        }
+    }
+    else if (type == TYPE_LOCAL)
+    {
+        uint32_t v = (uint32_t)value_of(data, size, 0);
+        if (size < 4) v &= 0xffffu;
+        if (tag == LOCAL_USAGE)
+        {
+            if (p->usage_count < 8) p->usages[p->usage_count++] = v;
+        }
+        else if (tag == LOCAL_MIN) { p->range_min = v; p->have_range = 1; }
+        else if (tag == LOCAL_MAX) { p->range_max = v; p->have_range = 1; }
+    }
+}
+
+void btv_hid_extras_feed(btv_hid_extras *x, btv_hid_extras_parser *p,
+                         const uint8_t *data, size_t bytes)
+{
+    size_t i;
+    for (i = 0; i < bytes; ++i)
+    {
+        uint8_t b = data[i];
+        if (p->skip > 0) { --p->skip; continue; }
+        if (p->item_have == 0)
+        {
+            unsigned int size = b & 3u;
+            if (b == 0xfe)
+            {
+                p->item[0] = b;
+                p->item_have = 1;
+                p->item_need = 2;
+                continue;
+            }
+            p->item[0] = b;
+            p->item_have = 1;
+            p->item_need = (uint8_t)(1u + (size == 3 ? 4u : size));
+        }
+        else
+            p->item[p->item_have++] = b;
+        if (p->item[0] == 0xfe && p->item_have == 2)
+        {
+            p->skip = (uint8_t)(p->item[1] + 1u);
+            p->item_have = 0;
+            continue;
+        }
+        if (p->item_have >= p->item_need)
+        {
+            process_item(x, p, p->item[0], p->item + 1, (unsigned)p->item_have - 1u);
+            p->item_have = 0;
+        }
+    }
+}
+
+int btv_hid_extras_finish(btv_hid_extras *x, btv_hid_extras_parser *p)
+{
+    (void)p;
+    return x->consumer_used != 0 || x->pad_used;
+}
+
+int btv_hid_extras_wants(const btv_hid_extras *x, uint8_t id)
+{
+    unsigned int i;
+    for (i = 0; i < x->consumer_used; ++i)
+        if (x->consumer[i].kind != BTV_XC_NONE && x->consumer[i].id == id)
+            return 1;
+    return x->pad_used && x->pad_id == id;
+}
+
+/* ---- decoding ----------------------------------------------------------- */
+
+static uint32_t get_bits(const uint8_t *report, size_t bytes, uint32_t offset,
+                         unsigned int size)
+{
+    uint32_t v = 0;
+    unsigned int i;
+    for (i = 0; i < size; ++i)
+    {
+        uint32_t bit = offset + i;
+        if ((bit >> 3) < bytes && (report[bit >> 3] >> (bit & 7u)) & 1u)
+            v |= 1u << i;
+    }
+    return v;
+}
+
+static int32_t signed_value(const uint8_t *r, size_t bytes, const btv_x_axis *a)
+{
+    uint32_t v = get_bits(r, bytes, a->offset, a->size);
+    if (a->minimum < 0 && a->size < 32 && (v & (1u << (a->size - 1u))) != 0)
+        v |= ~0u << a->size;
+    return (int32_t)v;
+}
+
+/* A logical value, mapped across its range to -32768 .. 32767. */
+static int16_t normalise(int32_t v, int32_t lo, int32_t hi)
+{
+    int64_t span = (int64_t)hi - lo, n;
+    if (span <= 0) return 0;
+    if (v < lo) v = lo;
+    if (v > hi) v = hi;
+    n = ((int64_t)(v - lo) * 65535) / span - 32768;
+    return (int16_t)(n > 32767 ? 32767 : n);
+}
+
+int btv_hid_extras_decode(const btv_hid_extras *x, uint8_t id,
+                          const uint8_t *report, size_t bytes,
+                          btv_hid_extra_event *e)
+{
+    unsigned int i, k;
+    memset(e, 0, sizeof *e);
+    for (i = 0; i < x->consumer_used; ++i)
+    {
+        const btv_x_consumer *c = &x->consumer[i];
+        if (c->kind == BTV_XC_NONE || c->id != id) continue;
+        e->consumer = 1;
+        if (c->kind == BTV_XC_ARRAY)
+        {
+            for (k = 0; k < c->count; ++k)
+            {
+                uint32_t u = get_bits(report, bytes, c->offset + k * c->size,
+                                      c->size);
+                if (u != 0 && e->consumer_count < BTV_XCONSUMER_MAX)
+                    e->consumer_usage[e->consumer_count++] = (uint16_t)u;
+            }
+        }
+        else
+        {
+            for (k = 0; k < c->count; ++k)
+                if (get_bits(report, bytes, c->offset + k, 1) &&
+                    e->consumer_count < BTV_XCONSUMER_MAX)
+                    e->consumer_usage[e->consumer_count++] = c->usage[k];
+        }
+    }
+    if (x->pad_used && x->pad_id == id)
+    {
+        e->pad = 1;
+        for (k = 0; k < x->pad_buttons; ++k)
+            if (get_bits(report, bytes, x->pad_button_offset + k, 1))
+                e->pad_buttons |= 1u << k;
+        for (k = 0; k < BTV_XAXES; ++k)
+            if (x->axis[k].used)
+            {
+                int32_t v = x->axis[k].minimum < 0 ?
+                            signed_value(report, bytes, &x->axis[k]) :
+                            (int32_t)get_bits(report, bytes, x->axis[k].offset,
+                                              x->axis[k].size);
+                e->axis[k] = normalise(v, x->axis[k].minimum, x->axis[k].maximum);
+            }
+        if (x->hat.used)
+        {
+            int32_t v = x->hat.minimum < 0 ? signed_value(report, bytes, &x->hat) :
+                        (int32_t)get_bits(report, bytes, x->hat.offset, x->hat.size);
+            if (v >= x->hat.minimum && v <= x->hat.maximum)
+            {
+                /* Eight directions from up, clockwise, whatever the range
+                 * (0 to 7, or 1 to 8). */
+                int32_t d = v - x->hat.minimum;
+                e->hat = (uint8_t)(1 + (d & 7));
+            }
+        }
+    }
+    return e->consumer || e->pad;
+}

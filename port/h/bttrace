@@ -1,0 +1,71 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*
+ * BluetoothVoice: the debug trace kept off the foreground, and the timing of
+ * each poll.
+ *
+ * HAL_DebugTX waits for room in the debug UART's FIFO, so a line written
+ * from the module's 2 cs callback holds the whole desktop for as long as the
+ * line takes to send (a 60 byte line is about 5 ms at 115200 baud, and the
+ * A2DP heartbeat writes ten of them). Lines are therefore queued here and
+ * the callback sends a few bytes a tick (bttr_drain). The pure logic is
+ * host-tested (test/btcore/bttrace.c).
+ *
+ * Copyright (c) 2026 RISC OS Technologies. BSD-2-Clause (see LICENSE).
+ */
+
+#ifndef BTTRACE_H
+#define BTTRACE_H
+
+#include <stdint.h>
+
+#define BTTR_RING 8192u		/* a power of two */
+#define BTTR_DRAIN_BYTES 32u	/* sent per tick: the 16 byte FIFO plus a little */
+#define BTTR_SLOW_US 2000u	/* a poll longer than this is logged */
+#define BTTR_KEEP 12u
+
+/* The stages of one pump, for saying where a slow one went. */
+enum bttr_stage {
+	BTTR_SETTINGS, BTTR_TRANSPORT_BOOT, BTTR_POLL_TRANSPORT, BTTR_BOOT_PUMP,
+	BTTR_TIMEOUTS, BTTR_SCAN, BTTR_L2CAP, BTTR_PROFILES, BTTR_RECONNECT,
+	BTTR_SUBMIT, BTTR_TAIL, BTTR_STAGES
+};
+
+/* Queues "text" and a line end; returns 0 and counts it when full. */
+int bttr_put(const char *text);
+/* Sends up to "budget" queued bytes through "tx"; returns how many. */
+uint32_t bttr_drain(uint32_t budget, void (*tx)(uint8_t byte));
+uint32_t bttr_pending(void);
+uint32_t bttr_dropped(void);
+void bttr_reset(void);
+
+/* Microseconds from the centisecond count and the HAL's counter, which
+ * counts down "period" times a centisecond. */
+uint32_t bttr_micros(uint32_t cs, uint32_t counter, uint32_t period);
+
+/* Per-poll accounting: stage changes (with the clock in microseconds) and
+ * the end of the poll. A poll over BTTR_SLOW_US is kept. */
+void bttr_begin(uint32_t now_us);
+void bttr_stage(unsigned int stage, uint32_t now_us);
+/* Returns 1 when the poll was slow (and was kept). "who" is 0 for the
+ * ticker's callback, 1 for the icon task's null. */
+int bttr_end(unsigned int who, uint32_t now_us, uint32_t at_cs);
+
+/* The icon task's null, which can be interrupted by the callback and so
+ * keeps its own tally: "phase" 0 summary, 1 housekeeping, 2 announce.
+ * Returns 1 when kept. */
+int bttr_task(unsigned int phase, uint32_t us, uint32_t at_cs);
+
+struct bttr_slow {
+	uint32_t at_cs, total_us, worst_us;
+	uint8_t who, worst_stage;
+};
+uint32_t bttr_slow_count(void);
+uint32_t bttr_polls(void);
+uint32_t bttr_worst_us(void);
+/* Entry "index" (0 is the oldest kept); returns 0 past the end. */
+int bttr_slow_get(unsigned int index, struct bttr_slow *out);
+/* "slow callback 3412us at 12345 cs: profiles 3100us" into out. */
+void bttr_format(const struct bttr_slow *s, char *out, unsigned int size);
+
+#endif

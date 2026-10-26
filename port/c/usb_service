@@ -1,0 +1,70 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        usb_service
+ * Purpose:     Read the published RISC OS USB service wire layout safely.
+ * Reference:   ROOL USBDriver build/h/USBDevFS at the revision in
+ *              docs/USB-TRANSPORT.md. No provider pointers are retained.
+ ******************************************************************/
+#include "usb_service.h"
+#include <string.h>
+
+#define USB_SERVICE_PREFIX 32u
+#define USB_DEVICE_DESCRIPTOR 1
+#define USB_FULL_SPEED 2
+
+/* Service and USB fields are little-endian and need not be aligned. */
+static unsigned int service_u16(const uint8_t *data)
+{
+    return (unsigned int)data[0] | ((unsigned int)data[1] << 8);
+}
+
+/* Validate lengths before inspecting the appended device/config descriptors. */
+int btv_usb_service_decode(const uint8_t *record, size_t bytes,
+                            uint8_t alternate, btv_usb_device *output)
+{
+    btv_usb_device result;
+    const uint8_t *device;
+    size_t total, offset, name_length, i;
+    int status;
+    if (record == NULL || output == NULL || bytes < USB_SERVICE_PREFIX)
+        return BTV_USB_INVALID;
+    total = service_u16(record);
+    offset = service_u16(record + 2);
+    if (total > bytes || offset < USB_SERVICE_PREFIX || offset > total ||
+        total - offset < 18)
+        return BTV_USB_INVALID;
+    for (name_length = 0; name_length < sizeof(result.name); ++name_length)
+        if (record[4 + name_length] == 0)
+            break;
+    if (name_length == 0 || name_length == sizeof(result.name))
+        return BTV_USB_INVALID;
+    /* DeviceFS names are copied into command/stream specifications later.
+     * Permit the documented USBxxnnn naming alphabet, not control syntax. */
+    for (i = 0; i < name_length; ++i)
+        if (!((record[4 + i] >= 'A' && record[4 + i] <= 'Z') ||
+              (record[4 + i] >= 'a' && record[4 + i] <= 'z') ||
+              (record[4 + i] >= '0' && record[4 + i] <= '9')))
+            return BTV_USB_INVALID;
+    device = record + offset;
+    if (device[0] < 18 || device[0] > total - offset || device[1] != USB_DEVICE_DESCRIPTOR)
+        return BTV_USB_INVALID;
+    if (record[28] != USB_FULL_SPEED || device[4] != 0xe0 ||
+        device[5] != 1 || device[6] != 1)
+        return BTV_USB_UNSUPPORTED;
+    memset(&result, 0, sizeof(result));
+    memcpy(result.name, record + 4, name_length);
+    result.vendor = (uint16_t)service_u16(device + 8);
+    result.product = (uint16_t)service_u16(device + 10);
+    result.revision = (uint16_t)service_u16(device + 12);
+    result.bus = record[24];
+    result.address = record[25];
+    if (result.address == 0 || result.address > 127)
+        return BTV_USB_INVALID;
+    offset += device[0];
+    status = btv_usb_select(record + offset, total - offset, alternate, &result.endpoints);
+    if (status != BTV_USB_READY)
+        return status;
+    *output = result;
+    return BTV_USB_READY;
+}

@@ -1,0 +1,235 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*
+ * riscos_shim: see h/riscos_shim.
+ */
+#include "riscos_shim.h"
+
+/* rs_swi(number, r): number | X bit is built into a SWI instruction on the
+ * stack-free path below by OS_CallASWIR12 (&71), which takes the SWI
+ * number in R12 - so no self-modifying code. */
+extern const struct os_error *rs_swi_asm(uint32_t number, uint32_t *r);
+__asm__(
+    "\t.text\n"
+    "\t.arm\n"
+    "\t.global rs_swi_asm\n"
+    "rs_swi_asm:\n"
+    "\tstmfd sp!, {r1, r4-r11, lr}\n"
+    "\torr r12, r0, #0x20000\n"          /* X bit */
+    "\tmov r11, r1\n"
+    "\tldmia r11, {r0-r7}\n"
+    "\tswi 0x20071\n"                    /* XOS_CallASWIR12 */
+    "\tldr r11, [sp, #0]\n"
+    "\tstmia r11, {r0-r7}\n"
+    "\tmovvc r0, #0\n"                   /* no error */
+    "\tldmfd sp!, {r1, r4-r11, pc}\n");
+
+const struct os_error *rs_swi(uint32_t number, uint32_t r[8])
+{
+    return rs_swi_asm(number, r);
+}
+
+static const struct os_error *swi4(uint32_t n, uint32_t a, uint32_t b,
+                                   uint32_t c, uint32_t d, uint32_t out[8])
+{
+    uint32_t r[8] = { 0 };
+    const struct os_error *e;
+    r[0] = a; r[1] = b; r[2] = c; r[3] = d;
+    e = rs_swi(n, r);
+    if (out != NULL)
+    {
+        unsigned int i;
+        for (i = 0; i < 8; ++i) out[i] = r[i];
+    }
+    return e;
+}
+
+/* XOS_CallAVector (&34): R9 = vector.  Not reachable through rs_swi (R9),
+ * so this one has its own veneer; IRQs are the caller's business. */
+extern void rs_call_vector(uint32_t vector, const uint32_t *regs);
+__asm__(
+    "\t.text\n"
+    "\t.arm\n"
+    "\t.global rs_call_vector\n"
+    "rs_call_vector:\n"
+    "\tstmfd sp!, {r4-r11, lr}\n"
+    "\tmov r9, r0\n"
+    "\tldr r0, [r1, #0]\n"
+    "\tldr r2, [r1, #8]\n"
+    "\tldr r3, [r1, #12]\n"
+    "\tldr r4, [r1, #16]\n"
+    "\tldr r1, [r1, #4]\n"
+    "\tswi 0x20034\n"
+    "\tldmfd sp!, {r4-r11, pc}\n");
+
+const struct os_error *os_call_a_vector_3(uint32_t vector, uint32_t r0,
+                                          uint32_t r1, uint32_t r2)
+{
+    uint32_t regs[5];
+    regs[0] = r0; regs[1] = r1; regs[2] = r2; regs[3] = 0; regs[4] = 0;
+    rs_call_vector(vector, regs);
+    return NULL;
+}
+
+const struct os_error *pointer_v_report(uint32_t device, int32_t dx,
+                                        int32_t dy, uint32_t flags)
+{
+    /* PointerV 3: R1 = device type, R2 = dx, R3 = dy. */
+    uint32_t regs[5];
+    (void)flags;
+    regs[0] = 3; regs[1] = device; regs[2] = (uint32_t)dx;
+    regs[3] = (uint32_t)dy; regs[4] = 0;
+    rs_call_vector(POINTERV, regs);
+    return NULL;
+}
+
+const struct os_error *pointer_v_wheel_change(int32_t dz, uint32_t extra,
+                                              int32_t dw)
+{
+    /* PointerV 9: R1 = wheel delta, R2 = extra buttons, R3 = X scroll. */
+    uint32_t regs[5];
+    regs[0] = 9; regs[1] = (uint32_t)dz; regs[2] = extra;
+    regs[3] = (uint32_t)dw; regs[4] = 0;
+    rs_call_vector(POINTERV, regs);
+    return NULL;
+}
+
+const struct os_error *os_claim(uint32_t vector, void *routine, void *pw)
+{
+    return swi4(0x1F, vector, (uint32_t)routine, (uint32_t)pw, 0, NULL);
+}
+
+const struct os_error *os_release(uint32_t vector, void *routine, void *pw)
+{
+    return swi4(0x20, vector, (uint32_t)routine, (uint32_t)pw, 0, NULL);
+}
+
+const struct os_error *os_pointer_get_type(uint32_t *type)
+{
+    uint32_t out[8];
+    const struct os_error *e = swi4(0x64, 0, 0, 0, 0, out);
+    if (e == NULL && type != NULL) *type = out[0];
+    return e;
+}
+
+const struct os_error *os_pointer_set_type(uint32_t type)
+{
+    return swi4(0x64, 1, type, 0, 0, NULL);
+}
+
+const struct os_error *kernel_read_var_val(const char *name, char *buffer,
+                                           uint32_t *len)
+{
+    uint32_t out[8];
+    const struct os_error *e = swi4(OS_ReadVarVal, (uint32_t)name,
+                                    (uint32_t)buffer, *len, 0, out);
+    *len = e == NULL ? out[2] : 0;
+    return e;
+}
+
+const struct os_error *os_read_var_val(const char *name, char *buffer,
+                                       int32_t size, int32_t type,
+                                       int32_t *used)
+{
+    uint32_t r[8] = { 0 };
+    const struct os_error *e;
+    r[0] = (uint32_t)name; r[1] = (uint32_t)buffer; r[2] = (uint32_t)size;
+    r[3] = 0; r[4] = (uint32_t)type;
+    e = rs_swi(OS_ReadVarVal, r);
+    if (used != NULL) *used = (int32_t)r[2];
+    return e;
+}
+
+uint32_t os_read_monotonic_time(void)
+{
+    uint32_t out[8];
+    return swi4(0x42, 0, 0, 0, 0, out) == NULL ? out[0] : 0;
+}
+
+const struct os_error *os_write_n(const char *text, uint32_t bytes)
+{
+    return swi4(0x46, (uint32_t)text, bytes, 0, 0, NULL);
+}
+
+const struct os_error *os_newline(void)
+{
+    return swi4(0x03, 0, 0, 0, 0, NULL);
+}
+
+const struct os_error *os_file_size_no_path(const char *name, int32_t *type,
+                                            uint32_t *length)
+{
+    uint32_t out[8];
+    const struct os_error *e = swi4(OS_File, 17, (uint32_t)name, 0, 0, out);
+    if (e != NULL) return e;
+    if (type != NULL) *type = (int32_t)out[0];
+    if (length != NULL) *length = out[4];
+    return NULL;
+}
+
+const struct os_error *os_file_load_no_path(const char *name, void *data)
+{
+    return swi4(OS_File, 16, (uint32_t)name, (uint32_t)data, 0, NULL);
+}
+
+const struct os_error *os_file_create_directory(const char *name)
+{
+    uint32_t r[8] = { 0 };
+    r[0] = 8; r[1] = (uint32_t)name; r[4] = 0;
+    return rs_swi(OS_File, r);
+}
+
+const struct os_error *os_file_save(const char *name, uint32_t type,
+                                    const void *start, const void *end)
+{
+    uint32_t r[8] = { 0 };
+    r[0] = 10; r[1] = (uint32_t)name; r[2] = type;
+    r[4] = (uint32_t)start; r[5] = (uint32_t)end;
+    return rs_swi(OS_File, r);
+}
+
+/* KeyV claimant: as the 32-bit build's btv_hid_keyv_handler (counts reason
+ * 3 NotifyLEDState and 4 EnableDrivers into the block at R12; passes on). */
+__asm__(
+    "\t.text\n"
+    "\t.arm\n"
+    "\t.global btm_keyv_entry\n"
+    "btm_keyv_entry:\n"
+    "\tstmfd sp!, {r2, r3}\n"
+    "\tmrs r3, cpsr\n"
+    "\tteq r0, #3\n"
+    "\tteqne r0, #4\n"
+    "\tbne 1f\n"
+    "\torr r2, r3, #0x80\n"
+    "\tmsr cpsr_c, r2\n"
+    "\tteq r0, #3\n"
+    "\tstreq r1, [r12, #0]\n"
+    "\tldreq r2, [r12, #4]\n"
+    "\tldrne r2, [r12, #8]\n"
+    "\tadd r2, r2, #1\n"
+    "\tstreq r2, [r12, #4]\n"
+    "\tstrne r2, [r12, #8]\n"
+    "1:\n"
+    "\tmsr cpsr_cf, r3\n"
+    "\tldmfd sp!, {r2, r3}\n"
+    "\tmov pc, lr\n");
+
+const struct os_error *os_file_read_bounded(const char *name, void *data,
+                                            uint32_t *length)
+{
+    uint32_t out[8];
+    uint32_t handle;
+    const struct os_error *e;
+    /* OS_Find &4F: open to read, no path, error if it is not there. */
+    e = swi4(0x0D, 0x4F, (uint32_t)name, 0, 0, out);
+    if (e != NULL) return e;
+    handle = out[0];
+    {
+        uint32_t r[8] = { 0 };
+        r[0] = 4; r[1] = handle; r[2] = (uint32_t)data; r[3] = *length;
+        e = rs_swi(0x0C, r);              /* OS_GBPB 4: read from PTR */
+        if (e == NULL) *length -= r[3];   /* R3 = bytes not read */
+    }
+    (void)swi4(0x0D, 0, handle, 0, 0, NULL);
+    return e;
+}

@@ -1,0 +1,340 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        host_bridge
+ * Purpose:     Private Virtual Kinetic Box Bluetooth transport probe.
+ ******************************************************************/
+#include <host_bridge>
+#include <native_usb>
+#include <string.h>
+
+enum bridge_backend { BRIDGE_NONE, BRIDGE_HOST, BRIDGE_NATIVE };
+static enum bridge_backend selected_backend;
+static btv_native_usb native_backend;
+
+static int bridge_call(uint32_t values[6])
+{
+    register uint32_t r0 __asm("r0") = values[0];
+    register uint32_t r1 __asm("r1") = values[1];
+    register uint32_t r2 __asm("r2") = values[2];
+    register uint32_t r3 __asm("r3") = values[3];
+    register uint32_t r4 __asm("r4") = values[4];
+    register uint32_t r5 __asm("r5") = values[5];
+    register uint32_t success __asm("r6");
+    __asm volatile(
+        "swi 0x76ac8\n\t"
+        "movvc %6, #1\n\t"
+        "movvs %6, #0"
+        : "+r" (r0), "+r" (r1), "+r" (r2), "+r" (r3),
+          "+r" (r4), "+r" (r5), "=r" (success)
+        :
+        : "cc", "memory", "lr");
+    values[0] = r0;
+    values[1] = r1;
+    values[2] = r2;
+    values[3] = r3;
+    values[4] = r4;
+    values[5] = r5;
+    return success;
+}
+
+int btv_host_bridge_inspect(btv_host_bridge_info *info)
+{
+    uint32_t values[6];
+    if (info == 0)
+        return 0;
+    info->version = info->max_transfer_bytes = info->max_iso_packets = 0;
+    info->result = info->windows_error = 0;
+    info->vendor = info->product = 0;
+    /* The desktop can ask whether an adapter is present while the core owns
+     * it.  Re-probing an open native transport used to clear
+     * selected_backend, so the next event ticket was polled through the
+     * absent host bridge and the active A2DP link failed. */
+    if (selected_backend == BRIDGE_NATIVE && native_backend.opened)
+    {
+        info->version = BTV_HOST_BRIDGE_ABI;
+        info->max_transfer_bytes = BTV_HOST_BRIDGE_IO_BYTES;
+        info->max_iso_packets = BTV_HOST_BRIDGE_ISO_PACKETS;
+        info->result = native_backend.removed ? BTV_HOST_BRIDGE_IO_ERROR :
+                       (native_backend.async_control ?
+                        BTV_HOST_BRIDGE_OK : BTV_HOST_BRIDGE_UNSUPPORTED);
+        info->vendor = native_backend.device.vendor;
+        info->product = native_backend.device.product;
+        return !native_backend.removed;
+    }
+    values[0] = values[1] = values[2] = 0;
+    values[3] = values[4] = values[5] = 0;
+    if (!bridge_call(values) || values[0] != BTV_HOST_BRIDGE_ABI)
+    {
+        selected_backend = BRIDGE_NONE;
+        if (!btv_native_usb_inspect(&native_backend)) return 0;
+        selected_backend = BRIDGE_NATIVE;
+        info->version = BTV_HOST_BRIDGE_ABI;
+        info->max_transfer_bytes = BTV_HOST_BRIDGE_IO_BYTES;
+        info->max_iso_packets = BTV_HOST_BRIDGE_ISO_PACKETS;
+        info->result = native_backend.async_control ?
+                       BTV_HOST_BRIDGE_OK : BTV_HOST_BRIDGE_UNSUPPORTED;
+        info->vendor = native_backend.device.vendor;
+        info->product = native_backend.device.product;
+        return 1;
+    }
+    selected_backend = BRIDGE_HOST;
+    info->version = values[0];
+    info->max_transfer_bytes = values[1];
+    info->max_iso_packets = values[2];
+    values[0] = 1;
+    values[1] = values[2] = 0;
+    if (!bridge_call(values))
+        return 0;
+    info->result = values[0];
+    info->windows_error = values[1];
+    info->vendor = (uint16_t)(values[2] & 0xffffu);
+    info->product = (uint16_t)(values[2] >> 16);
+    return 1;
+}
+
+static int result_call(uint32_t values[6], uint32_t *windows_error)
+{
+    if (!bridge_call(values))
+        return -7;
+    if (windows_error != 0)
+        *windows_error = values[1];
+    return (int)values[0];
+}
+
+int btv_host_bridge_open(uint32_t *windows_error)
+{
+    uint32_t values[6] = { 2, 0, 0, 0, 0, 0 };
+    if (selected_backend == BRIDGE_NATIVE)
+    {
+        if (windows_error != 0) *windows_error = 0;
+        return btv_native_usb_open(&native_backend) ? BTV_HOST_BRIDGE_OK :
+                                                     BTV_HOST_BRIDGE_IO_ERROR;
+    }
+    return result_call(values, windows_error);
+}
+
+int btv_host_bridge_voice(uint8_t alternate, uint32_t *windows_error)
+{
+    uint32_t values[6] = { 3, alternate, 0, 0, 0, 0 };
+    if (selected_backend == BRIDGE_NATIVE)
+    {
+        if (windows_error != 0) *windows_error = 0;
+        return btv_native_usb_voice(&native_backend, alternate);
+    }
+    return result_call(values, windows_error);
+}
+
+int btv_host_bridge_submit(unsigned int kind, const uint8_t *data,
+                           uint32_t bytes, uint32_t packets,
+                           uint32_t *ticket, uint32_t *windows_error)
+{
+    uint32_t values[6];
+    int result;
+    if (selected_backend == BRIDGE_NATIVE)
+    {
+        if (windows_error != 0) *windows_error = 0;
+        return btv_native_usb_submit(&native_backend, kind, data, bytes,
+                                     packets, ticket);
+    }
+    values[0] = 4;
+    values[1] = kind;
+    values[2] = (uint32_t)data;
+    values[3] = bytes;
+    values[4] = packets;
+    values[5] = 0;
+    result = result_call(values, windows_error);
+    if (ticket != 0)
+        *ticket = result == BTV_HOST_BRIDGE_OK ? values[2] : 0;
+    return result;
+}
+
+int btv_host_bridge_poll(uint32_t ticket,
+                         btv_host_bridge_completion *completion)
+{
+    uint32_t values[6];
+    int result;
+    if (completion == 0)
+        return -1;
+    if (selected_backend == BRIDGE_NATIVE)
+        return btv_native_usb_poll(&native_backend, ticket, completion);
+    values[0] = 5;
+    values[1] = ticket;
+    values[2] = (uint32_t)completion->data;
+    values[3] = BTV_HOST_BRIDGE_IO_BYTES;
+    values[4] = (uint32_t)completion->packets;
+    values[5] = BTV_HOST_BRIDGE_ISO_PACKETS;
+    if (!bridge_call(values))
+        return -7;
+    result = (int)values[0];
+    if (result == BTV_HOST_BRIDGE_OK)
+    {
+        completion->error = values[1];
+        completion->kind = values[2];
+        completion->bytes = values[3];
+        completion->packet_count = values[4];
+    }
+    return result;
+}
+
+int btv_host_bridge_cancel(uint32_t ticket, uint32_t *windows_error)
+{
+    uint32_t values[6] = { 6, ticket, 0, 0, 0, 0 };
+    if (selected_backend == BRIDGE_NATIVE)
+    {
+        if (windows_error != 0) *windows_error = 0;
+        return btv_native_usb_cancel(&native_backend, ticket);
+    }
+    return result_call(values, windows_error);
+}
+
+int btv_host_bridge_close(uint32_t *windows_error)
+{
+    uint32_t values[6] = { 7, 0, 0, 0, 0, 0 };
+    if (selected_backend == BRIDGE_NATIVE)
+    {
+        if (windows_error != 0) *windows_error = 0;
+        return btv_native_usb_close(&native_backend);
+    }
+    return result_call(values, windows_error);
+}
+
+const char *btv_host_bridge_device_name(void)
+{
+    if (selected_backend != BRIDGE_NATIVE || !native_backend.detected ||
+        native_backend.device.name[0] == 0)
+        return 0;
+    return native_backend.device.name;
+}
+
+void btv_host_bridge_acl_counts(uint32_t *in_count, uint32_t *out_count)
+{
+    *in_count = native_backend.acl_in_count;
+    *out_count = native_backend.acl_out_count;
+}
+
+void btv_host_bridge_output_diag(uint32_t values[6])
+{
+    memset(values, 0, 6u * sizeof(values[0]));
+    if (selected_backend == BRIDGE_NATIVE)
+        btv_native_usb_output_diag(&native_backend, values);
+}
+
+uint32_t btv_host_bridge_monitor_output(void)
+{
+    return selected_backend == BRIDGE_NATIVE ?
+           btv_native_usb_monitor_output(&native_backend) : 0;
+}
+
+int btv_host_bridge_present(void)
+{
+    if (selected_backend == BRIDGE_NATIVE)
+        return native_backend.detected && !native_backend.removed;
+    return selected_backend == BRIDGE_HOST;
+}
+
+uint32_t btv_host_bridge_voice_state(void)
+{
+    return (native_backend.sco_in_handle != 0 ? 1u : 0u) |
+           (native_backend.sco_out_handle != 0 ? 2u : 0u) |
+           ((uint32_t)(native_backend.close_phase & 3u) << 2);
+}
+
+uint32_t btv_host_bridge_trace(uint8_t *output, uint32_t capacity)
+{
+    uint32_t bytes = sizeof(native_backend.trace);
+    if (selected_backend != BRIDGE_NATIVE || capacity < bytes) return 0;
+    memcpy(output, native_backend.trace, bytes);
+    return bytes;
+}
+
+void btv_host_bridge_device_dead(uint32_t service, uint32_t handle,
+                                  const char *name)
+{
+    if (selected_backend == BRIDGE_NATIVE)
+        btv_native_usb_device_dead(&native_backend, service, handle, name);
+}
+
+/* ---- 64-bit core interface additions ------------------------------- */
+
+/* USB adapters need no start-up beyond what open did. */
+int btv_host_bridge_boot(void)
+{
+    return selected_backend == BRIDGE_NATIVE && native_backend.opened ? 1 : -1;
+}
+
+/* The core's notes ("[bt] a b" on the 64-bit build's HAL debug channel)
+ * kept here in a ring of lines, newest last, each stamped with the
+ * monotonic time in cs; read with Core reason 30. */
+#define NOTE_RING 8192u
+static char note_ring[NOTE_RING];
+static uint32_t note_end, note_wrapped;
+
+static void note_put(const char *text)
+{
+    while (*text != 0)
+    {
+        note_ring[note_end++] = *text++;
+        if (note_end == NOTE_RING) { note_end = 0; note_wrapped = 1; }
+    }
+}
+
+void btv_host_bridge_note(const char *a, const char *b)
+{
+    static const char digits[] = "0123456789";
+    char stamp[12];
+    register uint32_t cs __asm("r0");
+    uint32_t t;
+    int i = 10;
+    /* One of these per audio packet would push everything else out. */
+    if (b != 0 && b[0] == 'c' && strncmp(b, "completed packets", 17) == 0)
+        return;
+    __asm volatile("swi 0x42" : "=r" (cs) : : "cc", "lr");
+    t = cs;
+    stamp[11] = 0;
+    stamp[10] = ' ';
+    do { stamp[--i] = digits[t % 10u]; t /= 10u; } while (t != 0 && i > 0);
+    note_put(stamp + i);
+    if (a != 0) note_put(a);
+    if (b != 0) { if (a != 0) note_put(" "); note_put(b); }
+    note_put("\n");
+}
+
+/* Copies the notes, oldest first, into buffer; returns the bytes copied. */
+uint32_t btv_host_bridge_notes(char *buffer, uint32_t size)
+{
+    uint32_t used = 0, i, start = note_wrapped ? note_end : 0;
+    uint32_t total = note_wrapped ? NOTE_RING : note_end;
+    for (i = 0; i < total && used + 1 < size; ++i)
+    {
+        char c = note_ring[(start + i) % NOTE_RING];
+        if (c != 0) buffer[used++] = c;
+    }
+    if (size != 0) buffer[used] = 0;
+    return used;
+}
+
+void btv_host_bridge_flush(uint32_t budget)
+{
+    (void)budget;
+}
+
+uint32_t btv_host_bridge_micros(void)
+{
+    register uint32_t value __asm("r0");
+    __asm volatile("swi 0x42" : "=r" (value) : : "cc", "lr");
+    return value * 10000u;
+}
+
+void btv_host_bridge_errors(uint32_t out[5])
+{
+    memset(out, 0, 5u * sizeof(out[0]));
+}
+
+void btv_host_bridge_stats(uint32_t *tx_waiting, uint32_t *rx_total,
+                           uint32_t *rx_lost)
+{
+    if (tx_waiting) *tx_waiting = 0;
+    if (rx_total) *rx_total = native_backend.acl_in_count;
+    if (rx_lost) *rx_lost = 0;
+}

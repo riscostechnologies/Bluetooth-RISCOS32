@@ -1,0 +1,819 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        sound_device
+ * Purpose:     A software HAL audio controller (API 2, custom DMA) that
+ *              hands SoundDMA's 16-bit stereo buffers to the HFP playback
+ *              queue as 8 kHz mono.
+ *
+ * SoundDMA calls the device entries with R0 = device from arbitrary
+ * contexts where this module's C environment is not set up, so every
+ * entry is a leaf in the assembler below that only touches the device
+ * block.  The C half runs from BluetoothVoice SWIs, which the client
+ * issues continuously while a session is ready: whenever the voice link
+ * has drained the queue below the low-water mark, it takes the buffer
+ * SoundDMA filled last and asks for the next.  SoundDMA fills buffer 0,
+ * then 1, alternately, one per callback, so consuming in the same order
+ * always reads a buffer filled a whole round earlier.
+ ******************************************************************/
+#include <sound_device>
+#include <sound_pace>
+#include "sound_ring.h"
+#include <stddef.h>
+#include <string.h>
+
+#define OS_HARDWARE_ADD_DEVICE 2u
+#define OS_HARDWARE_REMOVE_DEVICE 3u
+#define HAL_DEVICE_TYPE_AUDIO_CONTROLLER 0x0201u /* Audio, AudC */
+#define HAL_DEVICE_TYPE_AUDIO_MIXER 0x0202u
+#define HAL_DEVICE_ID_SOFTWARE_MIXER 1u
+/* Beyond the IDs allocated in hdr:HALDevice, so it cannot collide. */
+#define HAL_DEVICE_ID_BLUETOOTH_HFP 0x0b70u
+#define HAL_DEVICE_LOCATION 0x10000000u /* system bus */
+#define HAL_API_2 0x00020000u
+#define AUDIO_FLAG_STEREO_REVERSE 1u
+#define CONTROLLER_ID_BYTES 40u
+/* 16-bit mono at 8 kHz: 1600 bytes is 100 ms, enough to ride out a
+ * TaskWindow time slice without the client polling. */
+#define LOW_WATER_BYTES 1600u
+#define MAX_BUFFERS_PER_PUMP 8u
+#define MONO_BYTES 4096u
+
+typedef void btv_hal_entry(void);
+
+typedef struct btv_rate_entry
+{
+    uint32_t frequency; /* Hz * 1024 */
+    uint8_t period;     /* microseconds */
+    uint8_t reserved[3];
+} btv_rate_entry;
+
+typedef struct btv_audio_device
+{
+    uint16_t type, id;
+    uint32_t location, version;
+    const char *description;
+    void *address;
+    uint32_t reserved1[3];
+    btv_hal_entry *activate, *deactivate, *reset, *sleep;
+    int32_t device;
+    btv_hal_entry *test_irq, *clear_irq;
+    uint32_t reserved2;
+    void *mixer;
+    uint32_t channels_out, channels_in;
+    uint32_t dma_params[5];
+    btv_hal_entry *pre_enable, *post_enable, *pre_disable, *post_disable;
+    btv_hal_entry *irq_handle;
+    uint32_t rate_count;
+    const btv_rate_entry *rate_table;
+    btv_hal_entry *set_rate, *custom_dma_enable;
+    uint32_t flags, min_buffer_bytes, buffer_align;
+    /* Private: written only by the assembler entries below. */
+    uint32_t buffer_bytes;        /* 144 */
+    int16_t *buffer[2];           /* 148, 152 */
+    uint32_t callback_parameter;  /* 156 */
+    void *callback;               /* 160 */
+    uint32_t running;             /* 164 */
+} btv_audio_device;
+
+/* HAL mixer API 0.1. SoundCtrl discovers this device through OS_Hardware,
+ * while SoundDMA obtains the same pointer from the audio controller. */
+typedef struct btv_mixer_device
+{
+    uint16_t type, id;
+    uint32_t location, version;
+    const char *description;
+    void *address;
+    uint32_t reserved1[3];
+    btv_hal_entry *activate, *deactivate, *reset, *sleep;
+    int32_t device;
+    btv_hal_entry *test_irq, *clear_irq;
+    uint32_t reserved2;
+    btv_audio_device *controller;
+    uint32_t channels;
+    btv_hal_entry *get_features, *set_mix, *get_mix, *get_limits;
+    uint32_t mute;
+    int32_t gain; /* dB * 16, from -640 to 0 */
+} btv_mixer_device;
+
+typedef char btv_check_mixer[
+    offsetof(btv_mixer_device, controller) == 64 &&
+    offsetof(btv_mixer_device, mute) == 88 &&
+    offsetof(btv_mixer_device, gain) == 92 ? 1 : -1];
+
+/* The assembler entries use these offsets literally. */
+typedef char btv_check_custom_dma[
+    offsetof(btv_audio_device, custom_dma_enable) == 128 ? 1 : -1];
+typedef char btv_check_private[
+    offsetof(btv_audio_device, buffer_bytes) == 144 &&
+    offsetof(btv_audio_device, running) == 164 ? 1 : -1];
+
+extern btv_hal_entry btv_audc_activate, btv_audc_nothing, btv_audc_zero,
+    btv_audc_pre_disable, btv_audc_custom_dma_enable;
+extern btv_hal_entry btv_mix_features, btv_mix_set, btv_mix_get,
+    btv_mix_limits;
+
+/* Activate: R0 = 1 (usable).  Sleep, IRQHandle: R0 = 0.
+ * PreDisable: stop consuming before SoundDMA frees the buffers.
+ * CustomDMAEnable: R1 = buffer size, R2/R3 = buffers, [SP] = callback
+ * parameter, [SP, #4] = callback; R0 = 0 for success. */
+__asm__(
+    "\t.text\n"
+    "\t.arm\n"
+    "\t.global btv_audc_activate\n"
+    "btv_audc_activate:\n"
+    "\tmov r0, #1\n"
+    "\tmov pc, lr\n"
+    "\t.global btv_audc_zero\n"
+    "btv_audc_zero:\n"
+    "\tmov r0, #0\n"
+    "\t.global btv_audc_nothing\n"
+    "btv_audc_nothing:\n"
+    "\tmov pc, lr\n"
+    "\t.global btv_audc_pre_disable\n"
+    "btv_audc_pre_disable:\n"
+    "\tmov r1, #0\n"
+    "\tstr r1, [r0, #164]\n"
+    "\tmov pc, lr\n"
+    "\t.global btv_audc_custom_dma_enable\n"
+    "btv_audc_custom_dma_enable:\n"
+    "\tstr r1, [r0, #144]\n"
+    "\tstr r2, [r0, #148]\n"
+    "\tstr r3, [r0, #152]\n"
+    "\tldr r1, [sp, #0]\n"
+    "\tstr r1, [r0, #156]\n"
+    "\tldr r1, [sp, #4]\n"
+    "\tstr r1, [r0, #160]\n"
+    "\tmov r1, #1\n"
+    "\tstr r1, [r0, #164]\n"
+    "\tmov r0, #0\n"
+    "\tmov pc, lr\n");
+
+/* HAL entries run without our module's C static base (R8), so they touch
+ * only the RMA mixer block passed in R0. GetMix returns mute/gain in R0/R1. */
+__asm__(
+    "\t.text\n"
+    "\t.arm\n"
+    "\t.global btv_mix_features\n"
+    "btv_mix_features:\n"
+    "\tmov r0, #0\n"             /* System output channel */
+    "\tmov pc, lr\n"
+    "\t.global btv_mix_set\n"
+    "btv_mix_set:\n"
+    "\tcmp r3, #0\n"
+    "\tmovgt r3, #0\n"
+    "\tldr r12, =-640\n"
+    "\tcmp r3, r12\n"
+    "\tmovlt r3, r12\n"
+    "\tand r2, r2, #1\n"
+    "\tstr r2, [r0, #88]\n"
+    "\tstr r3, [r0, #92]\n"
+    "\tmov pc, lr\n"
+    "\t.global btv_mix_get\n"
+    "btv_mix_get:\n"
+    "\tldr r1, [r0, #92]\n"
+    "\tldr r0, [r0, #88]\n"
+    "\tmov pc, lr\n"
+    "\t.global btv_mix_limits\n"
+    "btv_mix_limits:\n"
+    "\tldr r12, =-640\n"
+    "\tstr r12, [r2, #0]\n"
+    "\tmov r12, #0\n"
+    "\tstr r12, [r2, #4]\n"
+    "\tmov r12, #1\n"
+    "\tstr r12, [r2, #8]\n"
+    "\tmov pc, lr\n"
+    "\t.ltorg\n");
+
+static btv_rate_entry rates[1] = { { 8000u * 1024u, 125, { 0, 0, 0 } } };
+static const char hfp_description[] = "Bluetooth headset (HFP, 8 kHz)";
+static const char a2dp_description[] = "Bluetooth speakers (A2DP)";
+static const char mixer_description[] = "Bluetooth software mixer";
+static const char *description = hfp_description;
+static int stereo_mode;
+/* A2DP: SoundDMA's stereo frames wait here for the media clock. */
+#define RING_FRAMES 8192u
+#define STEREO_LOW_WATER 3072u
+/* Buffers allowed before the clock has run: enough to start smoothly. */
+#define STEREO_PRIME_BUFFERS 2u
+static int16_t ring[RING_FRAMES * 2u];
+static uint32_t stereo_rate, stereo_clock;
+/* When this device may take another buffer from SoundDMA. */
+static btv_sound_pace stereo_pace;
+/* SoundDMA fills its buffers from inside the callback we make, so the
+ * callback must never be re-entered. */
+static int in_sound_dma;
+/* Set when a previous instance left a device behind: only a reboot clears
+ * it, and registering again would make things worse. */
+static int stale_entry;
+static unsigned int ring_head, ring_used;
+/* The kernel keeps our audio device in its own hardware device list, and
+ * walks that list whenever anything enumerates devices.  A node pointing
+ * into a dead module's workspace aborts inside the kernel and takes the
+ * machine with it, so the block lives in the RMA and is never freed: a
+ * few hundred bytes are a cheap insurance against a locked machine. */
+static btv_audio_device *device_block;
+static btv_mixer_device *mixer_block;
+static int mixer_registered;
+
+/* After the device block: a tiny "not usable" entry and a name, so an
+ * orphaned device answers safely even with the module gone.  Everything
+ * it points at has to live in the block for the same reason. */
+#define DEVICE_CODE_OFFSET ((uint32_t)sizeof(btv_audio_device))
+#define DEVICE_NAME_OFFSET (DEVICE_CODE_OFFSET + 8u)
+#define MIXER_BLOCK_OFFSET (DEVICE_NAME_OFFSET + 24u)
+#define DEVICE_BLOCK_BYTES (MIXER_BLOCK_OFFSET + (uint32_t)sizeof(btv_mixer_device))
+
+/* OS_Module 6 (claim).  Returns 0 when the RMA has no room. */
+static int claim_device_block(void)
+{
+    register uint32_t r0 __asm("r0") = 6;
+    register uint32_t r1 __asm("r1") = 0;
+    register uint32_t r2 __asm("r2") = 0;
+    register uint32_t r3 __asm("r3") = (uint32_t)DEVICE_BLOCK_BYTES;
+    register uint32_t success __asm("r4");
+    if (device_block != NULL) return 1;
+    __asm volatile(
+        "swi 0x2001e\n\t"
+        "movvc %4, #1\n\t"
+        "movvs %4, #0"
+        : "+r" (r0), "+r" (r1), "+r" (r2), "+r" (r3), "=r" (success)
+        :
+        : "cc", "memory", "lr");
+    if (!success || r2 == 0) return 0;
+    device_block = (btv_audio_device *)r2;
+    memset(device_block, 0, DEVICE_BLOCK_BYTES);
+    mixer_block = (btv_mixer_device *)((uint8_t *)device_block +
+                                       MIXER_BLOCK_OFFSET);
+    return 1;
+}
+
+/* The refusal stub inside the block: "MOV R0, #0; MOV PC, LR". */
+static btv_hal_entry *inert_entry(void)
+{
+    uint32_t *code = (uint32_t *)((uint8_t *)device_block +
+                                  DEVICE_CODE_OFFSET);
+    register uint32_t r0 __asm("r0") = 1;
+    register uint32_t r1 __asm("r1") = (uint32_t)code;
+    register uint32_t r2 __asm("r2") = (uint32_t)(code + 2);
+    code[0] = 0xe3a00000u;
+    code[1] = 0xe1a0f00eu;
+    __asm volatile(
+        "swi 0x2006e"                  /* XOS_SynchroniseCodeAreas */
+        : "+r" (r0), "+r" (r1), "+r" (r2)
+        :
+        : "cc", "memory", "lr");
+    return (btv_hal_entry *)code;
+}
+
+static int registered;
+static uint32_t consumed;
+/* Bring-up meter: loudest sample and buffers holding any sound. */
+static uint32_t peak, audible;
+static uint32_t test_tone_frames, test_tone_phase;
+static unsigned int next_buffer;
+static char previous[CONTROLLER_ID_BYTES];
+static uint8_t mono[MONO_BYTES];
+/* Q15 amplitude for 0 through -40 dB, interpolated at 1/16 dB. */
+static const uint16_t mixer_gain[41] = {
+    32768, 29205, 26029, 23198, 20675, 18427, 16423, 14637,
+    13045, 11627, 10362, 9235, 8231, 7336, 6538, 5827,
+    5193, 4629, 4125, 3677, 3277, 2920, 2603, 2320,
+    2068, 1843, 1642, 1464, 1305, 1163, 1036, 924,
+    823, 734, 654, 583, 519, 463, 413, 368, 328
+};
+
+static uint32_t mixer_scale(void)
+{
+    unsigned int attenuation, whole, fraction;
+    if (mixer_block == NULL || mixer_block->mute) return 0;
+    if (mixer_block->gain >= 0) return 32768;
+    attenuation = (unsigned int)-mixer_block->gain;
+    if (attenuation >= 640) return mixer_gain[40];
+    whole = attenuation >> 4;
+    fraction = attenuation & 15u;
+    return (mixer_gain[whole] * (16u - fraction) +
+            mixer_gain[whole + 1u] * fraction) >> 4;
+}
+
+/* An ID string is "SoundDMA#HAL_" + 4 hex ID digits + "_" + location. */
+static const char own_id_tail[] = "_0B70_10000000";
+
+/* OS_Hardware takes its reason code in R8, which -mmodule code uses as its
+ * static base, so the call lives in a leaf that preserves R8 itself.
+ * In: R0 = device, R1 = reason.  Out: R0 = 1 on success. */
+extern int btv_os_hardware(void *device, uint32_t reason);
+__asm__(
+    "\t.text\n"
+    "\t.arm\n"
+    "\t.global btv_os_hardware\n"
+    "btv_os_hardware:\n"
+    "\tstmfd sp!, {r8, lr}\n"
+    "\tmov r8, r1\n"
+    "\tswi 0x2007a\n"
+    "\tmovvc r0, #1\n"
+    "\tmovvs r0, #0\n"
+    "\tldmfd sp!, {r8, pc}\n");
+
+static int hardware_call(uint32_t reason)
+{
+    return btv_os_hardware(device_block, reason);
+}
+
+/* Sound_EnumerateControllers: after `from` (empty for the first). */
+static int next_controller(const char *from, char *output, uint32_t bytes)
+{
+    register uint32_t r0 __asm("r0") = (uint32_t)from;
+    register uint32_t r1 __asm("r1") = (uint32_t)output;
+    register uint32_t r2 __asm("r2") = bytes;
+    register uint32_t r3 __asm("r3") = 0;
+    register uint32_t success __asm("r4");
+    __asm volatile(
+        "swi 0x60149\n\t"
+        "movvc %4, #1\n\t"
+        "movvs %4, #0"
+        : "+r" (r0), "+r" (r1), "+r" (r2), "+r" (r3), "=r" (success)
+        :
+        : "cc", "memory", "lr");
+    (void)r0; (void)r1; (void)r2; (void)r3;
+    return success && output[0] != 0;
+}
+
+static void select_controller(const char *id)
+{
+    register uint32_t r0 __asm("r0") = (uint32_t)id;
+    register uint32_t r1 __asm("r1") = 0;
+    register uint32_t r2 __asm("r2") = 0;
+    register uint32_t r3 __asm("r3") = 0;
+    __asm volatile(
+        "swi 0x60148"
+        : "+r" (r0), "+r" (r1), "+r" (r2), "+r" (r3)
+        :
+        : "cc", "memory", "lr");
+    (void)r0; (void)r1; (void)r2; (void)r3;
+}
+
+static int is_own(const char *id)
+{
+    size_t length = strlen(id), tail = sizeof(own_id_tail) - 1;
+    return length >= tail && strcmp(id + length - tail, own_id_tail) == 0;
+}
+
+/* SoundDMA has no call that reports the active controller, so the first
+ * other controller is the one sound returns to.  On the iMX6 that is the
+ * only other one. */
+static void remember_previous(void)
+{
+    char id[CONTROLLER_ID_BYTES];
+    id[0] = 0;
+    previous[0] = 0;
+    while (next_controller(id, id, sizeof(id)))
+    {
+        if (!is_own(id))
+        {
+            memcpy(previous, id, sizeof(previous));
+            return;
+        }
+    }
+}
+
+static void build_device(void)
+{
+    memset(device_block, 0, sizeof(*device_block));
+    device_block->type = HAL_DEVICE_TYPE_AUDIO_CONTROLLER;
+    device_block->id = HAL_DEVICE_ID_BLUETOOTH_HFP;
+    device_block->location = HAL_DEVICE_LOCATION;
+    device_block->version = HAL_API_2;
+    device_block->description = description;
+    device_block->activate = &btv_audc_activate;
+    device_block->deactivate = &btv_audc_nothing;
+    device_block->reset = &btv_audc_nothing;
+    device_block->sleep = &btv_audc_zero;
+    device_block->device = -1;
+    device_block->test_irq = &btv_audc_zero;
+    device_block->clear_irq = &btv_audc_nothing;
+    device_block->mixer = mixer_block;
+    device_block->channels_out = 1;
+    device_block->pre_enable = &btv_audc_nothing;
+    device_block->post_enable = &btv_audc_nothing;
+    device_block->pre_disable = &btv_audc_pre_disable;
+    device_block->post_disable = &btv_audc_nothing;
+    device_block->irq_handle = &btv_audc_zero;
+    device_block->rate_count = 1;
+    device_block->rate_table = rates;
+    device_block->set_rate = &btv_audc_nothing;
+    device_block->custom_dma_enable = &btv_audc_custom_dma_enable;
+    device_block->flags = AUDIO_FLAG_STEREO_REVERSE; /* L, R order; callback stays asynchronous */
+    device_block->min_buffer_bytes = 64u * 4u;
+    device_block->buffer_align = 16u;
+}
+
+static void build_mixer(void)
+{
+    memset(mixer_block, 0, sizeof(*mixer_block));
+    mixer_block->type = HAL_DEVICE_TYPE_AUDIO_MIXER;
+    mixer_block->id = HAL_DEVICE_ID_SOFTWARE_MIXER;
+    mixer_block->location = HAL_DEVICE_LOCATION;
+    mixer_block->version = 1u; /* HAL mixer API 0.1 */
+    mixer_block->description = mixer_description;
+    mixer_block->activate = &btv_audc_activate;
+    mixer_block->deactivate = &btv_audc_nothing;
+    mixer_block->reset = &btv_audc_nothing;
+    mixer_block->sleep = &btv_audc_zero;
+    mixer_block->device = -1;
+    mixer_block->test_irq = &btv_audc_zero;
+    mixer_block->clear_irq = &btv_audc_nothing;
+    mixer_block->controller = device_block;
+    mixer_block->channels = 1;
+    mixer_block->get_features = &btv_mix_features;
+    mixer_block->set_mix = &btv_mix_set;
+    mixer_block->get_mix = &btv_mix_get;
+    mixer_block->get_limits = &btv_mix_limits;
+}
+
+static void call_sound_dma(void)
+{
+    register uint32_t r0 __asm("r0") = 0;
+    register uint32_t r1 __asm("r1") = device_block->callback_parameter;
+    register uint32_t r2 __asm("r2") = (uint32_t)device_block->callback;
+    register uint32_t r3 __asm("r3") = 0;
+    register uint32_t r12 __asm("r12") = 0;
+    /* The callback may run SoundDMA's fill routine in place (RT_Yield),
+     * which corrupts R1-R9, R11 and R12: R8 is this module's static base,
+     * and a clobbered R8 sent the buffer loop to a wild address.  Save
+     * every callee-saved register, and SL, around the call. */
+    __asm volatile(
+        "stmfd sp!, {r4-r11}\n\t"
+        "mov lr, pc\n\t"
+        "mov pc, %2\n\t"
+        "ldmfd sp!, {r4-r11}"
+        : "+r" (r0), "+r" (r1), "+r" (r2), "+r" (r3), "+r" (r12)
+        :
+        : "cc", "memory", "lr");
+    (void)r0; (void)r1; (void)r2; (void)r3; (void)r12;
+}
+
+static void consume(btv_bridge_pcm *pcm)
+{
+    const int16_t *source = device_block->buffer[next_buffer];
+    size_t frames = device_block->buffer_bytes / 4u, index;
+    uint32_t scale = mixer_scale();
+    if (frames > MONO_BYTES / 2u) frames = MONO_BYTES / 2u;
+    unsigned int loudest = 0;
+    for (index = 0; index < frames; ++index)
+    {
+        int sum = (int)source[index * 2u] + (int)source[index * 2u + 1u];
+        int sample = (int)(((sum / 2) * (int32_t)scale) >> 15);
+        unsigned int level = (unsigned int)(sample < 0 ? -sample : sample);
+        if (level > loudest) loudest = level;
+        mono[index * 2u] = (uint8_t)sample;
+        mono[index * 2u + 1u] = (uint8_t)((unsigned int)sample >> 8);
+    }
+    if (loudest > peak) peak = loudest;
+    if (loudest != 0) ++audible;
+    (void)btv_bridge_pcm_write(pcm, mono, frames * 2u);
+    next_buffer ^= 1u;
+    ++consumed;
+    if (in_sound_dma) return;      /* SoundDMA is already inside us */
+    in_sound_dma = 1;
+    call_sound_dma();
+    in_sound_dma = 0;
+}
+
+/* Is a controller with our ID in SoundDMA's list? */
+static int own_controller_listed(void)
+{
+    char id[CONTROLLER_ID_BYTES];
+    id[0] = 0;
+    while (next_controller(id, id, sizeof(id)))
+        if (is_own(id)) return 1;
+    return 0;
+}
+
+static int register_device(void)
+{
+    static const char prefix[] = "SoundDMA#HAL";
+    char id[sizeof(prefix) - 1 + sizeof(own_id_tail)];
+    if (!claim_device_block()) return 0;
+    /* A controller with our ID that we did not add belongs to a previous
+     * instance of this module whose workspace is gone.  SoundDMA would
+     * abort the moment it touched either device, so leave well alone. */
+    if (own_controller_listed())
+    {
+        stale_entry = 1;
+        return 0;
+    }
+    build_device();
+    if (!mixer_registered) build_mixer();
+    remember_previous();
+    next_buffer = 0;
+    consumed = 0;
+    if (!hardware_call(OS_HARDWARE_ADD_DEVICE)) return 0;
+    registered = 1;
+    if (!mixer_registered)
+    {
+        if (!btv_os_hardware(mixer_block, OS_HARDWARE_ADD_DEVICE))
+        {
+            (void)hardware_call(OS_HARDWARE_REMOVE_DEVICE);
+            registered = 0;
+            return 0;
+        }
+        mixer_registered = 1;
+    }
+    /* SoundDMA adopts a new device on its own only when it has none. */
+    memcpy(id, prefix, sizeof(prefix) - 1);
+    memcpy(id + sizeof(prefix) - 1, own_id_tail, sizeof(own_id_tail));
+    select_controller(id);
+    return 1;
+}
+
+static int unregister_device(void)
+{
+    /* Hand sound back to the machine's own controller BEFORE leaving the
+     * device list.  Removing the selected controller makes SoundDMA
+     * disable sound and adopt another from inside the service call, with
+     * our entries being called while the stream is still live; that path
+     * aborted inside SoundDMA (&FC052230) and took the machine with it.
+     * Switching first leaves our device idle, so removing it is quiet. */
+    if (previous[0] != 0) select_controller(previous);
+    /* If the removal fails we must stay registered: SoundDMA would keep a
+     * pointer to this device block, and reading it after the module is
+     * killed aborts inside SoundDMA, with sound dead until a reboot. */
+    if (!hardware_call(OS_HARDWARE_REMOVE_DEVICE)) return 0;
+    /* Trust nothing: if SoundDMA still lists the device, stay registered
+     * so the module refuses to be killed. */
+    if (own_controller_listed()) return 0;
+    registered = 0;
+    device_block->running = 0;
+    if (mixer_registered &&
+        btv_os_hardware(mixer_block, OS_HARDWARE_REMOVE_DEVICE))
+        mixer_registered = 0;
+    return 1;
+}
+
+static int buffers_ready(void)
+{
+    return device_block != NULL && device_block->running && device_block->callback != NULL &&
+           device_block->buffer[0] != NULL && device_block->buffer[1] != NULL;
+}
+
+void btv_sound_device_sync(btv_bridge_pcm *pcm, int active)
+{
+    unsigned int count;
+    if (active && !registered)
+    {
+        stereo_mode = 0;
+        description = hfp_description;
+        rates[0].frequency = 8000u * 1024u;
+        rates[0].period = 125;
+        if (!register_device()) return;
+    }
+    else if (!active && registered && !stereo_mode)
+    {
+        (void)unregister_device();
+        return;
+    }
+    if (!registered || stereo_mode || pcm == NULL) return;
+    for (count = 0; count < MAX_BUFFERS_PER_PUMP; ++count)
+    {
+        if (!buffers_ready() || pcm->playback.used > LOW_WATER_BYTES)
+            break;
+        consume(pcm);
+    }
+}
+
+static void consume_stereo(void)
+{
+    const int16_t *source = device_block->buffer[next_buffer];
+    unsigned int frames = device_block->buffer_bytes >> 2, index, loudest = 0;
+    uint32_t scale = mixer_scale();
+    for (index = 0; index < frames && ring_used < RING_FRAMES; ++index)
+    {
+        unsigned int slot = (ring_head + ring_used) & (RING_FRAMES - 1u);
+        int left = (int)((source[index * 2u] * (int32_t)scale) >> 15);
+        int right = (int)((source[index * 2u + 1u] * (int32_t)scale) >> 15);
+        if (test_tone_frames != 0)
+        {
+            left = right = (test_tone_phase++ / 55u) & 1u ? 8000 : -8000;
+            --test_tone_frames;
+        }
+        unsigned int level = (unsigned int)(left < 0 ? -left : left);
+        if (level > loudest) loudest = level;
+        ring[slot * 2u] = (int16_t)left;
+        ring[slot * 2u + 1u] = (int16_t)right;
+        ++ring_used;
+    }
+    if (loudest > peak) peak = loudest;
+    if (loudest != 0) ++audible;
+    next_buffer ^= 1u;
+    ++consumed;
+    if (in_sound_dma) return;      /* SoundDMA is already inside us */
+    in_sound_dma = 1;
+    call_sound_dma();
+    in_sound_dma = 0;
+}
+
+/* Milliseconds of audio in one SoundDMA buffer, rounded down. */
+/* Frames in one SoundDMA buffer (stereo, 16-bit). */
+static uint32_t buffer_frames(void)
+{
+    return device_block == NULL ? 0u : device_block->buffer_bytes >> 2;
+}
+
+static void pump_stereo(void)
+{
+    unsigned int count;
+    uint32_t frames = buffer_frames();
+    if (frames != 0 && !stereo_pace.primed)
+        btv_sound_pace_start(&stereo_pace, frames, STEREO_PRIME_BUFFERS);
+    for (count = 0; count < MAX_BUFFERS_PER_PUMP; ++count)
+    {
+        if (!buffers_ready() || ring_used >= STEREO_LOW_WATER ||
+            ring_used + frames > RING_FRAMES)
+            break;
+        /* Only take what has had time to be filled. */
+        if (frames != 0)
+        {
+            if (!btv_sound_pace_take(&stereo_pace, frames)) break;
+        }
+        else if (count >= STEREO_PRIME_BUFFERS) break;
+        consume_stereo();
+    }
+    /* A full ring means the sink is not draining: do not bank credit for
+     * a burst of stale buffers later. */
+    if (ring_used >= STEREO_LOW_WATER) btv_sound_pace_idle(&stereo_pace);
+}
+
+int btv_sound_device_stereo_sync(int active, uint32_t rate, uint32_t now)
+{
+    if (active && registered && stereo_mode)
+    {
+        uint32_t elapsed = now - stereo_clock;
+        stereo_clock = now;
+        btv_sound_pace_tick(&stereo_pace, elapsed, stereo_rate,
+                            buffer_frames(), STEREO_PRIME_BUFFERS * 4u);
+    }
+    if (active && !registered)
+    {
+        stereo_mode = 1;
+        stereo_rate = rate;
+        stereo_clock = now;
+        /* Prime the ring so the encoder has something before the clock
+         * has earned a buffer. */
+        btv_sound_pace_start(&stereo_pace, buffer_frames(),
+                             STEREO_PRIME_BUFFERS);
+        description = a2dp_description;
+        rates[0].frequency = rate * 1024u;
+        rates[0].period = (uint8_t)(rate >= 48000u ? 21 : 23);
+        ring_head = ring_used = 0;
+        if (!register_device()) return 0;
+    }
+    else if (!active && registered && stereo_mode)
+    {
+        if (!unregister_device()) return 1;   /* still registered */
+        stereo_mode = 0;
+        return 0;
+    }
+    if (registered && stereo_mode) pump_stereo();
+    return registered && stereo_mode;
+}
+
+unsigned int btv_sound_device_stereo_read(int16_t *output,
+                                          unsigned int frames)
+{
+    unsigned int index, copied = 0;
+    if (!registered || !stereo_mode) return 0;
+    pump_stereo();
+    for (index = 0; index < frames && ring_used != 0; ++index)
+    {
+        output[index * 2u] = ring[ring_head * 2u];
+        output[index * 2u + 1u] = ring[ring_head * 2u + 1u];
+        ring_head = (ring_head + 1u) & (RING_FRAMES - 1u);
+        --ring_used;
+        ++copied;
+    }
+    return copied;
+}
+
+/* Leave a device the kernel can walk and no one can use.  Only for a
+ * finalisation this module cannot refuse: the alternative is a list node
+ * pointing at code that has gone, which aborts inside the kernel. */
+void btv_sound_device_orphan(void)
+{
+    btv_hal_entry *inert;
+    if ((!registered && !mixer_registered) || device_block == NULL) return;
+    inert = inert_entry();
+    if (mixer_registered)
+    {
+        mixer_block->activate = inert;
+        mixer_block->deactivate = inert;
+        mixer_block->reset = inert;
+        mixer_block->sleep = inert;
+        mixer_block->test_irq = inert;
+        mixer_block->clear_irq = inert;
+        mixer_block->get_features = inert;
+        mixer_block->set_mix = inert;
+        mixer_block->get_mix = inert;
+        mixer_block->get_limits = inert;
+        mixer_block->description = (const char *)device_block + DEVICE_NAME_OFFSET;
+    }
+    device_block->activate = inert;
+    device_block->deactivate = inert;
+    device_block->reset = inert;
+    device_block->sleep = inert;
+    device_block->test_irq = inert;
+    device_block->clear_irq = inert;
+    device_block->pre_enable = inert;
+    device_block->post_enable = inert;
+    device_block->pre_disable = inert;
+    device_block->post_disable = inert;
+    device_block->irq_handle = inert;
+    device_block->set_rate = inert;
+    device_block->custom_dma_enable = inert;
+    device_block->rate_table = NULL;
+    device_block->rate_count = 0;
+    /* The name must live in the block too: SoundDMA reads it when
+     * anything lists the sound controllers. */
+    {
+        char *name = (char *)device_block + DEVICE_NAME_OFFSET;
+        strcpy(name, "Bluetooth (stopped)");
+        device_block->description = name;
+    }
+    device_block->running = 0;
+}
+
+uint32_t btv_sound_device_state(void)
+{
+    if (device_block == NULL) return stale_entry ? 4u : 0u;
+    return (registered ? 1u : 0u) | (device_block->running ? 2u : 0u) |
+           (stale_entry ? 4u : 0u) | (consumed << 8);
+}
+
+uint32_t btv_sound_device_meter(void)
+{
+    uint32_t value = (peak > 0xffffu ? 0xffffu : peak) |
+                     ((audible > 0xffffu ? 0xffffu : audible) << 16);
+    peak = 0;
+    return value;
+}
+
+int btv_sound_device_test_tone(uint32_t milliseconds)
+{
+    if (!registered || !stereo_mode || milliseconds == 0) return 0;
+    if (milliseconds > 5000u) milliseconds = 5000u;
+    test_tone_phase = 0;
+    test_tone_frames = milliseconds * (stereo_rate / 1000u);
+    return 1;
+}
+
+int btv_sound_device_registered(void)
+{
+    return registered || mixer_registered;
+}
+
+int btv_sound_device_running(void)
+{
+    return registered && device_block != NULL && device_block->running;
+}
+
+/* ---- 64-bit core interface additions -------------------------------
+ * The 64-bit SoundDMA takes a sink (Sound_RegisterSink); RISC OS 5's takes
+ * this HAL audio controller instead, so the sink path is absent here. */
+static int autoselect = 1;
+
+void btv_sound_device_autoselect(int on)
+{
+    autoselect = on != 0;
+}
+
+void btv_sound_device_external_volume(int on)
+{
+    (void)on;
+}
+
+/* Only asked while A2DP is suspended for silence, which the 32-bit build
+ * never does (BTUI_IDLE_DEFAULT 0).  Pulling SoundDMA's buffers from the
+ * ticker while suspended (0.71) is the prime suspect for the 0.71 abort. */
+int btv_sound_device_stereo_audible(void)
+{
+    return 0;
+}
+
+void btv_sound_device_flush(void)
+{
+}
+
+void btv_sound_device_counts(uint32_t *refused, uint32_t *dropped,
+                             uint32_t *queued)
+{
+    if (refused) *refused = 0;
+    if (dropped) *dropped = 0;
+    if (queued) *queued = 0;
+}
+
+uint32_t btv_sound_device_sink(const int16_t *frames, uint32_t count)
+{
+    (void)frames;
+    (void)count;
+    return 0;
+}

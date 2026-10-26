@@ -1,0 +1,30 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/* HCI synchronous wire format: Core 5.4, Vol 4, Part E, section 5.4.3. */
+#include "sco_frame.h"
+#include <string.h>
+int btv_sco_frame_decode(const uint8_t *packet, size_t bytes, btv_sco_frame *frame)
+{
+    btv_sco_frame result;
+    size_t expected;
+    if (frame == NULL || btv_hci_frame_size(BTV_HCI_SCO, packet, bytes, 255, &expected) != BTV_HCI_COMPLETE ||
+        expected != bytes) return -1;
+    result.handle = (uint16_t)(packet[0] | ((unsigned int)(packet[1] & 15) << 8));
+    if (result.handle > 0x0eff) return -1;
+    result.status = (packet[1] >> 4) & 3;
+    result.data = packet + 3;
+    result.bytes = packet[2];
+    *frame = result;
+    return 1;
+}
+size_t btv_sco_frame_encode(uint8_t *output, size_t capacity, uint16_t handle,
+    const uint8_t *data, size_t bytes)
+{
+    if (output == NULL || handle > 0x0eff || bytes > 255 || capacity < bytes + 3 ||
+        (bytes && data == NULL)) return 0;
+    if (bytes) memmove(output + 3, data, bytes);
+    output[0] = (uint8_t)handle;
+    output[1] = (uint8_t)(handle >> 8);
+    output[2] = (uint8_t)bytes;
+    return bytes + 3;
+}

@@ -1,0 +1,359 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/* Secured ACL through SDP, RFCOMM and baseline HFP service-level connection. */
+#include "bridge_voice.h"
+#include <string.h>
+
+#define HFP_SERVICE 0x111eu
+
+static int fail(btv_bridge_voice *voice, unsigned int error)
+{
+    voice->error = error;
+    voice->state = BTV_BV_FAILED;
+    return -1;
+}
+
+int btv_bridge_voice_start(btv_bridge_voice *voice,
+                           btv_bridge_controller *controller,
+                           const uint8_t indicators[7], uint32_t now)
+{
+    if (voice == 0 || controller == 0 || indicators == 0 ||
+        controller->state != BTV_BC_SECURED ||
+        controller->pending_event_bytes != 0)
+        return 0;
+    memset(voice, 0, sizeof(*voice));
+    voice->controller = controller;
+    memcpy(voice->indicators, indicators, sizeof(voice->indicators));
+    if (!btv_bridge_acl_start(&voice->acl, &controller->info,
+                              &controller->link) ||
+        !btv_bridge_sdp_start(&voice->discovery, &voice->acl,
+                              HFP_SERVICE, now))
+        return 0;
+    voice->state = BTV_BV_DISCOVERING;
+    return 1;
+}
+
+static int controller_event(btv_bridge_voice *voice, uint32_t now)
+{
+    const uint8_t *event;
+    uint8_t acl_event[257];
+    size_t bytes;
+    unsigned int count, index, retained;
+    int result, sco_result;
+    uint32_t submitted;
+    result = btv_bridge_controller_pump(voice->controller, now);
+    if (result < 0) return fail(voice, 1);
+    submitted = btv_bridge_controller_take_submitted(voice->controller);
+    if (submitted != 0 &&
+        !btv_sco_link_submitted(&voice->sco_link, submitted))
+        return fail(voice, 16);
+    event = btv_bridge_controller_event(voice->controller, &bytes);
+    if (event == 0) return result;
+    if (bytes >= 3 && event[0] == 0x13)
+    {
+        count = event[2];
+        retained = 0;
+        acl_event[0] = 0x13;
+        for (index = 0; index < count && 3u + index * 4u + 4u <= bytes;
+             ++index)
+            if ((uint16_t)(event[3 + index * 4] |
+                ((uint16_t)event[4 + index * 4] << 8)) == voice->acl.handle)
+            {
+                memcpy(acl_event + 3 + retained * 4,
+                       event + 3 + index * 4, 4);
+                ++retained;
+            }
+        if (bytes != 3u + count * 4u) return fail(voice, 24);
+        acl_event[1] = (uint8_t)(1 + retained * 4);
+        acl_event[2] = (uint8_t)retained;
+        result = retained == 0 ? 0 : btv_bridge_acl_event(&voice->acl,
+                    acl_event, 3u + retained * 4u);
+    }
+    else
+        result = btv_bridge_acl_event(&voice->acl, event, bytes);
+    if (result < 0) return fail(voice, 2);
+    if (result == 0)
+    {
+        sco_result = btv_sco_link_event(&voice->sco_link, event, bytes, now);
+        if (sco_result < 0) return fail(voice, 17);
+        result = sco_result;
+    }
+    if (result == 0)
+    {
+        result = btv_acl_link_event(&voice->controller->link, event, bytes, now);
+        if (result < 0) return fail(voice, 3);
+    }
+    if (!btv_bridge_controller_take_event(voice->controller))
+        return fail(voice, 4);
+    if (voice->controller->link.state != BTV_LINK_OPEN)
+        return fail(voice, 5);
+    return 1;
+}
+
+static int begin_rfcomm_close(btv_bridge_voice *voice, uint32_t now)
+{
+    if (!btv_bridge_rfcomm_close(&voice->rfcomm, now)) return 0;
+    voice->state = BTV_BV_CLOSING_RFCOMM;
+    return 1;
+}
+
+static int audio_pump(btv_bridge_voice *voice, uint32_t now)
+{
+    unsigned int audio_state;
+    btv_sco_link_tick(&voice->sco_link, now);
+    if (voice->sco_link.state == BTV_SL_RECOVER)
+        return fail(voice, 18);
+    if (voice->state == BTV_BV_AUDIO_SETUP)
+    {
+        if (voice->sco_link.state == BTV_SL_REJECTED)
+            return voice->audio_cancel ? begin_rfcomm_close(voice, now) :
+                   fail(voice, 19);
+        if (voice->sco_link.state == BTV_SL_OPEN)
+        {
+            if (voice->audio_cancel)
+            {
+                if (!btv_sco_link_disconnect(&voice->sco_link, now))
+                    return fail(voice, 20);
+                voice->state = BTV_BV_AUDIO_DISCONNECTING;
+                return 1;
+            }
+            if (!btv_bridge_sco_start(&voice->audio, &voice->sco_link,
+                    voice->alternate, voice->transmit_mtu,
+                    voice->input_bytes, voice->input_packets,
+                    voice->output_bytes, voice->output_packets))
+                return fail(voice, 21);
+            voice->state = BTV_BV_AUDIO_RUNNING;
+            return 1;
+        }
+        return 0;
+    }
+    if (voice->state == BTV_BV_AUDIO_RUNNING ||
+        voice->state == BTV_BV_AUDIO_DRAINING)
+    {
+        audio_state = btv_bridge_sco_pump(&voice->audio, now);
+        if (audio_state == BTV_BSD_FAILED) voice->audio_failed = 1;
+        if (voice->state == BTV_BV_AUDIO_RUNNING && voice->audio_failed)
+        {
+            btv_bridge_sco_stop(&voice->audio);
+            voice->state = BTV_BV_AUDIO_DRAINING;
+        }
+        if (voice->state == BTV_BV_AUDIO_DRAINING &&
+            (audio_state == BTV_BSD_CLOSED || audio_state == BTV_BSD_FAILED))
+        {
+            if (!btv_sco_link_disconnect(&voice->sco_link, now))
+                return fail(voice, 22);
+            voice->state = BTV_BV_AUDIO_DISCONNECTING;
+            return 1;
+        }
+        return 0;
+    }
+    if (voice->state == BTV_BV_AUDIO_DISCONNECTING)
+    {
+        if (voice->sco_link.state == BTV_SL_CLOSED)
+            return voice->audio_failed ? fail(voice, 23) :
+                   begin_rfcomm_close(voice, now);
+        return 0;
+    }
+    return 0;
+}
+
+static int active_pump(btv_bridge_voice *voice, uint32_t now)
+{
+    const btv_sdp_service *service;
+    int result, work;
+    work = 0;
+    result = controller_event(voice, now);
+    if (result < 0) return -1;
+    work |= result;
+    if (voice->state == BTV_BV_DISCOVERING)
+    {
+        result = btv_bridge_sdp_pump(&voice->discovery, now);
+        if (result < 0) return fail(voice, 6);
+        work |= result;
+        if (voice->discovery.state == BTV_BS_DONE)
+        {
+            service = btv_bridge_sdp_result(&voice->discovery);
+            if (service == 0) return fail(voice, 7);
+            voice->service = *service;
+            if (!btv_bridge_rfcomm_start(&voice->rfcomm, &voice->acl,
+                    &voice->discovery.dispatch,
+                    voice->service.rfcomm_channel, now))
+                return fail(voice, 8);
+            voice->state = BTV_BV_RFCOMM;
+            work = 1;
+        }
+    }
+    if (voice->state == BTV_BV_RFCOMM || voice->state == BTV_BV_HFP ||
+        voice->state == BTV_BV_READY ||
+        (voice->state >= BTV_BV_AUDIO_SETUP &&
+         voice->state <= BTV_BV_AUDIO_DISCONNECTING) ||
+        voice->state == BTV_BV_CLOSING_RFCOMM)
+    {
+        result = btv_bridge_rfcomm_pump(&voice->rfcomm, now);
+        if (result < 0) return fail(voice, 9);
+        work |= result;
+        if (voice->state == BTV_BV_RFCOMM &&
+            voice->rfcomm.state == BTV_BR_READY)
+        {
+            if (!btv_hfp_link_start(&voice->hfp,
+                    &voice->rfcomm.binding.session, voice->indicators))
+                return fail(voice, 10);
+            voice->state = BTV_BV_HFP;
+            work = 1;
+        }
+        if (voice->state == BTV_BV_HFP || voice->state == BTV_BV_READY ||
+            (voice->state >= BTV_BV_AUDIO_SETUP &&
+             voice->state <= BTV_BV_AUDIO_DISCONNECTING))
+        {
+            result = btv_hfp_link_pump(&voice->hfp, now);
+            if (result < 0) return fail(voice, 11);
+            work |= result;
+            if (voice->state == BTV_BV_HFP &&
+                voice->hfp.gateway.stage == BTV_AG_READY)
+            {
+                voice->state = BTV_BV_READY;
+                work = 1;
+            }
+        }
+        if (voice->state == BTV_BV_CLOSING_RFCOMM &&
+            voice->rfcomm.state == BTV_BR_DONE)
+        {
+            voice->state = BTV_BV_DRAINING_ACL;
+            work = 1;
+        }
+        if (voice->state >= BTV_BV_AUDIO_SETUP &&
+            voice->state <= BTV_BV_AUDIO_DISCONNECTING)
+        {
+            result = audio_pump(voice, now);
+            if (result < 0) return -1;
+            work |= result;
+        }
+    }
+    return work;
+}
+
+static int close_pump(btv_bridge_voice *voice, uint32_t now)
+{
+    int result;
+    if (voice->state == BTV_BV_DRAINING_ACL)
+    {
+        result = btv_bridge_acl_stop(&voice->acl);
+        if (result < 0) return fail(voice, 12);
+        if (result == 0) return 0;
+        if (!btv_bridge_controller_disconnect(voice->controller, now))
+            return fail(voice, 13);
+        voice->state = BTV_BV_DISCONNECTING;
+        return 1;
+    }
+    if (voice->state == BTV_BV_DISCONNECTING)
+    {
+        result = btv_bridge_controller_pump(voice->controller, now);
+        if (result < 0) return fail(voice, 14);
+        if (voice->controller->state != BTV_BC_READY) return result;
+        voice->state = BTV_BV_CLOSING_CONTROLLER;
+        return 1;
+    }
+    if (voice->state == BTV_BV_CLOSING_CONTROLLER)
+    {
+        result = btv_bridge_controller_stop(voice->controller);
+        if (result < 0) return fail(voice, 15);
+        if (result == 0) return 0;
+        voice->state = BTV_BV_DONE;
+        return 1;
+    }
+    return 0;
+}
+
+int btv_bridge_voice_pump(btv_bridge_voice *voice, uint32_t now)
+{
+    if (voice == 0 || voice->state == BTV_BV_IDLE ||
+        voice->state == BTV_BV_DONE || voice->state == BTV_BV_FAILED)
+        return 0;
+    if (voice->state >= BTV_BV_DRAINING_ACL &&
+        voice->state <= BTV_BV_CLOSING_CONTROLLER)
+        return close_pump(voice, now);
+    return active_pump(voice, now);
+}
+
+int btv_bridge_voice_close(btv_bridge_voice *voice, uint32_t now)
+{
+    if (voice == 0 || voice->state == BTV_BV_IDLE ||
+        voice->state == BTV_BV_DONE) return 0;
+    if (voice->state == BTV_BV_FAILED ||
+        voice->state == BTV_BV_DISCOVERING)
+    {
+        btv_l2cap_dispatch_abort(&voice->discovery.dispatch);
+        voice->state = BTV_BV_DRAINING_ACL;
+        return 1;
+    }
+    if (voice->state == BTV_BV_RFCOMM || voice->state == BTV_BV_HFP ||
+        voice->state == BTV_BV_READY)
+    {
+        return begin_rfcomm_close(voice, now);
+    }
+    if (voice->state == BTV_BV_AUDIO_SETUP)
+    {
+        voice->audio_cancel = 1;
+        return 1;
+    }
+    if (voice->state == BTV_BV_AUDIO_RUNNING)
+    {
+        voice->audio_cancel = 1;
+        btv_bridge_sco_stop(&voice->audio);
+        voice->state = BTV_BV_AUDIO_DRAINING;
+        return 1;
+    }
+    return 1;
+}
+
+int btv_bridge_voice_start_audio(btv_bridge_voice *voice,
+                         const btv_sco_parameters *parameters,
+                         uint8_t alternate, uint16_t transmit_mtu,
+                         uint32_t input_bytes, uint32_t input_packets,
+                         uint32_t output_bytes, uint32_t output_packets,
+                         uint32_t now)
+{
+    btv_hci_commands *commands;
+    if (voice == 0 || voice->state != BTV_BV_READY || parameters == 0 ||
+        parameters->voice != 0x0060 ||
+        parameters->transmit_bandwidth != 8000 ||
+        parameters->receive_bandwidth != 8000 || alternate == 0)
+        return 0;
+    commands = btv_bridge_controller_commands(voice->controller);
+    if (commands == 0) return 0;
+    btv_sco_link_init(&voice->sco_link);
+    if (!btv_sco_link_start(&voice->sco_link, commands,
+            voice->controller->link.address, parameters, now)) return 0;
+    voice->audio_parameters = *parameters;
+    voice->alternate = alternate;
+    voice->transmit_mtu = transmit_mtu;
+    voice->input_bytes = input_bytes;
+    voice->input_packets = input_packets;
+    voice->output_bytes = output_bytes;
+    voice->output_packets = output_packets;
+    voice->state = BTV_BV_AUDIO_SETUP;
+    return 1;
+}
+
+int btv_bridge_voice_write(btv_bridge_voice *voice,
+                           const uint8_t *audio, size_t bytes)
+{
+    return voice != 0 && voice->state == BTV_BV_AUDIO_RUNNING ?
+           btv_bridge_sco_write(&voice->audio, audio, bytes) : -1;
+}
+
+int btv_bridge_voice_read(btv_bridge_voice *voice, uint8_t *audio,
+                          size_t capacity, btv_sco_packet_info *info)
+{
+    return voice != 0 && voice->state == BTV_BV_AUDIO_RUNNING ?
+           btv_bridge_sco_read(&voice->audio, audio, capacity, info) : -1;
+}
+
+int btv_bridge_voice_update(btv_bridge_voice *voice,
+                            const uint8_t indicators[7])
+{
+    if (voice == 0 || voice->state != BTV_BV_READY || indicators == 0 ||
+        !btv_hfp_ag_update(&voice->hfp.gateway, indicators)) return 0;
+    memcpy(voice->indicators, indicators, sizeof(voice->indicators));
+    return 1;
+}

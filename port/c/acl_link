@@ -1,0 +1,230 @@
+/*-
+ * Copyright (c) 2005 Iain Hibbert.
+ * Copyright (c) 2006 Itronix Inc.
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. The name of Itronix Inc. may not be used to endorse
+ *    or promote products derived from this software without specific
+ *    prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY ITRONIX INC. ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL ITRONIX INC. BE LIABLE FOR ANY
+ * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+/* Adapted from NetBSD hci_link.c ACL open/close and hci_event.c connection
+ * status/completion handling. Explicit transport evidence and recovery states
+ * replace kernel mbuf command dispatch and timer callbacks for this port. */
+#include "acl_link.h"
+#include "hci_frame.h"
+#include <string.h>
+#define CONNECT 1
+#define DISCONNECT 2
+
+static uint16_t read16(const uint8_t *p)
+{
+    return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+}
+
+static int recover(btv_acl_link *link, unsigned int error)
+{
+    link->state = BTV_LINK_RECOVER;
+    link->error = error;
+    return -1;
+}
+
+static void advance(btv_acl_link *link)
+{
+    if (link->state == BTV_LINK_RECOVER || link->state == BTV_LINK_CLOSED) return;
+    if (link->operation == CONNECT)
+    {
+        if (link->status_seen && link->command_status != 0)
+        {
+            if (link->event_seen && link->event_status == 0)
+                recover(link, BTV_LINK_BAD_EVENT);
+            else { link->state = BTV_LINK_REJECTED; link->error = BTV_LINK_COMMAND_ERROR; }
+        }
+        else if (link->event_seen && link->event_status != 0)
+        {
+            link->state = BTV_LINK_REJECTED;
+            link->error = BTV_LINK_EVENT_ERROR;
+        }
+        else if (link->usb_done && link->status_seen && link->event_seen)
+            link->state = BTV_LINK_OPEN;
+    }
+    else if (link->event_seen && link->event_status == 0)
+        link->state = BTV_LINK_CLOSED;
+    else if (link->usb_done && ((link->status_seen && link->command_status != 0) ||
+                              (link->event_seen && link->event_status != 0)))
+    {
+        link->state = BTV_LINK_OPEN;
+        link->error = link->event_seen ? BTV_LINK_EVENT_ERROR : BTV_LINK_COMMAND_ERROR;
+    }
+}
+
+void btv_acl_link_init(btv_acl_link *link)
+{
+    memset(link, 0, sizeof(*link));
+}
+
+int btv_acl_link_connect(btv_acl_link *link, const uint8_t address[6],
+                         uint8_t scan_mode, uint16_t clock_offset, uint32_t now)
+{
+    if (link->state != BTV_LINK_IDLE || address == NULL || scan_mode > 2) return 0;
+    memcpy(link->address, address, 6);
+    link->scan_mode = scan_mode;
+    link->clock_offset = clock_offset;
+    link->operation = CONNECT;
+    link->state = BTV_LINK_QUEUED;
+    link->started = now;
+    return 1;
+}
+
+int btv_acl_link_disconnect(btv_acl_link *link, uint32_t now)
+{
+    if (link->state != BTV_LINK_OPEN || (link->submitted && !link->usb_done)) return 0;
+    link->operation = DISCONNECT;
+    link->state = BTV_LINK_QUEUED;
+    link->submitted = link->usb_done = link->status_seen = link->event_seen = 0;
+    link->command_status = link->event_status = 0;
+    link->error = BTV_LINK_NO_ERROR;
+    link->started = now;
+    return 1;
+}
+
+void btv_acl_link_tick(btv_acl_link *link, uint32_t now)
+{
+    if ((link->state != BTV_LINK_QUEUED && link->state != BTV_LINK_WAIT) ||
+        (uint32_t)(now - link->started) < 30000u) return;
+    if (link->submitted) recover(link, BTV_LINK_TIMEOUT);
+    else
+    {
+        link->state = link->operation == CONNECT ? BTV_LINK_REJECTED : BTV_LINK_OPEN;
+        link->error = BTV_LINK_TIMEOUT;
+    }
+}
+
+size_t btv_acl_link_command(btv_acl_link *link, uint8_t *output, size_t capacity, uint32_t now)
+{
+    uint8_t parameters[13];
+    btv_acl_link_tick(link, now);
+    if (link->state != BTV_LINK_QUEUED) return 0;
+    memset(parameters, 0, sizeof(parameters));
+    if (link->operation == CONNECT)
+    {
+        memcpy(parameters, link->address, 6);
+        parameters[6] = 0x18; /* DM1 | DH1, the NetBSD initial ACL mask. */
+        parameters[8] = link->scan_mode;
+        parameters[10] = (uint8_t)link->clock_offset;
+        parameters[11] = (uint8_t)(link->clock_offset >> 8);
+        return btv_hci_command(output, capacity, 0x0405, parameters, 13);
+    }
+    parameters[0] = (uint8_t)link->handle;
+    parameters[1] = (uint8_t)(link->handle >> 8);
+    parameters[2] = 0x13; /* Remote User Terminated Connection. */
+    return btv_hci_command(output, capacity, 0x0406, parameters, 3);
+}
+
+int btv_acl_link_sent(btv_acl_link *link, uint32_t now)
+{
+    if (link->state != BTV_LINK_QUEUED) return 0;
+    link->submitted = 1;
+    if ((uint32_t)(now - link->started) >= 30000u)
+    {
+        recover(link, BTV_LINK_TIMEOUT);
+        return 0;
+    }
+    link->state = BTV_LINK_WAIT;
+    link->started = now;
+    return 1;
+}
+
+int btv_acl_link_usb_done(btv_acl_link *link, int success)
+{
+    if (!link->submitted || link->usb_done) return 0;
+    link->usb_done = 1;
+    if (!success) return recover(link, BTV_LINK_USB_ERROR);
+    advance(link);
+    return 1;
+}
+
+int btv_acl_link_event(btv_acl_link *link, const uint8_t *packet, size_t bytes, uint32_t now)
+{
+    size_t expected;
+    uint16_t opcode, handle;
+    btv_acl_link_tick(link, now);
+    if (link->state == BTV_LINK_RECOVER) return -1;
+    if (btv_hci_frame_size(BTV_HCI_EVENT, packet, bytes, 255, &expected) != BTV_HCI_COMPLETE || expected != bytes)
+        return recover(link, BTV_LINK_BAD_EVENT);
+    if (packet[0] == 0x10)
+        return recover(link, bytes == 3 ? BTV_LINK_HARDWARE_ERROR : BTV_LINK_BAD_EVENT);
+    if (packet[0] == 0x0f)
+    {
+        if (bytes != 6) return recover(link, BTV_LINK_BAD_EVENT);
+        opcode = read16(packet + 4);
+        if (!link->submitted || opcode != (link->operation == CONNECT ? 0x0405 : 0x0406)) return 0;
+        if (link->status_seen) return 0;
+        link->status_seen = 1;
+        link->command_status = packet[2];
+    }
+    else if (packet[0] == 3)
+    {
+        if (bytes != 13) return recover(link, BTV_LINK_BAD_EVENT);
+        if (link->operation != CONNECT || !link->submitted ||
+            (link->state != BTV_LINK_WAIT && link->state != BTV_LINK_REJECTED) ||
+            memcmp(packet + 5, link->address, 6) != 0) return 0;
+        if (link->event_seen) return recover(link, BTV_LINK_BAD_EVENT);
+        link->event_seen = 1;
+        link->event_status = packet[2];
+        if (packet[2] == 0)
+        {
+            handle = read16(packet + 3);
+            if (handle > 0x0fff || packet[11] != 1 || packet[12] > 2)
+                return recover(link, BTV_LINK_BAD_EVENT);
+            link->handle = handle;
+            link->encryption = packet[12];
+        }
+    }
+    else if (packet[0] == 5)
+    {
+        if (bytes != 6) return recover(link, BTV_LINK_BAD_EVENT);
+        handle = read16(packet + 3);
+        if (handle != link->handle || !(link->state == BTV_LINK_OPEN ||
+            (link->operation == DISCONNECT && (link->state == BTV_LINK_WAIT || link->state == BTV_LINK_QUEUED)) ||
+            (link->operation == CONNECT && link->event_seen && link->event_status == 0))) return 0;
+        if (packet[2] == 0)
+        {
+            link->disconnect_reason = packet[5];
+            link->state = BTV_LINK_CLOSED;
+            return 1;
+        }
+        if (link->operation != DISCONNECT || !link->submitted) return 0;
+        link->event_seen = 1;
+        link->event_status = packet[2];
+    }
+    else return 0;
+    advance(link);
+    return link->state == BTV_LINK_RECOVER ? -1 : 1;
+}
+
+int btv_acl_link_handle(const btv_acl_link *link, uint16_t *handle)
+{
+    if (link->state != BTV_LINK_OPEN || handle == NULL) return 0;
+    *handle = link->handle;
+    return 1;
+}

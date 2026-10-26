@@ -1,0 +1,33 @@
+Bluetooth for RISC OS
+=====================
+
+Plays sound through Bluetooth speakers and headphones (A2DP), and works
+with Bluetooth mice and keyboards (classic and Low Energy), through a
+USB Bluetooth adapter. Tested with a TP-Link UB400 (CSR8510) on a
+Raspberry Pi CM4 under RISC OS 5.
+
+Icon bar
+  SELECT   open the Devices window
+  MENU     status, Info, Devices, connect the saved speaker,
+           Disconnect all, Configure, Quit
+  ADJUST   open Configure > Bluetooth
+
+Devices window
+  Scan       look for devices for 10 seconds; put the device in
+             pairing mode first
+  Connect    pair with the chosen device and connect it
+  Disconnect drop the chosen device's connection
+  Forget     remove the pairing; the device must be paired again
+
+Paired devices come back by themselves: when the computer starts, and
+whenever a sleeping mouse or keyboard wakes. A speaker that was off is
+picked up within a few minutes of being switched on, or click Connect.
+
+Problems are shown in the Devices window's status line, never in a box
+that would stop the desktop.
+
+The drivers (BluetoothVoice and the USB driver) are loaded before the
+desktop starts, from Choices:Boot.PreDesk.Bluetooth. Use !Install to
+add or remove everything.
+
+Settings and pairings are kept in Choices:Bluetooth.

@@ -1,0 +1,69 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#ifndef BTV_HCI_BOOTSTRAP_H
+#define BTV_HCI_BOOTSTRAP_H
+#include "hci_version.h"
+
+enum btv_boot_stage
+{
+    BTV_BOOT_RESET, BTV_BOOT_ADDRESS, BTV_BOOT_BUFFERS, BTV_BOOT_FEATURES,
+    BTV_BOOT_EXTENDED, BTV_BOOT_VERSION, BTV_BOOT_COMMANDS,
+    BTV_BOOT_DISCOVERED, BTV_BOOT_FAILED
+};
+enum btv_boot_error
+{
+    BTV_BOOT_NO_ERROR, BTV_BOOT_TIMEOUT, BTV_BOOT_BAD_EVENT,
+    BTV_BOOT_CONTROLLER_ERROR, BTV_BOOT_TRANSPORT_ERROR, BTV_BOOT_HARDWARE_ERROR
+};
+typedef struct btv_controller_info
+{
+    uint8_t address[6]; /* Bluetooth wire order, least significant octet first */
+    uint16_t acl_bytes, acl_packets, sco_packets;
+    uint8_t sco_bytes, features[3][8], commands[64];
+    uint8_t feature_pages, max_feature_page, commands_reported;
+    btv_hci_version version;
+} btv_controller_info;
+typedef struct btv_hci_bootstrap
+{
+    /* Private working state; publish information only through snapshot. */
+    btv_controller_info info;
+    unsigned int stage, error;
+    uint8_t credits, awaiting, status, page, scheduler_owned, failed_stage;
+    uint8_t skip_extended;
+    uint32_t started, changed;
+} btv_hci_bootstrap;
+
+/* Fresh, exclusively owned controller only: this sequence issues HCI Reset.
+ * The owner must drain old USB operations and tear down old links first.
+ * Calls run on one serial deferred context, never a USB/guest IRQ callback.
+ * A power-up-noop controller starts with zero credits until it advertises them.
+ * now is a monotonic millisecond counter, allowed to wrap at 32 bits. */
+void btv_hci_bootstrap_start(btv_hci_bootstrap *boot, uint32_t now, int power_up_noop);
+/* Before the first submission, delegate command credits to hci_commands.
+ * In this mode command may produce bytes with no local credit; they MUST go
+ * through the controller scheduler. sent is called only after that scheduler
+ * accepts USB submission. This avoids stale local credits after queued replies.
+ * Standalone callers retain the original internal-credit behavior by default. */
+int btv_hci_bootstrap_use_scheduler(btv_hci_bootstrap *boot);
+
+/* Some CSR-compatible USB controllers advertise extended feature pages but
+ * never complete Read Local Extended Features.  The base feature page,
+ * version and supported-command mask are sufficient for the voice path.
+ * Call this after start and before the first command for those controllers. */
+int btv_hci_bootstrap_skip_extended(btv_hci_bootstrap *boot);
+
+/* Peek a command without changing state. Zero means no command or insufficient
+ * capacity (output unchanged). After successful transport submission call sent
+ * immediately, before delivering events. On a busy transport, retain/re-peek.
+ * USB transfer completion is not an HCI acknowledgement; report a failed
+ * transfer through abort, never re-send an ambiguously delivered command. */
+size_t btv_hci_bootstrap_command(const btv_hci_bootstrap *boot, uint8_t *output, size_t capacity);
+int btv_hci_bootstrap_sent(btv_hci_bootstrap *boot, uint32_t now);
+int btv_hci_bootstrap_event(btv_hci_bootstrap *boot, const uint8_t *packet, size_t bytes, uint32_t now);
+void btv_hci_bootstrap_tick(btv_hci_bootstrap *boot, uint32_t now);
+void btv_hci_bootstrap_abort(btv_hci_bootstrap *boot);
+
+/* Success means controller information was discovered, not that pairing,
+ * security, links, profiles or audio are ready. Failure leaves output intact. */
+int btv_hci_bootstrap_snapshot(const btv_hci_bootstrap *boot, btv_controller_info *output);
+#endif

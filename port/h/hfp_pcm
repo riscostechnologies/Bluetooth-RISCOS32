@@ -1,0 +1,51 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        hfp_pcm
+ * Purpose:     Buffer baseline HFP PCM between audio APIs and SCO packets.
+ ******************************************************************/
+#ifndef BTV_HFP_PCM_H
+#define BTV_HFP_PCM_H
+#include "pcm_queue.h"
+#include "hfp_audio.h"
+
+#define BTV_HFP_PCM_RATE 8000u
+#define BTV_HFP_PCM_CHANNELS 1u
+#define BTV_HFP_PCM_BITS 16u
+#define BTV_HFP_PCM_FRAME_BYTES 2u
+#define BTV_HFP_PCM_STORAGE 4096u
+
+typedef struct btv_hfp_pcm
+{
+    btv_hfp_audio *audio;
+    btv_pcm_queue playback, capture;
+    uint8_t playback_storage[BTV_HFP_PCM_STORAGE];
+    uint8_t capture_storage[BTV_HFP_PCM_STORAGE];
+    uint8_t playback_packet[254], capture_packet[255];
+    uint8_t silence[254];
+    btv_sco_packet_info capture_info;
+    uint32_t next_sequence, concealed;
+    uint16_t packet_bytes;
+    uint8_t playback_pending, capture_pending, failed;
+} btv_hfp_pcm;
+
+/* Baseline format is 8000 Hz, mono, signed 16-bit little-endian PCM, matching
+ * pinned NetBSD btsco for Voice_Setting 0x0060. packet_bytes is a whole-frame
+ * nominal HCI payload size used for playback and for silence when a lost SCO
+ * report carries no bytes. This layer owns no RISC OS sound device or clock. */
+int btv_hfp_pcm_init(btv_hfp_pcm *pcm, btv_hfp_audio *audio,
+                     uint16_t packet_bytes);
+
+/* One bounded capture and playback step. Returns 1 if either direction moved,
+ * 0 for backpressure/no work, -1 after session/format failure. Non-good SCO
+ * payloads become equal-length silence. Sequence gaps insert nominal silence
+ * one packet per call before the later packet, preserving bounded execution. */
+int btv_hfp_pcm_pump(btv_hfp_pcm *pcm);
+
+/* Copied whole-frame application queues. Short results are normal capacity or
+ * availability backpressure. Byte order remains little-endian. */
+size_t btv_hfp_pcm_playback_write(btv_hfp_pcm *pcm,
+                                  const void *data, size_t bytes);
+size_t btv_hfp_pcm_capture_read(btv_hfp_pcm *pcm,
+                                void *data, size_t bytes);
+#endif

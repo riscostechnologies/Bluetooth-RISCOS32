@@ -1,0 +1,41 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#ifndef BTV_SCO_LINK_H
+#define BTV_SCO_LINK_H
+#include "sco_setup.h"
+#include "hci_commands.h"
+enum btv_sco_link_state { BTV_SL_IDLE, BTV_SL_WAIT, BTV_SL_OPEN, BTV_SL_REJECTED, BTV_SL_CLOSED, BTV_SL_RECOVER, BTV_SL_CLOSING };
+typedef struct btv_sco_link {
+    btv_hci_commands *commands;
+    btv_sco_complete result;
+    uint8_t address[6], submitted, command_done, command_status, event_seen;
+    uint32_t ticket, started;
+    unsigned int state;
+    uint8_t closing, disconnect_seen, timed_out;
+} btv_sco_link;
+void btv_sco_link_init(btv_sco_link *link);
+/* One outstanding synchronous setup per peer on an established secured ACL.
+ * Caller chooses profile/controller parameters. Uses controller-wide command
+ * scheduler; FULL leaves link idle for retry. No actual USB calls here. */
+int btv_sco_link_start(btv_sco_link *link, btv_hci_commands *commands,
+    const uint8_t address[6], const btv_sco_parameters *parameters, uint32_t now);
+/* Parent calls immediately after commands_sent for this ticket. Events and
+ * USB completions continue through the global scheduler. */
+int btv_sco_link_submitted(btv_sco_link *link, uint32_t ticket);
+/* Queues Disconnect for the voice handle, reason Remote User Terminated.
+ * Stops exposing audio parameters immediately. FULL leaves OPEN for retry.
+ * On an unsent timeout or controller rejection without a close event, returns
+ * to OPEN with timed_out/command_status set, allowing explicit caller retry. */
+int btv_sco_link_disconnect(btv_sco_link *link, uint32_t now);
+void btv_sco_link_tick(btv_sco_link *link, uint32_t now);
+/* Route non-command HCI events here. 1 handled, 0 unrelated, -1 recovery.
+ * OPEN requires submitted USB, successful scheduler reply (USB + Status) and
+ * peer-matching synchronous completion. Duplicates do not replace parameters.
+ * Setup timeout after submission freezes scheduler pending parent recovery.
+ * CLOSED/REJECTED never imply all physical IO has drained. */
+int btv_sco_link_event(btv_sco_link *link, const uint8_t *event, size_t bytes, uint32_t now);
+/* Returns parameters only while OPEN. Owner still checks codec and configures
+ * transport before audio. Local closure waits for command receipts as well as
+ * the disconnection event; audio transfers must still be drained separately. */
+const btv_sco_complete *btv_sco_link_result(const btv_sco_link *link);
+#endif

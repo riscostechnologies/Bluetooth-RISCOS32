@@ -1,0 +1,66 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/* Diagnostic: BluetoothVoice core state. */
+#include <kernel.h>
+#include <stdio.h>
+#include <string.h>
+int main(int argc, char **argv)
+{
+    _kernel_swi_regs r;
+    _kernel_oserror *e;
+    (void)argv;
+    memset(&r, 0, sizeof(r));
+    r.r[1] = 2;
+    e = _kernel_swi(0xD7BC8, &r, &r);
+    if (e) { printf("Core read error: %s\n", e->errmess); return 1; }
+    printf("state %d error &%X gen %d passkey gen %d key %d problem &%X scanning %d\n",
+           r.r[1], r.r[2], r.r[3], r.r[4], r.r[5], r.r[6], r.r[7]);
+    memset(&r, 0, sizeof(r));
+    r.r[1] = 3;
+    e = _kernel_swi(0xD7BC8, &r, &r);
+    if (e) printf("detail: %s\n", e->errmess);
+    /* "queued ev/in" are how many transfers are outstanding, not ticket
+     * numbers: they should sit at their maximum (8 event, 4 ACL in)
+     * while the core is running.  A 1 there is the fault that capped
+     * A2DP at 50 packets a second. */
+    else printf("detail: boot stage %d/err %d config %d cmds %d waiting %d op &%X credits %d queued ev %d in %d; cmd ticket %X out %X drive &%08X\n",
+                r.r[1] & 0xff, (r.r[1] >> 8) & 0xff, (r.r[1] >> 16) & 0xff, (r.r[1] >> 24) & 0xff,
+                r.r[2] & 0xff, (r.r[2] >> 8) & 0xffff, (r.r[2] >> 24) & 0xff,
+                r.r[3], r.r[5], r.r[4], r.r[6], r.r[7]);
+    {
+        static unsigned char trace[48 * 32];
+        static const char *kinds[] = { "?", "EVT<", "ACL<", "ACL>", "CMD>", "NOTE" };
+        unsigned int i, n;
+        memset(&r, 0, sizeof(r));
+        r.r[1] = argc > 1 ? 5 : 4;
+        r.r[2] = (int)trace;
+        r.r[3] = sizeof(trace);
+        if (_kernel_swi(0xD7BC8, &r, &r) == NULL && r.r[3] > 0)
+        {
+            if (argc > 1) printf("log at failure &%X:\n", r.r[4]);
+            /* Oldest first. */
+            unsigned int order[48], count = 0, j;
+            for (i = 0; i < 48; ++i)
+            {
+                unsigned int seq = trace[i*32] | (trace[i*32+1] << 8) | (trace[i*32+2] << 16) | ((unsigned)trace[i*32+3] << 24);
+                if (seq != 0) order[count++] = i;
+            }
+            for (i = 0; i < count; ++i)
+                for (j = i + 1; j < count; ++j)
+                {
+                    unsigned a = trace[order[i]*32] | (trace[order[i]*32+1] << 8) | (trace[order[i]*32+2] << 16);
+                    unsigned b = trace[order[j]*32] | (trace[order[j]*32+1] << 8) | (trace[order[j]*32+2] << 16);
+                    if (b < a) { unsigned t = order[i]; order[i] = order[j]; order[j] = t; }
+                }
+            for (i = 0; i < count; ++i)
+            {
+                unsigned char *e = trace + order[i] * 32;
+                unsigned len = e[4] | (e[5] << 8), k = e[6] < 6 ? e[6] : 0;
+                printf("#%u %s %u:", e[0] | (e[1] << 8) | (e[2] << 16), kinds[k], len);
+                for (n = 0; n < len && n < 24; ++n) printf(" %02X", e[8 + n]);
+                printf("\n");
+            }
+        }
+    }
+    return 0;
+}

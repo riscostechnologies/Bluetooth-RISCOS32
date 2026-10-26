@@ -1,0 +1,237 @@
+REM SPDX-License-Identifier: BSD-2-Clause
+REM Copyright (c) 2026 RISC OS Technologies
+REM >!RunImage  Bluetooth installer
+REM Installs !Bluetooth and its Configure plug-in into !Boot, adds the
+REM PreDesk driver loader and the desktop start entry; or removes them.
+ON ERROR PROCfail : END
+DIM blk% 1024, ind% 1024, tmp% 1024, msgs% 16
+task$="Bluetooth installer"
+!msgs%=0
+SYS "Wimp_Initialise",310,&4B534154,task$,msgs% TO ,task%
+src$=FNvar("Install$Dir")
+src$=LEFT$(src$,LEN(src$)-9)
+version$=FNversion(src$+".Apps.!Bluetooth.Modules.BTVoice")
+installed$=FNversion("BootResources:!Bluetooth.Modules.BTVoice")
+PROCwindow
+IF installed$="" THEN
+  PROCstatus("Bluetooth "+version$+" is ready to install.")
+ELSE
+  PROCstatus("Bluetooth "+installed$+" is installed. Install puts "+version$+" in its place.")
+ENDIF
+quit%=FALSE
+REPEAT
+  SYS "Wimp_Poll",&1831,blk% TO r%
+  CASE r% OF
+    WHEN 2:SYS "Wimp_OpenWindow",,blk%
+    WHEN 3:quit%=TRUE
+    WHEN 6:PROCclick
+    WHEN 17,18:IF blk%!16=0 THEN quit%=TRUE
+  ENDCASE
+UNTIL quit%
+SYS "Wimp_CloseDown",task%,&4B534154
+END
+
+DEF PROCclick
+IF blk%!8=0 THEN ENDPROC
+CASE blk%!16 OF
+  WHEN 2:PROCinstall
+  WHEN 3:PROCremove
+  WHEN 4:quit%=TRUE
+ENDCASE
+ENDPROC
+
+DEF PROCinstall
+LOCAL e$
+IF FNvar("Boot$Dir")="" THEN PROCstatus("!Boot has not been seen: open the disc with !Boot on it first."):ENDPROC
+PROCstatus("Stopping Bluetooth...")
+PROCstop
+PROCstatus("Copying the application...")
+e$=FNcmd("Copy "+src$+".Apps.!Bluetooth BootResources:!Bluetooth ~CFR~V~P")
+IF e$<>"" THEN PROCstatus("Copy failed: "+e$):ENDPROC
+PROCstatus("Copying the Configure plug-in...")
+e$=FNcmd("CDir <Boot$Dir>.Resources.Configure")
+e$=FNcmd("Copy "+src$+".Apps.!BTSetup <Boot$Dir>.Resources.Configure.!BTSetup ~CFR~V~P")
+IF e$<>"" THEN PROCstatus("Copy failed: "+e$):ENDPROC
+PROCstatus("Adding the start-up entries...")
+e$=FNpredesk
+IF e$<>"" THEN PROCstatus("PreDesk entry failed: "+e$):ENDPROC
+e$=FNcmd("Copy "+src$+".!Install.Tasks "+FNbootdir("Tasks")+".Bluetooth ~CF~V")
+IF e$<>"" THEN PROCstatus("Tasks entry failed: "+e$):ENDPROC
+e$=FNcmd("Filer_Boot BootResources:!Bluetooth")
+e$=FNcmd("Filer_Run BootResources:!Bluetooth")
+PROCstatus("Bluetooth "+version$+" is installed and running. It starts by itself from now on.")
+ENDPROC
+
+DEF PROCremove
+LOCAL e$
+PROCstatus("Stopping Bluetooth...")
+PROCstop
+e$=FNcmd("Wipe "+FNbootdir("PreDesk")+".Bluetooth ~CFR~V")
+e$=FNcmd("Wipe "+FNbootdir("Tasks")+".Bluetooth ~CFR~V")
+e$=FNcmd("Wipe <Boot$Dir>.Resources.Configure.!BTSetup ~CFR~V")
+e$=FNcmd("Wipe BootResources:!Bluetooth ~CFR~V")
+PROCstatus("Bluetooth is removed. Your paired devices are kept in Choices:Bluetooth.")
+ENDPROC
+
+REM Quit the icon bar task, stop the core, and take the module out, so
+REM that nothing holds the files or the USB adapter while they change.
+DEF PROCstop
+LOCAL h%,t%,n%,s%,f%,i%
+REM Message_Quit to the task called Bluetooth.
+h%=0
+REPEAT
+  SYS "TaskManager_EnumerateTasks",h%,tmp%,256 TO h%,n%
+  FOR i%=tmp% TO n%-16 STEP 16
+    IF FNstr(i%!4)="Bluetooth" THEN
+      blk%!0=20:blk%!12=0:blk%!16=0
+      SYS "Wimp_SendMessage",17,blk%,!i%
+    ENDIF
+  NEXT
+UNTIL h%<0
+t%=FNnow+300
+REPEAT:SYS "Wimp_Poll",0,blk%:UNTIL FNnow>t%
+REM SWI &D7BC8 (core) reason 1: stop; then wait for state 0 (off).
+SYS "XOS_Module",18,"BluetoothVoice" TO ;f%
+IF (f% AND 1)=0 THEN
+  SYS &F7BC8,0,1
+  t%=FNnow+1000
+  REPEAT
+    SYS "Wimp_Poll",0,blk%
+    SYS &F7BC8,0,2 TO ,s%;f%
+    IF f% AND 1 THEN s%=0
+  UNTIL s%=0 OR FNnow>t%
+  IF s%=0 THEN SYS "XOS_Module",4,"BluetoothVoice"
+ENDIF
+ENDPROC
+
+DEF FNpredesk
+LOCAL in%,out%,l$,e$,d$
+d$=FNbootdir("PreDesk")
+IF d$="" THEN ="no PreDesk directory in Choices:Boot"
+in%=OPENIN(src$+".!Install.PreDesk")
+out%=OPENOUT(d$+".Bluetooth")
+IF out%=0 THEN CLOSE#in%:="cannot write "+d$
+WHILE NOT EOF#in%
+  l$=GET$#in%
+  e$=FNreplace(l$,"VERSION",version$)
+  BPUT#out%,e$
+ENDWHILE
+CLOSE#in%:CLOSE#out%
+SYS "OS_File",18,d$+".Bluetooth",&FEB
+=""
+
+REM The writable Choices directory for Boot.PreDesk or Boot.Tasks: the one
+REM the boot sequence already runs (Choices:Boot.<leaf> as found on the
+REM path), so that the entry is seen at the next start.
+DEF FNbootdir(leaf$)
+LOCAL t%,p$
+SYS "XOS_File",17,"Choices:Boot."+leaf$ TO t%
+IF t%=2 THEN
+  SYS "XOS_FSControl",37,"Choices:Boot."+leaf$,tmp%,0,0,512
+  =FNstr(tmp%)
+ENDIF
+p$=FNvar("Choices$Write")
+IF p$="" THEN =""
+SYS "XOS_File",8,p$+".Boot"
+SYS "XOS_File",8,p$+".Boot."+leaf$
+=p$+".Boot."+leaf$
+
+DEF FNversion(f$)
+REM The module's help string: "Title<tab>0.90 (21 Oct 2026)".
+LOCAL t%,l%,o%,v$,i%,h%
+SYS "XOS_File",17,f$ TO t%,,,,l%
+IF t%<>1 THEN =""
+h%=OPENIN(f$):IF h%=0 THEN =""
+PTR#h%=20:o%=BGET#h%+(BGET#h%<<8)+(BGET#h%<<16)+(BGET#h%<<24)
+IF o%<=0 OR o%>=l% THEN CLOSE#h%:=""
+PTR#h%=o%:v$=""
+REPEAT
+  i%=BGET#h%
+  IF i%=9 THEN i%=32
+  IF i%>=32 THEN v$+=CHR$i%
+UNTIL i%<32 OR EOF#h% OR LEN v$>80
+CLOSE#h%
+i%=INSTR(v$," "):IF i%=0 THEN =""
+v$=MID$(v$,i%)
+WHILE LEFT$(v$,1)=" ":v$=MID$(v$,2):ENDWHILE
+=LEFT$(v$,INSTR(v$+" "," ")-1)
+
+DEF FNcmd(c$)
+SYS "XOS_CLI",c$ TO e%;f%
+IF f% AND 1 THEN =FNstr(e%+4)
+=""
+
+DEF FNvar(v$)
+LOCAL n%,f%
+SYS "XOS_ReadVarVal",v$,tmp%,1000,0,3 TO ,,n%;f%
+IF f% AND 1 THEN =""
+tmp%?n%=13
+=FNstr(tmp%)
+
+DEF FNreplace(a$,f$,r$)
+LOCAL i%
+i%=INSTR(a$,f$):IF i%=0 THEN =a$
+=LEFT$(a$,i%-1)+r$+MID$(a$,i%+LEN f$)
+
+DEF FNstr(a%)
+LOCAL s$
+WHILE ?a%>=32:s$+=CHR$?a%:a%+=1:ENDWHILE
+=s$
+
+DEF FNnow
+LOCAL t%
+SYS "OS_ReadMonotonicTime" TO t%
+=t%
+
+DEF PROCstatus(s$)
+$(ind%+600)=LEFT$(s$,99)
+LOCAL q%
+q%=tmp%+800:q%!0=win%:q%!4=1:q%!8=0:q%!12=0
+SYS "Wimp_SetIconState",,q%
+ENDPROC
+
+REM One window: a heading, a status line, Install, Remove, Cancel.
+DEF PROCwindow
+LOCAL p%
+p%=blk%
+p%!0=0:p%!4=0:p%!8=880:p%!12=400:p%!16=0:p%!20=0:p%!24=-1
+p%!28=&87000012
+p%!32=&01070207:p%!36=&000C0103
+p%!40=0:p%!44=-400:p%!48=880:p%!52=0
+p%!56=&2700013D:p%!60=3<<12:p%!64=1:p%!68=&00010001
+$(ind%+400)="Install Bluetooth"
+p%!72=ind%+400:p%!76=-1:p%!80=18
+p%!84=5
+$(ind%+780)="L":$(ind%+790)="R5,3":$(ind%+800)="R6,3"
+PROCicon(p%+88,32,-200,848,-40,"Bluetooth for RISC OS: USB adapter, speakers and headphones (A2DP), mice and keyboards (HID). Install copies it into !Boot and starts it.",ind%+0,180,&17000111,ind%+780)
+PROCicon(p%+120,32,-300,848,-220,"",ind%+600,100,&17000131,ind%+780)
+PROCicon(p%+152,32,-380,272,-316,"Install",ind%+720,16,&1700313D,ind%+800)
+PROCicon(p%+184,304,-380,544,-316,"Remove",ind%+740,16,&1700313D,ind%+790)
+PROCicon(p%+216,576,-380,848,-316,"Cancel",ind%+760,16,&1700313D,ind%+790)
+SYS "Wimp_CreateWindow",,p% TO win%
+REM Open it in the middle of the screen.
+LOCAL w%,h%,ex%,ey%
+SYS "OS_ReadModeVariable",-1,11 TO ,,w%
+SYS "OS_ReadModeVariable",-1,12 TO ,,h%
+SYS "OS_ReadModeVariable",-1,4 TO ,,ex%
+SYS "OS_ReadModeVariable",-1,5 TO ,,ey%
+w%=(w%+1)<<ex%:h%=(h%+1)<<ey%
+blk%!0=win%
+blk%!4=(w%-880) DIV 2:blk%!8=(h%-560) DIV 2+120
+blk%!12=blk%!4+880:blk%!16=blk%!8+400
+blk%!20=0:blk%!24=0:blk%!28=-1
+SYS "Wimp_OpenWindow",,blk%
+ENDPROC
+
+DEF PROCicon(q%,x0%,y0%,x1%,y1%,t$,b%,n%,f%,v%)
+q%!0=x0%:q%!4=y0%:q%!8=x1%:q%!12=y1%:q%!16=f%
+$b%=t$:q%!20=b%:q%!24=v%:q%!28=n%
+ENDPROC
+
+DEF PROCfail
+LOCAL e$
+e$=REPORT$+" (line "+STR$ERL+")"
+!blk%=0:$(blk%+4)=e$+CHR$0
+SYS "Wimp_ReportError",blk%,1,task$
+SYS "XWimp_CloseDown"
+ENDPROC

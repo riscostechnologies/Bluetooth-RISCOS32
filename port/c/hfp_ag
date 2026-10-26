@@ -1,0 +1,237 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/* Baseline gateway exchange from Bluetooth HFP 1.10 sections 4.2.1, 5.1-5.3. */
+#include "hfp_ag.h"
+#include <string.h>
+
+static int number(const char **text, uint32_t *value)
+{
+    const char *p = *text;
+    uint32_t n = 0;
+    if (*p < '0' || *p > '9') return 0;
+    do {
+        unsigned int digit = (unsigned int)(*p++ - '0');
+        if (n > (0xffffffffUL - digit) / 10) return 0;
+        n = n * 10 + digit;
+    } while (*p >= '0' && *p <= '9');
+    *text = p; *value = n;
+    return 1;
+}
+
+int btv_hfp_ag_init(btv_hfp_ag *ag, const uint8_t values[7])
+{
+    static const uint8_t maxima[7] = { 1, 1, 3, 2, 5, 1, 5 };
+    unsigned int i;
+    if (ag == NULL || values == NULL) return 0;
+    for (i = 0; i < 7; ++i) if (values[i] > maxima[i]) return 0;
+    memset(ag, 0, sizeof(*ag));
+    memcpy(ag->indicators, values, 7);
+    ag->indicator_mask = 0x7f;
+    return 1;
+}
+
+static void command(btv_hfp_ag *ag, const char *line)
+{
+    char normalized[257];
+    const char *p, *reply = "\r\nERROR\r\n";
+    size_t i, used = 0;
+    uint32_t value, parameters[5];
+    unsigned int count, valid;
+    for (i = 0; line[i]; ++i)
+    {
+        char ch = line[i];
+        if (ch == ' ') continue;
+        normalized[used++] = ch >= 'a' && ch <= 'z' ? (char)(ch - 'a' + 'A') : ch;
+    }
+    normalized[used] = 0;
+    ag->next_stage = ag->stage;
+    ag->next_reporting = ag->reporting;
+    ag->pending_features = ag->hf_features;
+    ag->next_microphone_gain = ag->microphone_gain;
+    ag->next_speaker_gain = ag->speaker_gain;
+    ag->next_gain_known = ag->gain_known;
+    ag->next_indicator_mask = ag->indicator_mask;
+    if (!strncmp(normalized, "AT+BRSF=", 8))
+    {
+        p = normalized + 8;
+        if (number(&p, &value) && !*p && ag->stage <= BTV_AG_MAPPING)
+        {
+            ag->pending_features = value;
+            ag->next_stage = BTV_AG_MAPPING;
+            reply = "\r\n+BRSF: 0\r\n\r\nOK\r\n";
+        }
+    }
+    else if (!strcmp(normalized, "AT+CIND=?") && ag->stage >= BTV_AG_MAPPING)
+    {
+        reply = "\r\n+CIND: (\"service\",(0,1)),(\"call\",(0,1)),(\"callsetup\",(0-3)),"
+            "(\"callheld\",(0-2)),(\"signal\",(0-5)),(\"roam\",(0,1)),(\"battchg\",(0-5))\r\n\r\nOK\r\n";
+        if (ag->stage < BTV_AG_VALUES) ag->next_stage = BTV_AG_VALUES;
+    }
+    else if (!strcmp(normalized, "AT+CIND?") && ag->stage >= BTV_AG_VALUES)
+    {
+        strcpy(ag->response, "\r\n+CIND: ");
+        used = strlen(ag->response);
+        for (i = 0; i < 7; ++i)
+        {
+            if (i) ag->response[used++] = ',';
+            ag->response[used++] = (char)('0' + ag->indicators[i]);
+        }
+        strcpy(ag->response + used, "\r\n\r\nOK\r\n");
+        ag->response_bytes = strlen(ag->response);
+        if (ag->stage < BTV_AG_EVENTS) ag->next_stage = BTV_AG_EVENTS;
+        return;
+    }
+    else if (!strncmp(normalized, "AT+BIA=", 7) && ag->stage >= BTV_AG_VALUES)
+    {
+        p = normalized + 7; valid = 1;
+        value = ag->indicator_mask;
+        for (i = 0; i < 7; ++i)
+        {
+            uint32_t setting;
+            if (*p != ',' && *p)
+            {
+                if (!number(&p, &setting) || setting > 1) { valid = 0; break; }
+                if (setting) value |= 1U << i;
+                else value &= ~(1U << i);
+            }
+            if (!*p) break;
+            if (*p++ != ',') { valid = 0; break; }
+        }
+        if (valid)
+        {
+            ag->next_indicator_mask = (uint8_t)(value | 0x0e);
+            reply = "\r\nOK\r\n";
+        }
+    }
+    else if ((!strncmp(normalized, "AT+VGM=", 7) || !strncmp(normalized, "AT+VGS=", 7)) &&
+        ag->stage == BTV_AG_READY)
+    {
+        p = normalized + 7;
+        if (number(&p, &value) && !*p && value <= 15)
+        {
+            if (normalized[5] == 'M')
+            {
+                ag->next_microphone_gain = (uint8_t)value;
+                ag->next_gain_known |= 1;
+            }
+            else
+            {
+                ag->next_speaker_gain = (uint8_t)value;
+                ag->next_gain_known |= 2;
+            }
+            reply = "\r\nOK\r\n";
+        }
+    }
+    else if (!strncmp(normalized, "AT+CMER=", 8) && ag->stage >= BTV_AG_EVENTS)
+    {
+        p = normalized + 8; count = 0; valid = 1;
+        do {
+            if (count == 5) { valid = 0; break; }
+            value = 0;
+            if (*p != ',' && *p != 0 && !number(&p, &value)) { valid = 0; break; }
+            parameters[count++] = value;
+            if (!*p) break;
+            if (*p++ != ',') { valid = 0; break; }
+        } while (1);
+        if (valid && count >= 4 && parameters[0] == 3 && parameters[3] <= 1)
+        {
+            ag->next_reporting = (unsigned int)parameters[3];
+            if (parameters[3]) ag->next_stage = BTV_AG_READY;
+            reply = "\r\nOK\r\n";
+        }
+    }
+    strcpy(ag->response, reply);
+    ag->response_bytes = strlen(reply);
+}
+
+size_t btv_hfp_ag_feed(btv_hfp_ag *ag, const uint8_t *data, size_t bytes)
+{
+    size_t consumed;
+    const char *line;
+    if (ag == NULL || ag->response_bytes) return 0;
+    consumed = btv_at_stream_feed(&ag->input, data, bytes);
+    line = btv_at_stream_line(&ag->input);
+    if (line != NULL) command(ag, line);
+    return consumed;
+}
+
+int btv_hfp_ag_update(btv_hfp_ag *ag, const uint8_t values[7])
+{
+    static const uint8_t maxima[7] = { 1, 1, 3, 2, 5, 1, 5 };
+    unsigned int i, changes = 0, slot;
+    if (ag == NULL || values == NULL || ag->input.failed) return 0;
+    for (i = 0; i < 7; ++i)
+    {
+        if (values[i] > maxima[i]) return 0;
+        if (values[i] != ag->indicators[i] && (ag->indicator_mask & (1U << i))) ++changes;
+    }
+    if (ag->reporting && changes > 16 - ag->event_count) return 0;
+    for (i = 0; i < 7; ++i)
+    {
+        if (ag->reporting && values[i] != ag->indicators[i] && (ag->indicator_mask & (1U << i)))
+        {
+            slot = (ag->event_head + ag->event_count) % 16;
+            ag->events[slot][0] = (uint8_t)(i + 1);
+            ag->events[slot][1] = values[i];
+            ++ag->event_count;
+        }
+        ag->indicators[i] = values[i];
+    }
+    return 1;
+}
+
+size_t btv_hfp_ag_output(btv_hfp_ag *ag, uint8_t *output, size_t capacity)
+{
+    char event[] = "\r\n+CIEV: 1,0\r\n";
+    if (ag == NULL) return 0;
+    ag->selected = 0;
+    if (output == NULL || ag->input.failed) return 0;
+    if (ag->response_bytes)
+    {
+        if (capacity < ag->response_bytes) return 0;
+        memcpy(output, ag->response, ag->response_bytes);
+        ag->selected = 1;
+        return ag->response_bytes;
+    }
+    if (!ag->reporting || !ag->event_count || capacity < sizeof(event) - 1) return 0;
+    event[9] = (char)('0' + ag->events[ag->event_head][0]);
+    event[11] = (char)('0' + ag->events[ag->event_head][1]);
+    memcpy(output, event, sizeof(event) - 1);
+    ag->selected = 2;
+    return sizeof(event) - 1;
+}
+
+int btv_hfp_ag_sent(btv_hfp_ag *ag)
+{
+    unsigned int i, retained, source, destination;
+    if (ag == NULL) return 0;
+    if (ag->selected == 2 && ag->event_count)
+    {
+        ag->event_head = (ag->event_head + 1) % 16;
+        --ag->event_count;
+        ag->selected = 0;
+        return 1;
+    }
+    if (ag->selected != 1 || !ag->response_bytes || !btv_at_stream_take(&ag->input)) return 0;
+    ag->selected = 0;
+    ag->stage = ag->next_stage;
+    ag->reporting = ag->next_reporting;
+    if (!ag->reporting) ag->event_count = ag->event_head = 0;
+    ag->hf_features = ag->pending_features;
+    ag->microphone_gain = ag->next_microphone_gain;
+    ag->speaker_gain = ag->next_speaker_gain;
+    ag->gain_known = ag->next_gain_known;
+    ag->indicator_mask = ag->next_indicator_mask;
+    retained = 0;
+    for (i = 0; i < ag->event_count; ++i)
+    {
+        source = (ag->event_head + i) % 16;
+        if (!(ag->indicator_mask & (1U << (ag->events[source][0] - 1)))) continue;
+        destination = (ag->event_head + retained++) % 16;
+        ag->events[destination][0] = ag->events[source][0];
+        ag->events[destination][1] = ag->events[source][1];
+    }
+    ag->event_count = retained;
+    ag->response_bytes = 0;
+    return 1;
+}

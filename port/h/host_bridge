@@ -1,0 +1,90 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        host_bridge
+ * Purpose:     Private Virtual Kinetic Box Bluetooth transport probe.
+ ******************************************************************/
+#ifndef BTV_HOST_BRIDGE_H
+#define BTV_HOST_BRIDGE_H
+#include <stdint.h>
+
+#define BTV_HOST_BRIDGE_ABI 0x00010000u
+#define BTV_HOST_BRIDGE_SWI 0x76ac8u
+#define BTV_HOST_BRIDGE_OK 0
+#define BTV_HOST_BRIDGE_PENDING 1
+#define BTV_HOST_BRIDGE_INVALID -1
+#define BTV_HOST_BRIDGE_IO_ERROR -2
+#define BTV_HOST_BRIDGE_UNSUPPORTED -3
+#define BTV_HOST_BRIDGE_BUSY -4
+#define BTV_HOST_BRIDGE_IO_BYTES 4096u
+#define BTV_HOST_BRIDGE_ISO_PACKETS 32u
+
+enum btv_host_bridge_transfer
+{
+    BTV_HOST_BRIDGE_COMMAND = 0,
+    BTV_HOST_BRIDGE_EVENT_IN = 1,
+    BTV_HOST_BRIDGE_ACL_IN = 2,
+    BTV_HOST_BRIDGE_ACL_OUT = 3,
+    BTV_HOST_BRIDGE_SCO_IN = 4,
+    BTV_HOST_BRIDGE_SCO_OUT = 5
+};
+
+typedef struct btv_host_bridge_packet
+{
+    uint32_t offset, bytes, status;
+} btv_host_bridge_packet;
+
+typedef struct btv_host_bridge_completion
+{
+    uint32_t kind, error, bytes, packet_count;
+    btv_host_bridge_packet packets[BTV_HOST_BRIDGE_ISO_PACKETS];
+    uint8_t data[BTV_HOST_BRIDGE_IO_BYTES];
+} btv_host_bridge_completion;
+
+typedef struct btv_host_bridge_info
+{
+    uint32_t version, max_transfer_bytes, max_iso_packets;
+    uint32_t result, windows_error;
+    uint16_t vendor, product;
+} btv_host_bridge_info;
+
+/* Returns zero when the private SWI is absent or has an incompatible ABI.
+ * A successful function return can still contain a nonzero inspect result;
+ * in particular, -8 means that Windows BTHUSB owns the radio. */
+int btv_host_bridge_inspect(btv_host_bridge_info *info);
+/* The adapter's DeviceFS name ("USB20") once one has been found, else NULL. */
+const char *btv_host_bridge_device_name(void);
+int btv_host_bridge_open(uint32_t *windows_error);
+int btv_host_bridge_voice(uint8_t alternate, uint32_t *windows_error);
+int btv_host_bridge_submit(unsigned int kind, const uint8_t *data,
+                           uint32_t bytes, uint32_t packets,
+                           uint32_t *ticket, uint32_t *windows_error);
+int btv_host_bridge_poll(uint32_t ticket,
+                         btv_host_bridge_completion *completion);
+int btv_host_bridge_cancel(uint32_t ticket, uint32_t *windows_error);
+int btv_host_bridge_close(uint32_t *windows_error);
+void btv_host_bridge_device_dead(uint32_t service, uint32_t handle,
+                                  const char *name);
+/* Native backend ACL completion counts, for bring-up diagnostics only. */
+void btv_host_bridge_acl_counts(uint32_t *in_count, uint32_t *out_count);
+void btv_host_bridge_output_diag(uint32_t values[6]);
+uint32_t btv_host_bridge_monitor_output(void);
+/* Copy the native packet trace ring; returns bytes written (0 if absent). */
+uint32_t btv_host_bridge_trace(uint8_t *output, uint32_t capacity);
+/* Bit 0 SCO IN open, bit 1 SCO OUT open, bits 2-3 native close phase. */
+uint32_t btv_host_bridge_voice_state(void);
+/* Non-zero while the selected backend still has a usable controller. */
+int btv_host_bridge_present(void);
+
+
+/* 64-bit core interface additions (UART-specific there; trivial on USB). */
+int btv_host_bridge_boot(void);
+void btv_host_bridge_note(const char *a, const char *b);
+uint32_t btv_host_bridge_notes(char *buffer, uint32_t size);
+void btv_host_bridge_flush(uint32_t budget);
+uint32_t btv_host_bridge_micros(void);
+void btv_host_bridge_errors(uint32_t out[5]);
+void btv_host_bridge_stats(uint32_t *tx_waiting, uint32_t *rx_total,
+                           uint32_t *rx_lost);
+
+#endif

@@ -1,0 +1,38 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        sound_pace
+ * Purpose:     The clock that decides when the Bluetooth audio path may
+ *              take another buffer from SoundDMA.
+ *
+ * SoundDMA fills its buffers in the background, so buffers have to be
+ * taken at the rate the audio actually plays.  Taking them faster reads a
+ * buffer that has not been refilled and repeats that audio; counting in
+ * whole milliseconds instead of frames runs about one per cent fast.
+ ******************************************************************/
+#ifndef BTV_SOUND_PACE_H
+#define BTV_SOUND_PACE_H
+
+#include <stdint.h>
+
+typedef struct btv_sound_pace
+{
+    uint32_t credit;      /* frames this path has earned */
+    uint32_t remainder;   /* thousandths of a frame carried between ticks */
+    uint8_t primed;
+} btv_sound_pace;
+
+/* Starts the clock: `buffers` buffers are allowed straight away so the
+ * encoder has something to send. */
+void btv_sound_pace_start(btv_sound_pace *pace, uint32_t frames,
+                          uint32_t buffers);
+/* Earns credit for `elapsed` milliseconds at `rate` samples a second,
+ * never banking more than `cap` buffers of `frames`. */
+void btv_sound_pace_tick(btv_sound_pace *pace, uint32_t elapsed,
+                         uint32_t rate, uint32_t frames, uint32_t cap);
+/* Spends one buffer's worth of credit; 0 when nothing is owed yet. */
+int btv_sound_pace_take(btv_sound_pace *pace, uint32_t frames);
+/* Forgets banked credit (the ring is full: the sink is not draining). */
+void btv_sound_pace_idle(btv_sound_pace *pace);
+
+#endif

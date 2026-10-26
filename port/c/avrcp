@@ -1,0 +1,401 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        avrcp
+ * Purpose:     See avrcp.h.
+ * Licence:     BSD-2-Clause (see LICENSE).
+ ******************************************************************/
+#include "avrcp.h"
+#include <string.h>
+
+#define COMMAND_TIMEOUT_MS 4000u
+
+/* AV/C command types and response codes. */
+#define CT_CONTROL 0x00
+#define CT_STATUS 0x01
+#define CT_NOTIFY 0x03
+#define RS_NOT_IMPLEMENTED 0x08
+#define RS_ACCEPTED 0x09
+#define RS_REJECTED 0x0a
+#define RS_STABLE 0x0c
+#define RS_CHANGED 0x0d
+#define RS_INTERIM 0x0f
+
+#define SUBUNIT_PANEL 0x48            /* subunit type 9, id 0 */
+#define SUBUNIT_UNIT 0xff             /* the unit itself */
+#define OP_VENDOR 0x00
+#define OP_UNIT_INFO 0x30
+#define OP_SUBUNIT_INFO 0x31
+#define OP_PASS_THROUGH 0x7c
+
+#define PASS_VOLUME_UP 0x41
+#define PASS_VOLUME_DOWN 0x42
+#define PASS_MUTE 0x43
+
+#define PDU_GET_CAPABILITIES 0x10
+#define PDU_REGISTER_NOTIFICATION 0x31
+#define PDU_SET_ABSOLUTE_VOLUME 0x50
+#define CAP_COMPANY_ID 0x02
+#define CAP_EVENTS 0x03
+#define EVENT_VOLUME_CHANGED 0x0d
+
+enum { CMD_NONE, CMD_CAPABILITIES, CMD_REGISTER, CMD_VOLUME };
+
+/* The Bluetooth SIG's company identifier, 0x001958, as AVRCP's PDUs carry it. */
+static const uint8_t company[3] = { 0x00, 0x19, 0x58 };
+
+void btv_avrcp_init(btv_avrcp *a)
+{
+    memset(a, 0, sizeof *a);
+    a->speaker_volume = -1;
+}
+
+void btv_avrcp_open(btv_avrcp *a, uint32_t now)
+{
+    uint8_t keep_valid = a->want_valid, keep_volume = a->want_volume;
+    btv_avrcp_init(a);
+    a->want_valid = keep_valid;
+    a->want_volume = keep_volume;
+    a->state = BTV_AVRCP_CAPABILITIES;
+    a->send_capabilities = 1;
+    a->sent_at = now;
+}
+
+void btv_avrcp_close(btv_avrcp *a)
+{
+    uint8_t keep_valid = a->want_valid, keep_volume = a->want_volume;
+    uint32_t generation = a->generation;
+    btv_avrcp_init(a);
+    a->want_valid = keep_valid;
+    a->want_volume = keep_volume;
+    a->generation = generation;
+}
+
+void btv_avrcp_set_volume(btv_avrcp *a, unsigned int volume)
+{
+    if (volume > BTV_AVRCP_MAX_VOLUME) volume = BTV_AVRCP_MAX_VOLUME;
+    a->want_valid = 1;
+    a->want_volume = (uint8_t)volume;
+    if (a->state == BTV_AVRCP_ACTIVE && a->speaker_volume != (int)volume)
+        a->send_volume = 1;
+}
+
+int btv_avrcp_absolute(const btv_avrcp *a)
+{
+    return a->state == BTV_AVRCP_ACTIVE;
+}
+
+int btv_avrcp_speaker_volume(const btv_avrcp *a)
+{
+    return a->speaker_volume;
+}
+
+int btv_avrcp_take_steps(btv_avrcp *a)
+{
+    int steps = a->steps;
+    a->steps = 0;
+    return steps;
+}
+
+unsigned int btv_avrcp_take_mutes(btv_avrcp *a)
+{
+    unsigned int mutes = a->mute_toggles;
+    a->mute_toggles = 0;
+    return mutes;
+}
+
+/* ---- building --------------------------------------------------------- */
+
+/* AVCTP header: label, single packet, command or response, valid profile;
+ * the profile identifier; then the AV/C frame. */
+static size_t header(uint8_t *out, uint8_t label, int response)
+{
+    out[0] = (uint8_t)((label << 4) | (response ? 0x02 : 0x00));
+    out[1] = (uint8_t)(BTV_AVRCP_PROFILE >> 8);
+    out[2] = (uint8_t)BTV_AVRCP_PROFILE;
+    return 3;
+}
+
+/* A vendor dependent AV/C frame: ctype, panel subunit, opcode, company id,
+ * PDU id, a single packet, parameter length, parameters. */
+static size_t vendor(uint8_t *out, uint8_t label, int response, uint8_t ctype,
+                     uint8_t pdu, const uint8_t *params, size_t length)
+{
+    size_t n = header(out, label, response);
+    out[n++] = ctype;
+    out[n++] = SUBUNIT_PANEL;
+    out[n++] = OP_VENDOR;
+    memcpy(out + n, company, 3);
+    n += 3;
+    out[n++] = pdu;
+    out[n++] = 0;                          /* single packet */
+    out[n++] = (uint8_t)(length >> 8);
+    out[n++] = (uint8_t)length;
+    if (length != 0) memcpy(out + n, params, length);
+    return n + length;
+}
+
+size_t btv_avrcp_poll(btv_avrcp *a, uint32_t now, uint8_t *out, size_t room)
+{
+    uint8_t params[5];
+    uint8_t what;
+    if (room < 24 || a->state == BTV_AVRCP_IDLE) return 0;
+    if (a->outstanding != CMD_NONE)
+    {
+        if (now - a->sent_at < COMMAND_TIMEOUT_MS) return 0;
+        /* Never answered: the speaker does not do absolute volume (or not
+         * with us).  Its buttons may still arrive as pass-through. */
+        a->outstanding = CMD_NONE;
+        if (a->state != BTV_AVRCP_ACTIVE) a->state = BTV_AVRCP_PASSTHROUGH;
+        a->send_capabilities = a->send_register = 0;
+        a->send_volume = 0;
+        return 0;
+    }
+    what = a->send_capabilities ? CMD_CAPABILITIES :
+           a->send_register ? CMD_REGISTER :
+           (a->send_volume && a->state == BTV_AVRCP_ACTIVE && a->want_valid) ?
+               CMD_VOLUME : CMD_NONE;
+    if (what == CMD_NONE) return 0;
+    a->label = (uint8_t)((a->label + 1) & 0x0f);
+    a->outstanding_label = a->label;
+    a->outstanding = what;
+    a->sent_at = now;
+    switch (what)
+    {
+    case CMD_CAPABILITIES:
+        a->send_capabilities = 0;
+        params[0] = CAP_EVENTS;
+        return vendor(out, a->label, 0, CT_STATUS, PDU_GET_CAPABILITIES,
+                      params, 1);
+    case CMD_REGISTER:
+        a->send_register = 0;
+        params[0] = EVENT_VOLUME_CHANGED;
+        params[1] = params[2] = params[3] = params[4] = 0;
+        return vendor(out, a->label, 0, CT_NOTIFY, PDU_REGISTER_NOTIFICATION,
+                      params, 5);
+    default:
+        a->send_volume = 0;
+        a->in_flight = a->want_volume;
+        params[0] = a->want_volume;
+        return vendor(out, a->label, 0, CT_CONTROL, PDU_SET_ABSOLUTE_VOLUME,
+                      params, 1);
+    }
+}
+
+/* ---- answering the speaker's commands ------------------------------------ */
+
+static size_t not_implemented(const uint8_t *data, size_t bytes, uint8_t *out,
+                              size_t room)
+{
+    size_t n = bytes < room ? bytes : room;
+    memcpy(out, data, n);
+    out[0] = (uint8_t)((data[0] & 0xf0) | 0x02);
+    if (n > 3) out[3] = RS_NOT_IMPLEMENTED;
+    return n;
+}
+
+static size_t answer_command(btv_avrcp *a, const uint8_t *data, size_t bytes,
+                             uint8_t *out, size_t room)
+{
+    const uint8_t *f = data + 3;           /* the AV/C frame */
+    size_t n;
+    uint8_t label = (uint8_t)(data[0] >> 4);
+    if (bytes < 6 || room < 20) return 0;
+    ++a->commands;
+    switch (f[2])
+    {
+    case OP_UNIT_INFO:
+        /* 0x07, unit type (panel, 9) and unit 0, company identifier. */
+        n = header(out, label, 1);
+        out[n++] = RS_STABLE;
+        out[n++] = SUBUNIT_UNIT;
+        out[n++] = OP_UNIT_INFO;
+        out[n++] = 0x07;
+        out[n++] = SUBUNIT_PANEL;
+        memcpy(out + n, company, 3);
+        return n + 3;
+    case OP_SUBUNIT_INFO:
+        /* Page 0: one panel subunit (the highest id 0), the rest 0xff. */
+        n = header(out, label, 1);
+        out[n++] = RS_STABLE;
+        out[n++] = SUBUNIT_UNIT;
+        out[n++] = OP_SUBUNIT_INFO;
+        out[n++] = bytes > 6 ? f[3] : 0x07;
+        out[n++] = SUBUNIT_PANEL;
+        out[n++] = 0xff; out[n++] = 0xff; out[n++] = 0xff;
+        return n;
+    case OP_PASS_THROUGH:
+    {
+        uint8_t operation, released;
+        if (bytes < 8) return not_implemented(data, bytes, out, room);
+        operation = (uint8_t)(f[3] & 0x7f);
+        released = (uint8_t)((f[3] & 0x80) != 0);
+        ++a->passthrough_seen;
+        if (operation == PASS_VOLUME_UP || operation == PASS_VOLUME_DOWN ||
+            operation == PASS_MUTE)
+        {
+            if (!released)
+            {
+                if (operation == PASS_VOLUME_UP && a->steps < 100) ++a->steps;
+                else if (operation == PASS_VOLUME_DOWN && a->steps > -100)
+                    --a->steps;
+                else if (operation == PASS_MUTE && a->mute_toggles < 100)
+                    ++a->mute_toggles;
+            }
+            n = bytes < room ? bytes : room;
+            memcpy(out, data, n);
+            out[0] = (uint8_t)((data[0] & 0xf0) | 0x02);
+            out[3] = RS_ACCEPTED;
+            return n;
+        }
+        /* Play, pause and the rest: nothing here plays them. */
+        return not_implemented(data, bytes, out, room);
+    }
+    case OP_VENDOR:
+        if (bytes >= 14 && memcmp(f + 3, company, 3) == 0 &&
+            f[6] == PDU_GET_CAPABILITIES)
+        {
+            uint8_t id = f[10];
+            uint8_t params[6];
+            size_t length = 0;
+            params[length++] = id;
+            if (id == CAP_COMPANY_ID)
+            {
+                params[length++] = 1;
+                memcpy(params + length, company, 3);
+                length += 3;
+            }
+            else if (id == CAP_EVENTS)
+                params[length++] = 0;      /* no events: we are no player */
+            else
+                return not_implemented(data, bytes, out, room);
+            return vendor(out, label, 1, RS_STABLE, PDU_GET_CAPABILITIES,
+                          params, length);
+        }
+        return not_implemented(data, bytes, out, room);
+    default:
+        return not_implemented(data, bytes, out, room);
+    }
+}
+
+/* ---- the speaker's answers ----------------------------------------------- */
+
+static void adopt_speaker_volume(btv_avrcp *a, int volume)
+{
+    if (volume < 0 || volume > (int)BTV_AVRCP_MAX_VOLUME) return;
+    a->speaker_volume = (int16_t)volume;
+}
+
+static void answer_response(btv_avrcp *a, const uint8_t *data, size_t bytes,
+                            uint32_t now)
+{
+    const uint8_t *f = data + 3;
+    uint8_t label = (uint8_t)(data[0] >> 4);
+    uint8_t code;
+    size_t length;
+    const uint8_t *p;
+    (void)now;
+    if (bytes < 14 || f[2] != OP_VENDOR) return;
+    code = f[0];
+    if (memcmp(f + 3, company, 3) != 0) return;
+    length = (size_t)((f[8] << 8) | f[9]);
+    if (10 + length + 3 > bytes) return;
+    p = f + 10;
+    ++a->responses;
+    if (code == RS_CHANGED && f[6] == PDU_REGISTER_NOTIFICATION && length >= 2 &&
+        p[0] == EVENT_VOLUME_CHANGED)
+    {
+        /* The speaker's own volume changed (its buttons): note it, and ask
+         * to be told the next time, as a notification is used once. */
+        ++a->notifications;
+        adopt_speaker_volume(a, p[1] & 0x7f);
+        a->want_valid = 1;               /* the speaker's change is now wanted */
+        a->want_volume = (uint8_t)(p[1] & 0x7f);
+        ++a->generation;
+        a->send_register = 1;
+        return;
+    }
+    if (a->outstanding == CMD_NONE || label != a->outstanding_label) return;
+    switch (a->outstanding)
+    {
+    case CMD_CAPABILITIES:
+    {
+        size_t i;
+        int has = 0;
+        a->outstanding = CMD_NONE;
+        if ((code == RS_STABLE || code == RS_ACCEPTED) && length >= 2 &&
+            p[0] == CAP_EVENTS)
+            for (i = 0; i < p[1] && 2 + i < length; ++i)
+                if (p[2 + i] == EVENT_VOLUME_CHANGED) has = 1;
+        if (has)
+        {
+            a->state = BTV_AVRCP_REGISTERING;
+            a->send_register = 1;
+        }
+        else
+            a->state = BTV_AVRCP_PASSTHROUGH;
+        break;
+    }
+    case CMD_REGISTER:
+        a->outstanding = CMD_NONE;
+        if (code == RS_INTERIM && length >= 2 && p[0] == EVENT_VOLUME_CHANGED)
+        {
+            a->state = BTV_AVRCP_ACTIVE;
+            adopt_speaker_volume(a, p[1] & 0x7f);
+            if (a->want_valid && a->speaker_volume != (int)a->want_volume)
+                a->send_volume = 1;      /* what the host has set wins */
+            else if (!a->want_valid)
+            {
+                a->want_valid = 1;       /* the host takes the speaker's */
+                a->want_volume = (uint8_t)a->speaker_volume;
+                ++a->generation;
+            }
+        }
+        else if (code == RS_CHANGED && length >= 2)
+        {
+            adopt_speaker_volume(a, p[1] & 0x7f);
+            a->want_valid = 1;
+            a->want_volume = (uint8_t)(p[1] & 0x7f);
+            ++a->generation;
+            a->send_register = 1;
+        }
+        else
+            a->state = BTV_AVRCP_PASSTHROUGH;
+        break;
+    case CMD_VOLUME:
+        a->outstanding = CMD_NONE;
+        if (code == RS_ACCEPTED && length >= 1)
+            adopt_speaker_volume(a, p[0] & 0x7f);
+        else if (code == RS_REJECTED)
+            a->speaker_volume = -1;
+        /* The host's volume moved again while this was in flight. */
+        if (a->want_valid && a->state == BTV_AVRCP_ACTIVE &&
+            a->speaker_volume != (int)a->want_volume)
+            a->send_volume = 1;
+        break;
+    default:
+        break;
+    }
+}
+
+size_t btv_avrcp_receive(btv_avrcp *a, const uint8_t *data, size_t bytes,
+                         uint32_t now, uint8_t *out, size_t room)
+{
+    unsigned int profile;
+    if (bytes < 3 || room < 3) return 0;
+    if (((data[0] >> 2) & 3u) != 0) return 0;     /* fragmented: not used */
+    profile = ((unsigned)data[1] << 8) | data[2];
+    if (profile != BTV_AVRCP_PROFILE)
+    {
+        /* A command for another profile: reply "invalid profile" (IPID). */
+        if ((data[0] & 0x02) != 0) return 0;
+        out[0] = (uint8_t)((data[0] & 0xf0) | 0x03);
+        out[1] = data[1];
+        out[2] = data[2];
+        return 3;
+    }
+    if ((data[0] & 0x02) == 0)
+        return answer_command(a, data, bytes, out, room);
+    answer_response(a, data, bytes, now);
+    return 0;
+}

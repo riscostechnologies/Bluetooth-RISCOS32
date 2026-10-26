@@ -1,0 +1,225 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#define _POSIX_C_SOURCE 200809L
+/*******************************************************************
+ * File:        btsetup
+ * Purpose:     Configure plug-in (!BTSetup) for the Bluetooth choices.
+ *              Configure starts it with "-openat x y" and later sends
+ *              Message_OpenConfigWindow / Message_PlugInQuit.
+ ******************************************************************/
+#include "btsettings.h"
+#include "btwimp.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define TASK_NAME "Bluetooth Setup"
+#define WINDOW_WIDTH 1000
+#define WINDOW_HEIGHT 524
+
+enum
+{
+    I_ADDRESS_LABEL, I_ADDRESS, I_ADDRESS_HINT,
+    I_PIN_LABEL, I_PIN,
+    I_SOUND, I_START, I_CONNECT, I_USB,
+    I_NOTE,
+    I_DEFAULT, I_CANCEL, I_SET,
+    I_COUNT
+};
+
+static int window;
+
+static void create_window(void)
+{
+    bt_icon_spec icons[I_COUNT];
+    memset(icons, 0, sizeof(icons));
+    icons[I_ADDRESS_LABEL] = (bt_icon_spec){ 16, -72, 300, -20, 0,
+        "Speaker", NULL, 0 };
+    icons[I_ADDRESS] = (bt_icon_spec){ 310, -72, 660, -20, 0, "",
+        "Kta;A0-9a-fA-F:;Pptr_write", 18 };
+    icons[I_ADDRESS_HINT] = (bt_icon_spec){ 676, -72, 984, -20, 0,
+        "", NULL, 64 };
+    icons[I_PIN_LABEL] = (bt_icon_spec){ 16, -136, 300, -84, 0,
+        "Pairing PIN", NULL, 0 };
+    icons[I_PIN] = (bt_icon_spec){ 310, -136, 520, -84, 0, "",
+        "Kta;A0-9;Pptr_write", 17 };
+    icons[I_SOUND] = (bt_icon_spec){ 16, -200, 984, -152, 0,
+        "Play system sound through the headset", "Soptoff,opton", 0 };
+    icons[I_START] = (bt_icon_spec){ 16, -256, 984, -208, 0,
+        "Start Bluetooth when the desktop starts", "Soptoff,opton", 0 };
+    icons[I_CONNECT] = (bt_icon_spec){ 16, -312, 984, -264, 0,
+        "Reconnect the speaker when Bluetooth starts", "Soptoff,opton", 0 };
+    icons[I_USB] = (bt_icon_spec){ 16, -368, 984, -320, 0,
+        "Load the USB audio drivers at start-up", "Soptoff,opton", 0 };
+    icons[I_NOTE] = (bt_icon_spec){ 16, -428, 984, -380, 0,
+        "Connect devices from the Bluetooth icon's Devices window.", NULL, 0 };
+    icons[I_DEFAULT] = (bt_icon_spec){ 16, -508, 216, -448, 0,
+        "Default", "R5,3", 0 };
+    icons[I_CANCEL] = (bt_icon_spec){ 572, -508, 772, -448, 0,
+        "Cancel", "R5,3", 0 };
+    icons[I_SET] = (bt_icon_spec){ 784, -512, 984, -444, 0,
+        "Set", "R6,3", 0 };
+    icons[I_ADDRESS_LABEL].flags = bt_flags_label() | 0x200u;
+    icons[I_PIN_LABEL].flags = bt_flags_label() | 0x200u;
+    icons[I_ADDRESS_HINT].flags = bt_flags_label();
+    icons[I_NOTE].flags = bt_flags_label();
+    icons[I_ADDRESS].flags = bt_flags_writable();
+    icons[I_PIN].flags = bt_flags_writable();
+    icons[I_SOUND].flags = bt_flags_option();
+    icons[I_START].flags = bt_flags_option();
+    icons[I_CONNECT].flags = bt_flags_option();
+    icons[I_USB].flags = bt_flags_option();
+    icons[I_DEFAULT].flags = bt_flags_action();
+    icons[I_CANCEL].flags = bt_flags_action();
+    icons[I_SET].flags = bt_flags_action();
+    window = bt_window_create("Bluetooth configuration", WINDOW_WIDTH,
+                              WINDOW_HEIGHT, icons, I_COUNT, 1);
+}
+
+static void show(const bt_settings *settings, int start_with_desktop,
+                 int usb_at_start)
+{
+    bt_icon_set_text(window, I_ADDRESS, settings->address);
+    bt_icon_set_text(window, I_ADDRESS_HINT,
+                     settings->name[0] ? settings->name :
+                     settings->address[0] ? "" : "(none chosen)");
+    bt_icon_set_text(window, I_PIN, settings->pin);
+    bt_icon_set_selected(window, I_SOUND, settings->system_sound);
+    bt_icon_set_selected(window, I_START, start_with_desktop);
+    bt_icon_set_selected(window, I_CONNECT, settings->connect_at_start);
+    bt_icon_set_selected(window, I_USB, usb_at_start);
+}
+
+static void load_into_window(void)
+{
+    bt_settings settings;
+    bt_settings_load(&settings);
+    show(&settings, bt_settings_start_with_desktop(),
+         settings.load_usb_drivers);
+}
+
+static int save_from_window(void)
+{
+    bt_settings settings;
+    const char *address = bt_icon_text(window, I_ADDRESS);
+    bt_settings_load(&settings); /* keep anything the window lacks */
+    if (!bt_settings_address_valid(address))
+    {
+        bt_report("The headset address must look like 01:23:45:67:89:AB, or be empty.", 1);
+        bt_caret_to(window, I_ADDRESS);
+        return 0;
+    }
+    if (strcmp(settings.address, address) != 0) settings.name[0] = '\0';
+    strncpy(settings.address, address, sizeof(settings.address) - 1);
+    settings.address[sizeof(settings.address) - 1] = '\0';
+    strncpy(settings.pin, bt_icon_text(window, I_PIN), sizeof(settings.pin) - 1);
+    settings.pin[sizeof(settings.pin) - 1] = '\0';
+    if (settings.pin[0] == '\0') strcpy(settings.pin, "0000");
+    settings.system_sound = bt_icon_selected(window, I_SOUND);
+    settings.connect_at_start = bt_icon_selected(window, I_CONNECT);
+    settings.load_usb_drivers = bt_icon_selected(window, I_USB);
+    if (!bt_settings_save(&settings))
+    {
+        bt_report("Could not save the Bluetooth choices.", 1);
+        return 0;
+    }
+    if (!bt_settings_set_start_with_desktop(bt_icon_selected(window, I_START)))
+    {
+        bt_report("Could not change the desktop start-up entry.", 1);
+        return 0;
+    }
+    if (!bt_settings_set_load_usb_at_start(settings.load_usb_drivers))
+    {
+        bt_report("Could not change the USB driver start-up entry.", 1);
+        return 0;
+    }
+    return 1;
+}
+
+static int on_click(const int *block)
+{
+    int icon = block[4], buttons = block[2];
+    if (block[3] != window) return 0;
+    switch (icon)
+    {
+    case I_SOUND:
+    case I_START:
+    case I_CONNECT:
+    case I_USB:
+        bt_icon_set_selected(window, icon, !bt_icon_selected(window, icon));
+        break;
+    case I_DEFAULT:
+    {
+        bt_settings settings;
+        bt_settings_default(&settings);
+        show(&settings, 0, 0);
+        break;
+    }
+    case I_CANCEL:
+        if (buttons == BUTTON_ADJUST) load_into_window();
+        else return 1;
+        break;
+    case I_SET:
+        if (save_from_window() && buttons != BUTTON_ADJUST) return 1;
+        break;
+    default: break;
+    }
+    return 0;
+}
+
+int main(int argc, char **argv)
+{
+    int block[64];
+    int done = 0;
+    if (!bt_wimp_initialise(TASK_NAME)) return 1;
+    create_window();
+    if (window == 0) return 1;
+    load_into_window();
+    if (argc >= 4 && strcmp(argv[1], "-openat") == 0)
+        bt_window_open_at(window, atoi(argv[2]), atoi(argv[3]));
+    else
+        bt_window_open_centred(window);
+    bt_caret_to(window, I_ADDRESS);
+    while (!done)
+    {
+        switch (bt_wimp_poll(-1, block))
+        {
+        case WIMP_OPEN: bt_window_reopen(block); break;
+        case WIMP_CLOSE: done = 1; break;
+        case WIMP_CLICK: done = on_click(block); break;
+        case WIMP_KEY:
+            if (block[6] == 13) done = save_from_window();
+            else if (block[6] == 27) done = 1;
+            else
+            {
+                _kernel_swi_regs regs;
+                memset(&regs, 0, sizeof(regs));
+                regs.r[0] = block[6];
+                (void)_kernel_swi(0x400dc /* Wimp_ProcessKey */, &regs, &regs);
+            }
+            break;
+        case WIMP_MESSAGE:
+        case WIMP_MESSAGE_RECORDED:
+            if (block[4] == MESSAGE_QUIT || block[4] == MESSAGE_PLUGIN_QUIT)
+                done = 1;
+            else if (block[4] == MESSAGE_OPEN_CONFIG_WINDOW)
+            {
+                int state[9];
+                _kernel_swi_regs regs;
+                state[0] = window;
+                memset(&regs, 0, sizeof(regs));
+                regs.r[1] = (int)state;
+                if (_kernel_swi(0x400cb /* Wimp_GetWindowState */, &regs,
+                                &regs) == NULL)
+                {
+                    state[7] = -1; /* bring to the front */
+                    bt_window_reopen(state);
+                }
+            }
+            break;
+        default: break;
+        }
+    }
+    bt_wimp_finalise();
+    return 0;
+}

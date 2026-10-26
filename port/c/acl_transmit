@@ -1,0 +1,246 @@
+/*-
+ * Copyright (c) 2005 Iain Hibbert.
+ * Copyright (c) 2006 Itronix Inc.
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. The name of Itronix Inc. may not be used to endorse
+ *    or promote products derived from this software without specific
+ *    prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY ITRONIX INC. ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL ITRONIX INC. BE LIABLE FOR ANY
+ * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+/* Adapted from NetBSD hci_link.c hci_acl_start/hci_acl_complete and
+ * hci_event.c hci_event_num_compl_pkts. Bounded copied PDUs and receipt slots
+ * replace mbuf queues. USB completion is tracked separately from HCI credit. */
+#include "acl_transmit.h"
+#include <string.h>
+
+static int find_link(const btv_acl_transmit *tx, uint16_t handle)
+{
+    unsigned int i;
+    for (i = 0; i < BTV_TX_LINKS; ++i)
+        if (tx->links[i].bound && tx->links[i].handle == handle) return (int)i;
+    return -1;
+}
+
+int btv_acl_transmit_init(btv_acl_transmit *tx, uint16_t controller_mtu,
+                         uint16_t controller_packets, size_t transport_bytes)
+{
+    size_t mtu;
+    if (tx == NULL || controller_mtu < 4 || controller_packets == 0 || transport_bytes < 8) return 0;
+    mtu = controller_mtu;
+    if (mtu > transport_bytes - 4) mtu = transport_bytes - 4;
+    memset(tx, 0, sizeof(*tx));
+    tx->mtu = (uint16_t)mtu;
+    tx->credits = tx->maximum = controller_packets;
+    tx->next_ticket = 1;
+    return 1;
+}
+
+int btv_acl_transmit_bind(btv_acl_transmit *tx, uint16_t handle, uint8_t *storage, size_t capacity)
+{
+    unsigned int i;
+    if (tx->error) return BTV_TX_FAILED;
+    if (storage == NULL || capacity < 4 || handle > 0x0fff) return BTV_TX_INVALID;
+    if (find_link(tx, handle) >= 0) return BTV_TX_WAIT;
+    for (i = 0; i < BTV_TX_LINKS; ++i)
+        if (!tx->links[i].bound)
+        {
+            memset(&tx->links[i], 0, sizeof(tx->links[i]));
+            tx->links[i].bound = 1;
+            tx->links[i].handle = handle;
+            tx->links[i].storage = storage;
+            tx->links[i].capacity = capacity;
+            return BTV_TX_OK;
+        }
+    return BTV_TX_WAIT;
+}
+
+int btv_acl_transmit_unbind(btv_acl_transmit *tx, uint16_t handle)
+{
+    int i;
+    i = find_link(tx, handle);
+    if (i < 0) return BTV_TX_INVALID;
+    if (tx->links[i].length != 0) return BTV_TX_WAIT;
+    tx->links[i].bound = 0;
+    return BTV_TX_OK;
+}
+
+int btv_acl_transmit_queue(btv_acl_transmit *tx, uint16_t handle, const uint8_t *pdu, size_t bytes)
+{
+    int i;
+    btv_tx_link *link;
+    if (tx->error) return BTV_TX_FAILED;
+    i = find_link(tx, handle);
+    if (i < 0 || pdu == NULL || bytes < 4) return BTV_TX_INVALID;
+    link = &tx->links[i];
+    if (link->length != 0) return BTV_TX_WAIT;
+    if (bytes > link->capacity || ((size_t)pdu[0] | ((size_t)pdu[1] << 8)) != bytes - 4)
+        return BTV_TX_INVALID;
+    memmove(link->storage, pdu, bytes);
+    link->length = bytes;
+    link->offset = 0;
+    return BTV_TX_OK;
+}
+
+size_t btv_acl_transmit_peek(btv_acl_transmit *tx, uint8_t *output, size_t capacity, uint32_t *ticket)
+{
+    unsigned int i, slot, n;
+    btv_tx_link *link;
+    size_t bytes;
+    uint16_t flags;
+    if (tx->error || tx->credits == 0 || output == NULL || ticket == NULL) return 0;
+    if (tx->prepared_ticket == 0)
+    {
+        if (tx->next_ticket == 0) return 0;
+        for (slot = 0; slot < BTV_TX_RECEIPTS && tx->receipts[slot].ticket != 0; ++slot) {}
+        if (slot == BTV_TX_RECEIPTS) return 0;
+        for (n = 0; n < BTV_TX_LINKS; ++n)
+        {
+            i = (tx->next_link + n) % BTV_TX_LINKS;
+            link = &tx->links[i];
+            if (link->bound && link->offset < link->length) break;
+        }
+        if (n == BTV_TX_LINKS) return 0;
+        bytes = link->length - link->offset;
+        if (bytes > tx->mtu) bytes = tx->mtu;
+        if (capacity < bytes + 4) return 0;
+        tx->prepared_link = i;
+        tx->prepared_slot = slot;
+        tx->prepared_bytes = bytes;
+        tx->prepared_ticket = tx->next_ticket++;
+    }
+    bytes = tx->prepared_bytes;
+    if (capacity < bytes + 4) return 0;
+    link = &tx->links[tx->prepared_link];
+    flags = (uint16_t)(link->handle | (link->offset == 0 ? 0x2000 : 0x1000));
+    memcpy(output + 4, link->storage + link->offset, bytes);
+    output[0] = (uint8_t)flags; output[1] = (uint8_t)(flags >> 8);
+    output[2] = (uint8_t)bytes; output[3] = (uint8_t)(bytes >> 8);
+    *ticket = tx->prepared_ticket;
+    return bytes + 4;
+}
+
+int btv_acl_transmit_sent(btv_acl_transmit *tx, uint32_t ticket)
+{
+    btv_tx_link *link;
+    btv_tx_receipt *receipt;
+    if (tx->error) return BTV_TX_FAILED;
+    if (ticket == 0 || ticket != tx->prepared_ticket || tx->credits == 0) return BTV_TX_INVALID;
+    receipt = &tx->receipts[tx->prepared_slot];
+    memset(receipt, 0, sizeof(*receipt));
+    receipt->ticket = ticket;
+    receipt->link = (uint8_t)tx->prepared_link;
+    link = &tx->links[tx->prepared_link];
+    link->offset += tx->prepared_bytes;
+    ++link->pending;
+    ++link->controller_pending;
+    --tx->credits;
+    tx->next_link = (tx->prepared_link + 1) % BTV_TX_LINKS;
+    tx->prepared_ticket = 0;
+    return BTV_TX_OK;
+}
+
+static void retire(btv_acl_transmit *tx, btv_tx_receipt *receipt)
+{
+    if (receipt->usb_done && receipt->controller_done)
+    {
+        --tx->links[receipt->link].pending;
+        receipt->ticket = 0;
+    }
+}
+
+int btv_acl_transmit_usb_done(btv_acl_transmit *tx, uint32_t ticket, int success)
+{
+    unsigned int i;
+    btv_tx_receipt *receipt;
+    if (ticket == 0) return BTV_TX_INVALID;
+    for (i = 0; i < BTV_TX_RECEIPTS; ++i)
+    {
+        receipt = &tx->receipts[i];
+        if (receipt->ticket != ticket) continue;
+        if (receipt->usb_done) return BTV_TX_INVALID;
+        receipt->usb_done = 1;
+        if (!success) tx->error = BTV_TX_USB_ERROR;
+        retire(tx, receipt);
+        return tx->error ? BTV_TX_FAILED : BTV_TX_OK;
+    }
+    return BTV_TX_INVALID;
+}
+
+int btv_acl_transmit_completed(btv_acl_transmit *tx, const btv_acl_completed *entries, size_t count)
+{
+    uint32_t totals[BTV_TX_LINKS], sum, oldest;
+    size_t n;
+    unsigned int i, j, chosen;
+    int link;
+    if (tx->error) return BTV_TX_FAILED;
+    if ((entries == NULL && count != 0) || count > 63) return BTV_TX_INVALID;
+    memset(totals, 0, sizeof(totals));
+    sum = 0;
+    for (n = 0; n < count; ++n)
+    {
+        if (entries[n].packets == 0) continue;
+        link = find_link(tx, entries[n].handle);
+        if (link < 0) goto bad;
+        totals[link] += entries[n].packets;
+        if (totals[link] > tx->links[link].controller_pending) goto bad;
+        sum += entries[n].packets;
+    }
+    if (sum > (uint32_t)(tx->maximum - tx->credits)) goto bad;
+    for (i = 0; i < BTV_TX_LINKS; ++i)
+        while (totals[i] != 0)
+        {
+            chosen = BTV_TX_RECEIPTS;
+            oldest = UINT32_MAX;
+            for (j = 0; j < BTV_TX_RECEIPTS; ++j)
+                if (tx->receipts[j].ticket != 0 && !tx->receipts[j].controller_done &&
+                    tx->receipts[j].link == i && (chosen == BTV_TX_RECEIPTS || tx->receipts[j].ticket < oldest))
+                {
+                    chosen = j;
+                    oldest = tx->receipts[j].ticket;
+                }
+            /* Every pending controller packet has a receipt by construction. */
+            if (chosen == BTV_TX_RECEIPTS) goto bad;
+            tx->receipts[chosen].controller_done = 1;
+            --tx->links[i].controller_pending;
+            ++tx->credits;
+            --totals[i];
+            retire(tx, &tx->receipts[chosen]);
+        }
+    return BTV_TX_OK;
+bad:
+    tx->error = BTV_TX_CREDIT_ERROR;
+    return BTV_TX_FAILED;
+}
+
+int btv_acl_transmit_take(btv_acl_transmit *tx, uint16_t handle)
+{
+    int i;
+    btv_tx_link *link;
+    if (tx->error) return BTV_TX_FAILED;
+    i = find_link(tx, handle);
+    if (i < 0) return BTV_TX_INVALID;
+    link = &tx->links[i];
+    if (link->length == 0 || link->offset != link->length || link->pending != 0) return BTV_TX_WAIT;
+    link->length = link->offset = 0;
+    return BTV_TX_OK;
+}

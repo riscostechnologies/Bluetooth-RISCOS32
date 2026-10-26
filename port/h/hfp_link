@@ -1,0 +1,23 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#ifndef BTV_HFP_LINK_H
+#define BTV_HFP_LINK_H
+#include "hfp_ag.h"
+#include "rfcomm_session.h"
+typedef struct btv_hfp_link {
+    btv_rfcomm_session *session;
+    btv_hfp_ag gateway;
+    uint8_t reply[256];
+    unsigned int failed;
+} btv_hfp_link;
+/* Attach to an already READY RFCOMM session and exclusively own its application
+ * reads/writes. The parent retains transport/signaling/cleanup ownership.
+ * Objects cannot move or overlap; same serialized owner. */
+int btv_hfp_link_start(btv_hfp_link *link, btv_rfcomm_session *session, const uint8_t indicators[7]);
+/* At most 256 input bytes and one response commit per call. 1 response copied
+ * to RFCOMM, 0 pending/no input/modem exchange paused, -1 failed/closed.
+ * Leaves unread bytes in RX while a response waits for copied TX space.
+ * Parent must pump again on new input, released TX space or modem readiness.
+ * Invalid command framing aborts RFCOMM for parent teardown. */
+int btv_hfp_link_pump(btv_hfp_link *link, uint32_t now);
+#endif

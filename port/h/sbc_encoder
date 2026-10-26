@@ -1,0 +1,72 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        sbc_encoder
+ * Purpose:     Fixed-point A2DP SBC encoder for BluetoothVoice.
+ * Reference:   A2DP 1.3 Appendix B (SBC); integer-only, no runtime
+ *              helpers, no heap and no mutable static data.
+ ******************************************************************/
+#ifndef BTV_SBC_ENCODER_H
+#define BTV_SBC_ENCODER_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#define BTV_SBC_SYNCWORD 0x9c
+#define BTV_SBC_MONO 0
+#define BTV_SBC_DUAL_CHANNEL 1
+#define BTV_SBC_STEREO 2
+#define BTV_SBC_JOINT_STEREO 3
+#define BTV_SBC_LOUDNESS 0
+#define BTV_SBC_SNR 1
+#define BTV_SBC_MAX_BLOCKS 16
+#define BTV_SBC_MAX_SUBBANDS 8
+#define BTV_SBC_MAX_CHANNELS 2
+/* Dual channel, 8 subbands, 16 blocks, bitpool 128: 12 + 512 octets. */
+#define BTV_SBC_MAX_FRAME_BYTES 524
+
+typedef struct btv_sbc_config
+{
+    uint32_t sample_rate;   /* 16000, 32000, 44100 or 48000 */
+    uint8_t channel_mode;   /* 0 mono, 1 dual channel, 2 stereo, 3 joint */
+    uint8_t blocks;         /* 4, 8, 12, 16 */
+    uint8_t subbands;       /* 4 or 8 */
+    uint8_t allocation;     /* 0 loudness, 1 SNR */
+    uint8_t bitpool;        /* 2..250 within the limit for the mode */
+} btv_sbc_config;
+
+/* All encoder state; about 1.4 KB. Owned and serialised by the caller. */
+typedef struct btv_sbc_encoder
+{
+    btv_sbc_config config;
+    unsigned int channels;
+    unsigned int blocks;
+    unsigned int subbands;
+    size_t frame_bytes;
+    uint8_t header[2];      /* frame octets 1 and 2 */
+    uint8_t frequency;      /* 2-bit sampling frequency code */
+    uint8_t join;           /* bit sb set when subband sb is mid/side */
+    /* Analysis input X[], newest sample first, per channel. */
+    int16_t history[BTV_SBC_MAX_CHANNELS][10 * BTV_SBC_MAX_SUBBANDS];
+    /* Subband samples of the frame being encoded, Q14 PCM units. */
+    int32_t samples[BTV_SBC_MAX_BLOCKS][BTV_SBC_MAX_CHANNELS]
+                   [BTV_SBC_MAX_SUBBANDS];
+    uint8_t scale[BTV_SBC_MAX_CHANNELS][BTV_SBC_MAX_SUBBANDS];
+    uint8_t bits[BTV_SBC_MAX_CHANNELS][BTV_SBC_MAX_SUBBANDS];
+} btv_sbc_encoder;
+
+/* Returns 1 and resets the filter history, or 0 leaving enc untouched. */
+int btv_sbc_init(btv_sbc_encoder *enc, const btv_sbc_config *config);
+/* Length of every frame this encoder produces. */
+size_t btv_sbc_frame_bytes(const btv_sbc_encoder *enc);
+/* Changes the bitpool of the frames to come without resetting the filter. */
+int btv_sbc_set_bitpool(btv_sbc_encoder *enc, uint8_t bitpool);
+/* PCM frames consumed per SBC frame: blocks * subbands (per channel). */
+unsigned int btv_sbc_frame_samples(const btv_sbc_encoder *enc);
+/* pcm: interleaved native-endian signed 16-bit, exactly frame_samples
+ * frames of 1 (mono) or 2 channels. Writes one complete SBC frame and
+ * returns its length, or 0 if the arguments or capacity are unusable. */
+size_t btv_sbc_encode(btv_sbc_encoder *enc, const int16_t *pcm,
+                      uint8_t *out, size_t capacity);
+
+#endif

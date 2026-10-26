@@ -1,0 +1,233 @@
+/*	$NetBSD: rfcomm.h,v 1.19 2022/05/28 21:14:57 andvar Exp $	*/
+
+/*-
+ * Copyright (c) 2006 Itronix Inc.
+ * All rights reserved.
+ *
+ * Written by Iain Hibbert for Itronix Inc.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. The name of Itronix Inc. may not be used to endorse
+ *    or promote products derived from this software without specific
+ *    prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY ITRONIX INC. ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL ITRONIX INC. BE LIABLE FOR ANY
+ * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+/*-
+ * Copyright (c) 2001-2003 Maksim Yevmenkin <m_evmenkin@yahoo.com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ *
+ * $Id: rfcomm.h,v 1.19 2022/05/28 21:14:57 andvar Exp $
+ * $FreeBSD: src/sys/netgraph/bluetooth/include/ng_btsocket_rfcomm.h,v 1.4 2005/01/11 01:39:53 emax Exp $
+ */
+
+/* Explicit-state adaptation of NetBSD rfcomm_session.c DLCI-0 handlers. */
+#include "rfcomm_mux.h"
+#include <string.h>
+
+void btv_rfcomm_mux_init(btv_rfcomm_mux *mux)
+{
+    if (mux != NULL)
+        memset(mux, 0, sizeof(*mux));
+}
+
+void btv_rfcomm_mux_abort(btv_rfcomm_mux *mux)
+{
+    if (mux != NULL)
+    {
+        mux->state = BTV_MUX_FAILED;
+        mux->request_bytes = mux->response_bytes = 0;
+        mux->awaiting = 0;
+    }
+}
+
+int btv_rfcomm_mux_start(btv_rfcomm_mux *mux, int initiator, uint32_t now)
+{
+    if (mux == NULL || mux->state != BTV_MUX_IDLE || (initiator != 0 && initiator != 1))
+        return 0;
+    mux->initiator = (uint8_t)initiator;
+    mux->state = BTV_MUX_WAIT;
+    mux->started = now;
+    if (initiator)
+        mux->request_bytes = btv_rfcomm_frame_encode(mux->request, 4, 0, 1, 0x2f, 1, -1, NULL, 0);
+    return 1;
+}
+
+int btv_rfcomm_mux_close(btv_rfcomm_mux *mux, uint32_t now)
+{
+    if (mux == NULL || mux->state != BTV_MUX_OPEN || mux->response_bytes != 0)
+        return 0;
+    mux->state = BTV_MUX_CLOSING;
+    mux->started = now;
+    mux->awaiting = 0;
+    mux->request_bytes = btv_rfcomm_frame_encode(mux->request, 4, 0, mux->initiator,
+        0x43, 1, -1, NULL, 0);
+    return 1;
+}
+
+void btv_rfcomm_mux_tick(btv_rfcomm_mux *mux, uint32_t now)
+{
+    if (mux != NULL && (mux->state == BTV_MUX_WAIT || mux->state == BTV_MUX_CLOSING) &&
+        (uint32_t)(now - mux->started) >= 20000UL)
+        btv_rfcomm_mux_abort(mux);
+}
+
+size_t btv_rfcomm_mux_output(btv_rfcomm_mux *mux, uint8_t *output,
+                             size_t capacity, unsigned int *token, uint32_t now)
+{
+    if (mux == NULL || output == NULL || token == NULL)
+        return 0;
+    btv_rfcomm_mux_tick(mux, now);
+    if (capacity < 4)
+        return 0;
+    if (mux->response_bytes != 0)
+    {
+        memcpy(output, mux->response, 4);
+        *token = 2;
+        return 4;
+    }
+    if (mux->request_bytes != 0)
+    {
+        memcpy(output, mux->request, 4);
+        *token = 1;
+        return 4;
+    }
+    return 0;
+}
+
+int btv_rfcomm_mux_sent(btv_rfcomm_mux *mux, unsigned int token)
+{
+    if (mux == NULL)
+        return 0;
+    if (token == 2 && mux->response_bytes != 0)
+    {
+        mux->state = mux->response_state;
+        mux->response_bytes = 0;
+        return 1;
+    }
+    if (token == 1 && mux->request_bytes != 0 && mux->response_bytes == 0)
+    {
+        mux->awaiting = mux->request[1] & 0xef;
+        mux->request_bytes = 0;
+        return 1;
+    }
+    return 0;
+}
+
+int btv_rfcomm_mux_receive(btv_rfcomm_mux *mux, const btv_rfcomm_frame *frame, uint32_t now)
+{
+    int response;
+    if (mux == NULL || frame == NULL)
+        return -1;
+    if (frame->dlci != 0)
+        return 0;
+    btv_rfcomm_mux_tick(mux, now);
+    if (mux->state == BTV_MUX_FAILED)
+        return -1;
+    if (mux->state == BTV_MUX_IDLE)
+        return 0;
+    response = frame->type == 0x63 || frame->type == 0x0f;
+    if (frame->cr != (response ? mux->initiator : !mux->initiator) ||
+        (frame->type != 0xef && frame->bytes != 0) || frame->has_credit ||
+        (frame->type != 0xef && frame->type != 0x0f && !frame->pf) ||
+        (frame->type == 0xef && frame->pf))
+    {
+        btv_rfcomm_mux_abort(mux);
+        return -1;
+    }
+    if (frame->type == 0xef)
+        return 0; /* MCC owner may process only while mux is OPEN. */
+    if (frame->type == 0x2f)
+    {
+        if (mux->initiator || (mux->state != BTV_MUX_WAIT && mux->state != BTV_MUX_OPEN))
+        {
+            btv_rfcomm_mux_abort(mux);
+            return -1;
+        }
+        if (mux->response_bytes != 0)
+            return 2;
+        mux->response_bytes = btv_rfcomm_frame_encode(mux->response, 4, 0,
+            !mux->initiator, 0x63, 1, -1, NULL, 0);
+        mux->response_state = BTV_MUX_OPEN;
+        return 1;
+    }
+    if (frame->type == 0x43)
+    {
+        if (mux->response_bytes != 0)
+            return 2;
+        if (mux->state != BTV_MUX_CLOSING)
+            mux->started = now;
+        mux->state = BTV_MUX_CLOSING;
+        mux->request_bytes = 0;
+        mux->awaiting = 0;
+        mux->response_bytes = btv_rfcomm_frame_encode(mux->response, 4, 0,
+            !mux->initiator, 0x63, 1, -1, NULL, 0);
+        mux->response_state = BTV_MUX_CLOSED;
+        return 1;
+    }
+    if (frame->type == 0x63)
+    {
+        if (mux->state == BTV_MUX_WAIT && mux->awaiting == 0x2f)
+            mux->state = BTV_MUX_OPEN;
+        else if (mux->state == BTV_MUX_CLOSING && mux->awaiting == 0x43)
+            mux->state = BTV_MUX_CLOSED;
+        else
+            return 0;
+        mux->awaiting = 0;
+        return 1;
+    }
+    if (frame->type == 0x0f)
+    {
+        if (mux->state == BTV_MUX_WAIT && mux->awaiting == 0x2f)
+        {
+            btv_rfcomm_mux_abort(mux);
+            return -1;
+        }
+        if (mux->state == BTV_MUX_OPEN || mux->state == BTV_MUX_CLOSING)
+        {
+            mux->state = BTV_MUX_CLOSED;
+            mux->awaiting = 0;
+            mux->request_bytes = mux->response_bytes = 0;
+            return 1;
+        }
+    }
+    return 0;
+}

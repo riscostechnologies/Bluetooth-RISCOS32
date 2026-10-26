@@ -1,0 +1,658 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        bt_hid
+ * Purpose:     Classic Bluetooth HID host: reads the device's own report
+ *              descriptor from its SDP record, opens (or accepts) the
+ *              control and interrupt channels, selects report protocol
+ *              when the descriptor can be used (boot protocol when it
+ *              cannot), and delivers keyboard, pointer, consumer-key and
+ *              game controller reports to RISC OS.
+ ******************************************************************/
+#include "bt_profiles.h"
+#include "hid_riscos.h"
+#include "hid_sdp.h"
+#include <string.h>
+
+#define HID_CONTROL_PSM 0x0011u
+#define HID_INTERRUPT_PSM 0x0013u
+#define SDP_PSM 0x0001u
+#define STEP_TIMEOUT_MS 15000u
+/* Until the link is encrypted a person may be pairing it: reading a number
+ * off the screen and typing it on a keyboard takes longer than a step. */
+#define PAIRING_TIMEOUT_MS 60000u
+#define SDP_TIMEOUT_MS 3500u       /* the whole query; then boot protocol */
+
+#define HIDP_HANDSHAKE 0x00
+#define HIDP_CONTROL 0x10
+#define HIDP_SET_PROTOCOL_BOOT 0x70
+#define HIDP_SET_PROTOCOL_REPORT 0x71
+#define HIDP_DATA_INPUT 0xa1
+#define HIDP_UNPLUG 0x15
+
+extern btv_hid_riscos btp_hid_riscos;
+
+static btp_hid *for_link(btc_core *core, uint8_t link)
+{
+    return link < BTC_LINKS ? &core->profiles->hid[link] : 0;
+}
+
+static void step(btp_hid *h, uint8_t next, uint32_t now)
+{
+    if (h->state != next) ++btc_profile_generation;
+    h->state = next;
+    h->step_started = now;
+}
+
+static void detach(btc_core *core, btp_hid *h)
+{
+    if (h->keyboard)
+        btv_hid_riscos_keyboard_detach(&btp_hid_riscos, &h->kb);
+    if (h->mouse)
+        btv_hid_riscos_mouse_detach(&btp_hid_riscos, &h->pointer);
+    btp_hid_extras_detach(core, &h->pad, &h->pad_attached);
+    h->keyboard = h->mouse = 0;
+}
+
+static void fail(btc_core *core, btp_hid *h, uint8_t link)
+{
+    detach(core, h);
+    step(h, BTP_HID_FAILED, core->now);
+    (void)btc_disconnect(core, core->links[link].address);
+}
+
+void btp_hid_init(btc_core *core, uint8_t link)
+{
+    btp_hid *h = for_link(core, link);
+    if (h == 0) return;
+    memset(h, 0, sizeof(*h));
+    h->link = link;
+    h->control = h->interrupt = -1;
+    btv_hid_keyboard_init(&h->kb);
+    btv_hid_mouse_init(&h->pointer);
+    btv_hid_pad_init(&h->pad);
+}
+
+/* ---- reading the device's descriptor ------------------------------------ */
+
+static const uint16_t sdp_attributes[] =
+{
+    BTV_HIDSDP_SUBCLASS, BTV_HIDSDP_RECONNECT, BTV_HIDSDP_DESCRIPTORS,
+    BTV_HIDSDP_BOOT
+};
+
+static void sdp_release(btc_core *core, uint8_t link)
+{
+    btc_profiles *p = core->profiles;
+    if (p->sdp_link != link) return;
+    if (p->sdp_channel >= 0) (void)btc_l2cap_disconnect(core, p->sdp_channel);
+    p->sdp_link = 0xff;
+    p->sdp_channel = -1;
+}
+
+static void proceed(btc_core *core, btp_hid *h);
+
+/* The device's descriptor is known (read from it, or kept from the last
+ * time): the protocol is report protocol, laid out by it. */
+static void use_map(btp_hid *h)
+{
+    unsigned int i;
+    h->sdp = BTP_HID_SDP_DONE;
+    h->report_mode = 1;
+    h->ids_used = 0;
+    for (i = 0; i < h->map.fields_used; ++i)
+        if (h->map.fields[i].report_id != 0) h->ids_used = 1;
+    if (h->extras.pad_used && h->extras.pad_id != 0) h->ids_used = 1;
+    for (i = 0; i < h->extras.consumer_used; ++i)
+        if (h->extras.consumer[i].id != 0) h->ids_used = 1;
+    h->has_leds = h->map.has_leds;
+    h->led_id = h->map.led_id;
+}
+
+/* The descriptor goes with the bond, so that the next connection (above
+ * all one the device makes when a key is pressed) needs no query: report
+ * protocol is chosen as soon as the channels are open.  valid = 2 marks a
+ * classic device's (a Low Energy device's is 1). */
+static void keep_descriptor(btc_core *core, const btp_hid *h)
+{
+    btc_key *key = btc_key_find(core, core->links[h->link].address);
+    if (key == 0 || key->le) return;
+    key->gatt.map = h->map;
+    key->gatt.extras = h->extras;
+    key->gatt.valid = 2;
+    ++core->keys_generation;
+    btc_note("HID: descriptor kept with the bond, link", h->link);
+}
+
+static int kept_descriptor(btc_core *core, btp_hid *h)
+{
+    btc_key *key = btc_key_find(core, core->links[h->link].address);
+    if (key == 0 || key->le || key->gatt.valid != 2 ||
+        btv_hid_riscos_prefer_boot())
+        return 0;
+    h->map = key->gatt.map;
+    h->extras = key->gatt.extras;
+    h->from_cache = 1;
+    use_map(h);
+    btc_note("HID: using the descriptor kept with the bond, link", h->link);
+    return 1;
+}
+
+/* The query is over, well or not: decide the protocol and go on. */
+static void sdp_finished(btc_core *core, btp_hid *h, int ok)
+{
+    btc_profiles *p = core->profiles;
+    btv_hid_sdp_info info;
+    size_t bytes = 0;
+    const uint8_t *result = ok ? btp_sdpc_result(&p->sdpc, &bytes) : 0;
+    h->sdp = BTP_HID_SDP_FAILED;
+    if (result != 0 && btv_hid_sdp_parse(result, bytes, &info) == 1 &&
+        !btv_hid_riscos_prefer_boot())
+    {
+        btv_hid_extras_parser xp;
+        int map_ok, extras_ok;
+        btv_hid_map_init(&h->map);
+        btv_hid_map_feed(&h->map, info.descriptor, info.descriptor_bytes);
+        map_ok = btv_hid_map_finish(&h->map);
+        btv_hid_extras_init(&h->extras, &xp);
+        btv_hid_extras_feed(&h->extras, &xp, info.descriptor,
+                            info.descriptor_bytes);
+        extras_ok = btv_hid_extras_finish(&h->extras, &xp);
+        h->boot_capable = info.boot_known && info.boot_device;
+        if (map_ok || extras_ok)
+        {
+            use_map(h);
+            keep_descriptor(core, h);
+            btc_note("HID: report protocol, descriptor bytes", (uint32_t)info.descriptor_bytes);
+        }
+        else
+            btc_note("HID: descriptor not usable, bytes", (uint32_t)info.descriptor_bytes);
+    }
+    if (h->sdp != BTP_HID_SDP_DONE)
+        btc_note("HID: no usable descriptor, boot protocol, link", h->link);
+    sdp_release(core, h->link);
+    proceed(core, h);
+}
+
+static void sdp_start(btc_core *core, btp_hid *h)
+{
+    btc_profiles *p = core->profiles;
+    if (h->sdp != BTP_HID_SDP_NONE) return;
+    if (p->sdp_link != 0xff && p->sdp_link != h->link) return;   /* in use */
+    if (h->state == BTP_HID_SECURING) step(h, BTP_HID_SDP, core->now);
+    p->sdp_channel = btc_l2cap_connect(core, h->link, SDP_PSM,
+                                       BTC_OWN_SDP_CLIENT, 0);
+    if (p->sdp_channel < 0)
+    {
+        sdp_finished(core, h, 0);
+        return;
+    }
+    p->sdp_link = h->link;
+    h->sdp = BTP_HID_SDP_RUNNING;
+    ++p->sdp_transaction;
+    btp_sdpc_start(&p->sdpc, BTV_HIDSDP_UUID, sdp_attributes, 4,
+                   p->sdp_transaction);
+    h->step_started = core->now;
+}
+
+static void sdp_send(btc_core *core, btp_hid *h)
+{
+    btc_profiles *p = core->profiles;
+    uint8_t request[64];
+    size_t n = btp_sdpc_request(&p->sdpc, request, sizeof request, core->now);
+    (void)h;
+    if (n != 0) (void)btc_l2cap_send(core, p->sdp_channel, request, n);
+}
+
+/* Know the device's descriptor: from the bond if it is kept there, or ask. */
+static void start_descriptor(btc_core *core, btp_hid *h)
+{
+    if (h->sdp != BTP_HID_SDP_NONE) return;
+    if (kept_descriptor(core, h))
+    {
+        if (h->state == BTP_HID_SECURING) step(h, BTP_HID_SDP, core->now);
+        proceed(core, h);
+        return;
+    }
+    sdp_start(core, h);
+}
+
+void btp_hid_sdp_open(btc_core *core, int channel)
+{
+    btc_profiles *p = core->profiles;
+    btp_hid *h = p->sdp_link < BTC_LINKS ? &p->hid[p->sdp_link] : 0;
+    (void)channel;
+    if (h == 0 || h->sdp != BTP_HID_SDP_RUNNING) return;
+    sdp_send(core, h);
+}
+
+void btp_hid_sdp_data(btc_core *core, int channel, const uint8_t *data,
+                      size_t bytes)
+{
+    btc_profiles *p = core->profiles;
+    btp_hid *h = p->sdp_link < BTC_LINKS ? &p->hid[p->sdp_link] : 0;
+    int r;
+    (void)channel;
+    if (h == 0 || h->sdp != BTP_HID_SDP_RUNNING) return;
+    r = btp_sdpc_response(&p->sdpc, data, bytes);
+    if (r == 1) sdp_finished(core, h, 1);
+    else if (r < 0) sdp_finished(core, h, 0);
+    else sdp_send(core, h);              /* the next piece, if there is one */
+}
+
+void btp_hid_sdp_closed(btc_core *core, int channel)
+{
+    btc_profiles *p = core->profiles;
+    btp_hid *h;
+    if (channel != p->sdp_channel) return;
+    h = p->sdp_link < BTC_LINKS ? &p->hid[p->sdp_link] : 0;
+    p->sdp_channel = -1;
+    p->sdp_link = 0xff;
+    if (h != 0 && h->sdp == BTP_HID_SDP_RUNNING) sdp_finished(core, h, 0);
+}
+
+/* ---- the channels ----------------------------------------------------- */
+
+void btp_hid_link_opened(btc_core *core, uint8_t link)
+{
+    btp_hid *h = for_link(core, link);
+    btp_hid_init(core, link);
+    h->active = 1;
+    h->outgoing = core->links[link].outgoing;
+    if (h->outgoing)
+    {
+        step(h, BTP_HID_SECURING, core->now);
+        if (!btc_secure(core, link)) fail(core, h, link);
+    }
+    else
+        step(h, BTP_HID_WAITING, core->now);   /* the device drives it */
+}
+
+void btp_hid_link_secured(btc_core *core, uint8_t link)
+{
+    btp_hid *h = for_link(core, link);
+    if (!h->active) return;
+    if (h->state == BTP_HID_SECURING) step(h, BTP_HID_SDP, core->now);
+    if (h->state == BTP_HID_SDP || h->state == BTP_HID_WAITING)
+        start_descriptor(core, h);   /* if another query runs, the pump tries again */
+}
+
+void btp_hid_link_closed(btc_core *core, uint8_t link)
+{
+    btp_hid *h = for_link(core, link);
+    if (h == 0 || !h->active) return;
+    sdp_release(core, link);
+    detach(core, h);
+    btp_hid_init(core, link);
+}
+
+uint8_t btp_hid_incoming(btc_core *core, uint8_t link, uint16_t psm)
+{
+    btp_hid *h = for_link(core, link);
+    if (!h->active)
+    {
+        btp_hid_init(core, link);
+        h->active = 1;
+        step(h, BTP_HID_WAITING, core->now);
+    }
+    if (psm == HID_CONTROL_PSM && h->control < 0) return BTC_OWN_HID_CONTROL;
+    if (psm == HID_INTERRUPT_PSM && h->interrupt < 0)
+        return BTC_OWN_HID_INTERRUPT;
+    return BTC_OWN_NONE;
+}
+
+/* The descriptor has been read, or given up on. */
+static int decided(const btp_hid *h)
+{
+    return h->sdp == BTP_HID_SDP_DONE || h->sdp == BTP_HID_SDP_FAILED;
+}
+
+/* Both channels are open and the protocol is known: select it. */
+static void apply_protocol(btc_core *core, btp_hid *h)
+{
+    uint8_t request = h->report_mode ? HIDP_SET_PROTOCOL_REPORT
+                                     : HIDP_SET_PROTOCOL_BOOT;
+    if (h->protocol_set || h->control < 0 || h->interrupt < 0 || !decided(h))
+        return;
+    if (core->channels[h->control].state != BTC_CH_OPEN ||
+        core->channels[h->interrupt].state != BTC_CH_OPEN)
+        return;
+    if (btc_l2cap_send(core, h->control, &request, 1) == 1)
+    {
+        h->protocol_set = 1;
+        h->awaiting_handshake = 1;
+        btc_note(h->report_mode ? "HID: SET_PROTOCOL report, link" :
+                 "HID: SET_PROTOCOL boot, link", h->link);
+        step(h, BTP_HID_READY, core->now);
+        ++core->links_generation;
+    }
+}
+
+/* The descriptor is in (or given up on): open the channels if this side
+ * does, and select the protocol if they are open. */
+static void proceed(btc_core *core, btp_hid *h)
+{
+    if (h->outgoing && h->control < 0 && h->state == BTP_HID_SDP)
+    {
+        h->control = btc_l2cap_connect(core, h->link, HID_CONTROL_PSM,
+                                       BTC_OWN_HID_CONTROL, 0);
+        if (h->control < 0) fail(core, h, h->link);
+        else step(h, BTP_HID_CONTROL, core->now);
+        return;
+    }
+    apply_protocol(core, h);
+}
+
+void btp_hid_channel_open(btc_core *core, int channel)
+{
+    btc_channel *c = &core->channels[channel];
+    btp_hid *h = for_link(core, c->link);
+    if (c->owner == BTC_OWN_HID_CONTROL)
+    {
+        h->control = channel;
+        if (!c->incoming)
+        {
+            h->interrupt = btc_l2cap_connect(core, c->link, HID_INTERRUPT_PSM,
+                                             BTC_OWN_HID_INTERRUPT, 0);
+            if (h->interrupt < 0) fail(core, h, c->link);
+            else step(h, BTP_HID_INTERRUPT, core->now);
+        }
+    }
+    else
+        h->interrupt = channel;
+    apply_protocol(core, h);
+}
+
+/* ---- reports ----------------------------------------------------------- */
+
+static void deliver_keyboard(btc_core *core, btp_hid *h,
+                             const btv_hid_event *e)
+{
+    uint8_t boot[8];
+    btc_link *link = &core->links[h->link];
+    if (!h->keyboard)
+    {
+        if (!btv_hid_riscos_keyboard_attach(&btp_hid_riscos))
+        {
+            if (h->attach_failed != 0xffu && ++h->attach_failed == 1)
+                btc_note("HID: KeyV could not be claimed for a keyboard", h->link);
+            return;
+        }
+        h->keyboard = 1;
+        link->flags |= BTC_DEV_HID | BTC_DEV_KEYBOARD;
+        btc_note("HID: keyboard announced to the desktop, link", h->link);
+    }
+    boot[0] = e->modifiers;
+    boot[1] = 0;
+    memcpy(boot + 2, e->keys, 6);
+    btv_hid_riscos_keyboard_report(&btp_hid_riscos, &h->kb, boot, 8);
+}
+
+static void deliver_pointer(btc_core *core, btp_hid *h, const btv_hid_event *e)
+{
+    btc_link *link = &core->links[h->link];
+    if (!h->mouse)
+    {
+        btv_hid_riscos_mouse_attach(&btp_hid_riscos);
+        h->mouse = 1;
+        link->flags |= BTC_DEV_HID | BTC_DEV_MOUSE;
+        btc_note("HID: mouse announced to the desktop, link", h->link);
+    }
+    btv_hid_riscos_mouse_event(&btp_hid_riscos, &h->pointer, e->buttons, e->dx,
+                               e->dy, e->wheel, e->pan);
+}
+
+/* A report in report protocol: "A1 [id] data". */
+static void report_input(btc_core *core, btp_hid *h, const uint8_t *data,
+                         size_t bytes)
+{
+    uint8_t id = 0;
+    const uint8_t *payload = data + 1;
+    size_t payload_bytes = bytes - 1;
+    btv_hid_event e;
+    btv_hid_extra_event x;
+    int handled = 0;
+    if (h->ids_used)
+    {
+        if (bytes < 2) return;
+        id = data[1];
+        payload = data + 2;
+        payload_bytes = bytes - 2;
+    }
+    h->last_report_id = id;
+    h->last_report_bytes = (uint8_t)(bytes > 255 ? 255 : bytes);
+    if (btv_hid_map_wants(&h->map, id) &&
+        btv_hid_map_decode(&h->map, id, payload, payload_bytes, &e))
+    {
+        handled = 1;
+        if (e.keyboard) deliver_keyboard(core, h, &e);
+        if (e.pointer) deliver_pointer(core, h, &e);
+    }
+    if (btv_hid_extras_wants(&h->extras, id) &&
+        btv_hid_extras_decode(&h->extras, id, payload, payload_bytes, &x))
+    {
+        handled = 1;
+        btp_hid_extras_deliver(core, h->link, &x, &h->pad, &h->pad_attached,
+                               h->last_consumer);
+    }
+    if (handled)
+    {
+        ++h->decoded;
+        return;
+    }
+    ++h->unmatched;
+    /* A descriptor kept from an earlier connection that describes nothing
+     * the device sends is the wrong one: forget it, and read the device's
+     * own at the next connection. */
+    if (h->from_cache && h->decoded == 0 && h->unmatched >= 8 && !h->fell_back)
+    {
+        btc_key *key = btc_key_find(core, core->links[h->link].address);
+        if (key != 0 && !key->le)
+        {
+            key->gatt.valid = 0;
+            ++core->keys_generation;
+        }
+        h->fell_back = 1;
+        btc_note("HID: the kept descriptor fits none of the reports; dropped, link", h->link);
+    }
+    if (h->unmatched == 1)
+        btc_note("HID: a report the descriptor does not describe, id|bytes",
+                 (uint32_t)id << 8 | h->last_report_bytes);
+    /* The device may have stayed in (or gone back to) boot protocol, which
+     * has fixed layouts under report IDs 1 (keyboard) and 2 (mouse): use
+     * them for what the descriptor has no place for. */
+    if (h->ids_used && !btv_hid_map_wants(&h->map, id))
+    {
+        unsigned int kind = btv_hid_classic_input(data, bytes, &payload,
+                                                  &payload_bytes);
+        if (kind == 1 && payload_bytes >= 8)
+        {
+            ++h->fallbacks;
+            if (!h->keyboard)
+            {
+                if (!btv_hid_riscos_keyboard_attach(&btp_hid_riscos)) return;
+                h->keyboard = 1;
+                core->links[h->link].flags |= BTC_DEV_HID | BTC_DEV_KEYBOARD;
+            }
+            btv_hid_riscos_keyboard_report(&btp_hid_riscos, &h->kb, payload,
+                                           payload_bytes);
+        }
+        else if (kind == 2 && payload_bytes >= 3)
+        {
+            ++h->fallbacks;
+            if (!h->mouse)
+            {
+                btv_hid_riscos_mouse_attach(&btp_hid_riscos);
+                h->mouse = 1;
+                core->links[h->link].flags |= BTC_DEV_HID | BTC_DEV_MOUSE;
+            }
+            btv_hid_riscos_mouse_report(&btp_hid_riscos, &h->pointer, payload,
+                                        payload_bytes);
+        }
+    }
+}
+
+static void input(btc_core *core, btp_hid *h, const uint8_t *data,
+                  size_t bytes)
+{
+    const uint8_t *payload;
+    size_t payload_bytes;
+    unsigned int id;
+    ++h->reports;
+    if (h->reports == 1)
+        btc_note("HID: first report, bytes|report mode",
+                 (uint32_t)bytes << 8 | h->report_mode);
+    if (h->report_mode)
+    {
+        if (bytes >= 1) report_input(core, h, data, bytes);
+        return;
+    }
+    id = btv_hid_classic_input(data, bytes, &payload, &payload_bytes);
+    if (id == 1)
+    {
+        if (!h->keyboard)
+        {
+            if (!btv_hid_riscos_keyboard_attach(&btp_hid_riscos)) return;
+            h->keyboard = 1;
+            core->links[h->link].flags |= BTC_DEV_HID | BTC_DEV_KEYBOARD;
+        }
+        btv_hid_riscos_keyboard_report(&btp_hid_riscos, &h->kb, payload,
+                                       payload_bytes);
+    }
+    else if (id == 2)
+    {
+        if (!h->mouse)
+        {
+            btv_hid_riscos_mouse_attach(&btp_hid_riscos);
+            h->mouse = 1;
+            core->links[h->link].flags |= BTC_DEV_HID | BTC_DEV_MOUSE;
+        }
+        btv_hid_riscos_mouse_report(&btp_hid_riscos, &h->pointer, payload,
+                                    payload_bytes);
+    }
+}
+
+void btp_hid_channel_data(btc_core *core, int channel, const uint8_t *data,
+                          size_t bytes)
+{
+    btc_channel *c = &core->channels[channel];
+    btp_hid *h = for_link(core, c->link);
+    if (bytes == 0) return;
+    if (channel == h->interrupt)
+    {
+        /* Until the protocol is selected the format is not known. */
+        if (data[0] == HIDP_DATA_INPUT && h->protocol_set)
+            input(core, h, data, bytes);
+        return;
+    }
+    /* Control channel. */
+    if ((data[0] & 0xf0) == HIDP_HANDSHAKE)
+    {
+        /* The answer to SET_PROTOCOL (HID Profile 1.1.1, 7.4.1): 0 is
+         * success, 1 not ready, 2 invalid report id, 3 unsupported request,
+         * 4 invalid parameter, 14 unknown, 15 fatal.  A device that will not
+         * go to report protocol is used in boot protocol. */
+        uint8_t result = (uint8_t)(data[0] & 0x0f);
+        btc_note("HID: handshake result|report mode", (uint32_t)result << 8 | h->report_mode);
+        h->handshake = (uint8_t)(result | 0x80u);
+        if (h->awaiting_handshake)
+        {
+            h->awaiting_handshake = 0;
+            if (result != 0 && h->report_mode && h->boot_capable &&
+                !h->boot_after_handshake &&
+                core->channels[h->control].state == BTC_CH_OPEN)
+            {
+                uint8_t boot = HIDP_SET_PROTOCOL_BOOT;
+                h->boot_after_handshake = 1;
+                h->report_mode = 0;
+                (void)btc_l2cap_send(core, h->control, &boot, 1);
+                btc_note("HID: the device refused report protocol; boot protocol, link", h->link);
+            }
+        }
+    }
+    else if ((data[0] & 0xf0) == HIDP_CONTROL && data[0] == HIDP_UNPLUG)
+    {
+        /* The device asked to be forgotten. */
+        (void)btc_key_forget(core, core->links[c->link].address);
+        fail(core, h, c->link);
+    }
+    else if (data[0] == HIDP_DATA_INPUT && h->protocol_set)
+        input(core, h, data, bytes);
+}
+
+void btp_hid_channel_closed(btc_core *core, int channel)
+{
+    btc_channel *c = &core->channels[channel];
+    btp_hid *h = for_link(core, c->link);
+    if (!h->active) return;
+    if (channel == h->control) h->control = -1;
+    if (channel == h->interrupt) h->interrupt = -1;
+    if (h->control < 0 && h->interrupt < 0)
+    {
+        /* Both gone: the device is going away. */
+        detach(core, h);
+        (void)btc_disconnect(core, core->links[c->link].address);
+    }
+}
+
+void btp_hid_pump(btc_core *core, uint32_t led_flags, unsigned int events)
+{
+    unsigned int index;
+    for (index = 0; index < BTC_LINKS; ++index)
+    {
+        btp_hid *h = &core->profiles->hid[index];
+        if (!h->active) continue;
+        if ((events & 2u) && h->keyboard) btv_hid_keyboard_forget(&h->kb);
+        /* A query that could not begin because another was running. */
+        if (h->sdp == BTP_HID_SDP_NONE &&
+            (h->state == BTP_HID_SDP || h->state == BTP_HID_WAITING) &&
+            core->links[index].security == BTC_SEC_ENCRYPTED)
+            start_descriptor(core, h);
+        /* A query that never ends: boot protocol, as before. */
+        if (h->sdp == BTP_HID_SDP_RUNNING)
+        {
+            btp_sdpc_tick(&core->profiles->sdpc, core->now, SDP_TIMEOUT_MS);
+            if (core->profiles->sdpc.state == BTP_SDPC_FAILED)
+                sdp_finished(core, h, 0);
+        }
+        /* The channels are open and the query never began (the link was not
+         * reported secured, or another query held it): boot protocol. */
+        if (!h->protocol_set && !decided(h) && h->sdp == BTP_HID_SDP_NONE &&
+            h->control >= 0 && h->interrupt >= 0 &&
+            core->now - h->step_started >= 4000u)
+        {
+            h->sdp = BTP_HID_SDP_FAILED;
+            apply_protocol(core, h);
+        }
+        if (h->keyboard && h->interrupt >= 0 && h->state == BTP_HID_READY)
+        {
+            uint8_t leds = btv_hid_keyboard_leds(led_flags);
+            if ((events & 1u) || leds != h->leds)
+            {
+                uint8_t frame[4];
+                size_t bytes;
+                if (h->report_mode)
+                {
+                    if (!h->has_leds) { h->leds = leds; continue; }
+                    bytes = 0;
+                    frame[bytes++] = 0xa2;
+                    if (h->led_id != 0) frame[bytes++] = h->led_id;
+                    frame[bytes++] = leds;
+                }
+                else
+                    bytes = btv_hid_classic_led_frame(frame, leds);
+                if (btc_l2cap_send(core, h->interrupt, frame, bytes) == 1)
+                    h->leds = leds;
+            }
+        }
+        if (h->state != BTP_HID_READY && h->state != BTP_HID_FAILED &&
+            h->state != BTP_HID_IDLE &&
+            core->now - h->step_started >=
+                (core->links[index].security == BTC_SEC_ENCRYPTED ?
+                 STEP_TIMEOUT_MS : PAIRING_TIMEOUT_MS))
+        {
+            btc_note("HID: step timed out, state|link", (uint32_t)h->state << 8 | index);
+            fail(core, h, (uint8_t)index);
+        }
+    }
+}

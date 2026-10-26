@@ -1,0 +1,53 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#ifndef BTV_SDP_SESSION_H
+#define BTV_SDP_SESSION_H
+#include "l2cap_dispatch.h"
+#include "sdp_query.h"
+#include "sdp_record.h"
+enum btv_discovery_state
+{
+    BTV_DISCOVERY_IDLE, BTV_DISCOVERY_OPENING, BTV_DISCOVERY_QUERY,
+    BTV_DISCOVERY_CLOSING, BTV_DISCOVERY_DONE, BTV_DISCOVERY_FAILED
+};
+enum btv_discovery_outcome
+{
+    BTV_DISCOVERY_PENDING, BTV_DISCOVERY_FOUND, BTV_DISCOVERY_NO_MATCH,
+    BTV_DISCOVERY_BAD_RECORD, BTV_DISCOVERY_QUERY_ERROR, BTV_DISCOVERY_LINK_ERROR,
+    BTV_DISCOVERY_TIMEOUT
+};
+typedef struct btv_sdp_session
+{
+    btv_l2cap_dispatch *dispatch;
+    btv_sdp_query query;
+    btv_sdp_service service;
+    uint8_t *storage;
+    size_t capacity;
+    uint16_t local_cid, requested_service;
+    unsigned int state, outcome, needs_acl_recovery;
+    uint32_t started;
+} btv_sdp_session;
+/* One discovery on a fresh dedicated SDP channel belonging to an established
+ * ACL dispatcher. Same serialized owner as dispatcher/ACL. Caller storage is
+ * retained through terminal state; existing channels on dispatcher coexist. */
+void btv_sdp_session_init(btv_sdp_session *session);
+int btv_sdp_session_start(btv_sdp_session *session, btv_l2cap_dispatch *dispatch,
+                         uint16_t service, uint16_t receive_mtu,
+                         uint8_t *storage, size_t capacity, uint32_t now);
+void btv_sdp_session_tick(btv_sdp_session *session, uint32_t now);
+/* Owner services dispatcher signaling output first, then this SDP data output.
+ * Both are complete L2CAP PDUs for the same ordered ACL queue. sent must follow
+ * acceptance of the session output's copied bytes immediately, before any
+ * other operation; no sent on backpressure. Not physical USB completion. */
+size_t btv_sdp_session_output(btv_sdp_session *session, uint8_t *pdu,
+                              size_t capacity, uint32_t now);
+int btv_sdp_session_sent(btv_sdp_session *session);
+/* Feed reassembled data PDUs after CID-1 signaling is routed to dispatcher.
+ * 1 consumed, 0 not this active query/CID, -1 query/link failure. */
+int btv_sdp_session_receive(btv_sdp_session *session, const uint8_t *pdu,
+                            size_t bytes, uint32_t now);
+/* Result only after successful discovery AND SDP channel close. DONE with
+ * NO_MATCH has no service. FAILED with needs_acl_recovery requires parent link
+ * teardown/recovery before releasing old IO or reinitializing this session. */
+const btv_sdp_service *btv_sdp_session_result(const btv_sdp_session *session);
+#endif

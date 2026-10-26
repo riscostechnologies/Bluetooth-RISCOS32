@@ -1,0 +1,16 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#include <kernel.h>
+#include <stdio.h>
+#include <string.h>
+int main(void)
+{
+    _kernel_swi_regs r;
+    _kernel_oserror *e;
+    memset(&r, 0, sizeof(r));
+    r.r[1] = 3000;
+    e = _kernel_swi(0xD7BD0, &r, &r);
+    if (e != NULL) { printf("audio test: %s\n", e->errmess); return 1; }
+    printf("audio test %s\n", r.r[1] ? "started" : "requires A2DP streaming");
+    return r.r[1] ? 0 : 1;
+}

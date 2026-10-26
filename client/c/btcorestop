@@ -1,0 +1,38 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/* Recovery: stop the BluetoothVoice core and hand the audio device back,
+ * so the module can be killed and replaced by hand.  Mod_Final refuses
+ * while the core is running or the device is registered. */
+#include <kernel.h>
+#include <stdio.h>
+#include <string.h>
+#define SWI_CORE 0x000D7BC8
+static int core_call(int reason, _kernel_swi_regs *r)
+{
+    memset(r, 0, sizeof(*r));
+    r->r[1] = reason;
+    return _kernel_swi(SWI_CORE, r, r) == NULL;
+}
+int main(void)
+{
+    _kernel_swi_regs r;
+    int tick, start, state = 1;
+    if (!core_call(1, &r)) { printf("stop failed\n"); return 1; }
+    memset(&r, 0, sizeof(r));
+    if (_kernel_swi(0x42, &r, &r) != NULL) return 1;   /* ReadMonotonicTime */
+    start = r.r[0];
+    for (;;)
+    {
+        if (!core_call(2, &r)) break;
+        state = r.r[1];
+        if (state == 0) break;
+        memset(&r, 0, sizeof(r));
+        if (_kernel_swi(0x42, &r, &r) != NULL) break;
+        tick = r.r[0];
+        if (tick - start > 500) break;
+    }
+    printf("core state %d\n", state);
+    if (core_call(6, &r))
+        printf("sound device: was &%X now &%X\n", r.r[1], r.r[2]);
+    return state == 0 ? 0 : 1;
+}

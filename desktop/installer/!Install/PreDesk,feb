@@ -1,0 +1,11 @@
+| SPDX-License-Identifier: BSD-2-Clause
+| Copyright (c) 2026 RISC OS Technologies
+| Bluetooth: load the drivers before the desktop starts (added by !Install)
+| Raspberry Pi only (its DWCDriver is loaded): USBDriver 1.35 and the
+| DWC host driver from the package.  Other boards keep their own USB stack.
+Set Bluetooth$Pi 1
+RMEnsure DWCDriver 0.00 Set Bluetooth$Pi 0
+If "<Bluetooth$Pi>" = "1" Then IfThere BootResources:!Bluetooth.Modules.USBDriver Then RMEnsure USBDriver 1.35 RMLoad BootResources:!Bluetooth.Modules.USBDriver
+If "<Bluetooth$Pi>" = "1" Then IfThere BootResources:!Bluetooth.Modules.DWCDriver Then RMEnsure DWCDriver 0.40 RMLoad BootResources:!Bluetooth.Modules.DWCDriver
+Unset Bluetooth$Pi
+IfThere BootResources:!Bluetooth.Modules.BTVoice Then RMEnsure BluetoothVoice VERSION RMLoad BootResources:!Bluetooth.Modules.BTVoice

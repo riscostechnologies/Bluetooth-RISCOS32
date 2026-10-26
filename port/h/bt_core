@@ -1,0 +1,451 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        bt_core
+ * Purpose:     Shared Bluetooth host core: owns one controller for as long
+ *              as it runs and serves several classic and Low Energy links
+ *              at once (speakers, keyboards, mice).  Driven by btc_pump
+ *              from a callback, so it needs no client polling.
+ ******************************************************************/
+#ifndef BTC_CORE_H
+#define BTC_CORE_H
+
+#include <stddef.h>
+#include <stdint.h>
+#include "hci_bootstrap.h"
+#include "hci_stream.h"
+#include "host_bridge.h"
+#include "hid_report.h"
+#include "hid_extras.h"
+
+#define BTC_LINKS 6
+#define BTC_CHANNELS 16
+#define BTC_DEVICES 40
+#define BTC_NAME_CACHE 48       /* names kept for devices seen in earlier scans */
+#define BTC_KEYS 16
+#define BTC_NAME_BYTES 64
+#define BTC_COMMANDS 32     /* power of two */
+#define BTC_TX_BYTES 6144u     /* per-link queue of whole L2CAP PDUs */
+#define BTC_RX_BYTES 2048u     /* largest L2CAP PDU accepted */
+#define BTC_EVENT_BYTES 260u
+
+enum btc_state
+{
+    BTC_OFF, BTC_BOOTING, BTC_CONFIGURING, BTC_READY, BTC_STOPPING,
+    BTC_FAILED
+};
+
+/* Device flags (scan results and links). */
+#define BTC_DEV_AUDIO_SINK   0x0001u /* speaker / headphones (A2DP) */
+#define BTC_DEV_HANDSFREE    0x0002u /* headset with a microphone (HFP/HSP) */
+#define BTC_DEV_HID          0x0004u
+#define BTC_DEV_KEYBOARD     0x0008u
+#define BTC_DEV_MOUSE        0x0010u
+#define BTC_DEV_LE           0x0020u /* found by Low Energy scanning */
+#define BTC_DEV_NAMED        0x0040u
+#define BTC_DEV_PAIRED       0x0080u
+#define BTC_DEV_CONNECTED    0x0100u
+#define BTC_DEV_RANDOM_ADDR  0x0200u /* LE random address */
+#define BTC_DEV_GAMEPAD      0x0400u /* game controller or joystick */
+#define BTC_DEV_CLASSIC      0x0800u /* answered an inquiry (BR/EDR), alone or as well as LE */
+
+typedef struct btc_device
+{
+    uint8_t address[6];      /* least significant octet first */
+    uint8_t device_class[3];
+    int8_t rssi;
+    uint16_t flags;
+    uint16_t clock_offset;
+    uint8_t page_scan_rep_mode;
+    uint8_t name_tried;
+    uint8_t name_status;     /* HCI status of the last Remote Name Request */
+    uint8_t name_cached;     /* the name is one remembered from an earlier scan */
+    uint8_t name_source;     /* 1 advertised (EIR / LE data), 2 asked for, 3 remembered */
+    uint16_t appearance;     /* LE */
+    char name[BTC_NAME_BYTES];
+    /* LE: once bonded, the identity address the device is listed under (it
+     * may have been found at a private address). */
+    uint8_t identity[6], identity_type, has_identity;
+} btc_device;
+
+/* What the HID service of a bonded LE device looked like when it was last
+ * discovered, kept with the bond so that a reconnection goes straight to
+ * enabling the input reports (HID over GATT 1.0, 3.x: a bonded client may
+ * rely on cached handles until Service Changed says otherwise). */
+#define BTC_GATT_INPUTS 4
+typedef struct btc_gatt_cache
+{
+    uint8_t valid, count;
+    uint16_t protocol_mode, keyboard_out;
+    uint16_t value[BTC_GATT_INPUTS], cccd[BTC_GATT_INPUTS];
+    uint8_t report_id[BTC_GATT_INPUTS];
+    btv_hid_map map;
+    /* Consumer keys and a controller's layout (hid_extras.c).  Added after
+     * the bond file's first version: it is at the end of btc_key, so that
+     * an older file's entries are a prefix (module_core.c, settings_load). */
+    btv_hid_extras extras;
+} btc_gatt_cache;
+
+/* One device to be brought back automatically (bt_reconnect.c). */
+typedef struct btc_rc_entry
+{
+    uint8_t address[6];
+    uint8_t le, address_type, profile, rank, state, tries;
+    uint32_t next_at;
+} btc_rc_entry;
+
+/* A stored pairing.  Classic: link key.  LE: long term key with its
+ * EDIV/Rand, plus the peer's identity key when it sent one. */
+typedef struct btc_key
+{
+    uint8_t used, le, address_type, key_type;
+    uint8_t address[6];
+    uint8_t key[16];
+    uint8_t ediv[2], rand[8];
+    uint8_t irk[16], has_irk, key_size;
+    uint16_t flags;          /* BTC_DEV_* hints: what the device is */
+    btc_gatt_cache gatt;     /* LE input devices */
+} btc_key;
+
+/* The bond file's first version had this many bytes to an entry. Entries of
+ * that size are read into the start of a btc_key, the rest zero. */
+#define BTC_KEY_V1_BYTES 348u
+#if UINTPTR_MAX > 0xffffffffu
+_Static_assert(offsetof(btc_key, gatt) + offsetof(btc_gatt_cache, extras) ==
+               BTC_KEY_V1_BYTES, "the bond file's first layout changed");
+#endif
+
+enum btc_prompt
+{
+    BTC_PROMPT_NONE, BTC_PROMPT_CONFIRM, BTC_PROMPT_ENTRY
+};
+
+/* A pairing question unanswered for this long is refused. */
+#define BTC_PROMPT_TIMEOUT_MS 30000u
+
+enum btc_link_state
+{
+    BTC_LINK_FREE, BTC_LINK_CONNECTING, BTC_LINK_OPEN, BTC_LINK_CLOSING
+};
+
+enum btc_security
+{
+    BTC_SEC_NONE, BTC_SEC_AUTHENTICATING, BTC_SEC_ENCRYPTING,
+    BTC_SEC_PAIRING_LE, BTC_SEC_ENCRYPTED, BTC_SEC_FAILED
+};
+
+typedef struct btc_link
+{
+    uint8_t state, le, outgoing, address_type;
+    uint8_t address[6];
+    uint16_t handle;
+    uint16_t flags;          /* BTC_DEV_* of the peer */
+    uint8_t security;        /* enum btc_security */
+    uint8_t role;            /* 0 master, 1 slave (from Role Change) */
+    uint8_t want_security;
+    uint8_t switch_sent;     /* asked to become the master */
+    uint8_t secure_wanted, secure_retries;   /* see btc_secure */
+    uint32_t secure_at;
+    uint8_t profile;         /* BTC_PROFILE_* requested for this link */
+    uint8_t next_ident;      /* L2CAP signalling identifier */
+    uint8_t disconnect_reason, closing_sent;
+    uint8_t user_retries;    /* page attempts repeated for a person's Connect */
+    uint8_t crossed;         /* we accepted the device's own call while paging it */
+    uint32_t started;
+    /* Transmit: a ring of [length16][L2CAP PDU] records, fragmented to
+     * controller packets as credits allow. */
+    uint8_t tx[BTC_TX_BYTES];
+    uint16_t tx_head, tx_used, tx_offset;
+    uint16_t outstanding;    /* packets handed to the controller */
+    /* Receive reassembly. */
+    uint8_t rx[BTC_RX_BYTES];
+    uint16_t rx_used, rx_expected;
+    uint32_t rx_dropped;
+} btc_link;
+
+enum btc_channel_state
+{
+    BTC_CH_FREE, BTC_CH_CONNECTING, BTC_CH_CONFIG, BTC_CH_OPEN,
+    BTC_CH_DISCONNECTING
+};
+
+/* Channel owners (profile users). */
+enum btc_owner
+{
+    BTC_OWN_NONE, BTC_OWN_SDP, BTC_OWN_AVDTP_SIGNAL, BTC_OWN_AVDTP_MEDIA,
+    BTC_OWN_HID_CONTROL, BTC_OWN_HID_INTERRUPT, BTC_OWN_AVRCP,
+    BTC_OWN_SDP_CLIENT      /* our own SDP query of a device (bt_hid.c) */
+};
+
+typedef struct btc_channel
+{
+    uint8_t state, link, owner, ident;
+    uint8_t conf_sent, conf_local_done, conf_remote_done, incoming;
+    uint16_t psm, local_cid, remote_cid, remote_mtu, local_mtu;
+    uint32_t started;
+} btc_channel;
+
+enum btc_profile
+{
+    BTC_PROFILE_NONE, BTC_PROFILE_A2DP, BTC_PROFILE_HID, BTC_PROFILE_LE_HID
+};
+
+typedef struct btc_command
+{
+    uint8_t packet[259];
+    uint16_t bytes;
+    uint8_t kind;            /* what to do with the reply */
+    uint8_t link;            /* link index the command concerns, or 0xff */
+} btc_command;
+
+/* Command reply kinds, handled in bt_core. */
+enum btc_reply
+{
+    BTC_R_IGNORE, BTC_R_CONFIG, BTC_R_LE_BUFFER, BTC_R_LINK_KEY_REPLY,
+    BTC_R_CONNECT, BTC_R_LE_CONNECT, BTC_R_AUTH, BTC_R_ENCRYPT,
+    BTC_R_NAME, BTC_R_LE_ENCRYPT, BTC_R_LE_RAND, BTC_R_INQUIRY,
+    BTC_R_BUFFER
+};
+
+struct btc_profiles;         /* bt_profiles */
+
+/* Six transfers in flight: the pump runs every 2 cs, so four would cap
+ * the link at 200 packets a second, and A2DP needs most of that. */
+#define BTC_ACL_OUT_SLOTS 6u
+
+/* Event IN transfers outstanding at once.  The controller reports a
+ * finished ACL packet with a Number Of Completed Packets event, and with
+ * one transfer in flight the core harvests at most one event per pump:
+ * on the module's 100 Hz ticker that alone caps A2DP at 100 packets a
+ * second, whatever the radio can do.  Keeping several queued lets one
+ * pump drain the whole backlog.  USB completes transfers on an endpoint
+ * in the order they were submitted, so a FIFO of tickets keeps the event
+ * stream in order. */
+#define BTC_EVENT_SLOTS 8u
+
+
+/* One remembered name: devices come and go from the scan list, a name is
+ * only worth asking for once. */
+typedef struct btc_name_entry
+{
+    uint8_t used, address[6], device_class[3];
+    uint16_t flags;
+    char name[BTC_NAME_BYTES];
+} btc_name_entry;
+
+/* What *BTInfo prints: counters of what the controller said, so that one
+ * look at them says which step of a scan, a pairing or a reconnection
+ * failed.  The "last" fields are HCI status codes (Core Vol 1 Part F). */
+typedef struct btc_stats
+{
+    uint32_t scans, inquiry_results, eir_names, name_requests, names_found,
+             name_failures, name_last_status, le_reports, le_names,
+             devices_evicted, devices_dropped, scan_failures, scan_last_status, le_scan_restarts,
+             command_resends;
+    uint32_t connects, connect_failures, connect_retries, connect_last_status;
+    uint32_t incoming, incoming_accepted, incoming_rejected, incoming_crossed;
+    uint32_t auth_failures, auth_last_status, enc_failures, enc_last_status;
+    uint32_t link_keys_stored, link_keys_replied, link_keys_refused;
+    uint32_t last_incoming_address_tail;
+    uint8_t last_incoming_address[6], last_incoming_reason;
+} btc_stats;
+
+typedef struct btc_core
+{
+    uint8_t state, config_step;
+    uint32_t error, now, state_since;
+    btv_hci_bootstrap boot;
+    btv_controller_info info;
+    /* Transport tickets. */
+    uint32_t command_ticket, acl_in_ticket;
+    uint32_t event_ticket[BTC_EVENT_SLOTS];
+    uint8_t event_head, event_count;
+    /* Several ACL OUT transfers ride at once: each carries exactly one HCI
+     * packet (merging them crashes the adapter), but waiting for each to
+     * finish caps the link at one packet per pump, which is too slow to
+     * carry A2DP audio and makes it stutter. */
+    uint32_t acl_out_ticket[BTC_ACL_OUT_SLOTS];
+    /* Why a transmit did not happen, for the audio diagnostic. */
+    uint32_t acl_sent, acl_no_slot, acl_no_credit, acl_busy;
+    /* Flow control: when a Number Of Completed Packets last came, when the
+     * credits ran out, when they were last made good, how many events. */
+    uint32_t last_nocp, credit_wait_since, last_resync, nocp_events,
+             nocp_packets, resyncs;
+    uint8_t last_role;
+    uint32_t acl_out_bytes;
+    btv_host_bridge_completion *completion;
+    btv_hci_stream acl_stream;
+    uint8_t acl_stream_storage[BTV_HOST_BRIDGE_IO_BYTES];
+    uint8_t acl_in[BTV_HOST_BRIDGE_IO_BYTES];
+    uint32_t acl_in_bytes, acl_in_offset;
+    uint8_t acl_out[BTV_HOST_BRIDGE_IO_BYTES];
+    uint8_t acl_out_link;
+    uint16_t acl_out_frags;
+    /* Commands: a FIFO; one outstanding at a time. */
+    btc_command commands[BTC_COMMANDS];
+    uint8_t command_head, command_count, command_waiting, credits;
+    uint16_t waiting_opcode;
+    uint8_t waiting_kind, waiting_link;
+    uint32_t waiting_since;
+    /* The command in flight, kept so a failed USB transfer can be resent
+     * (the CSR adapter behind the CM4's hub loses the odd control
+     * transfer to three transaction errors). */
+    btc_command in_flight;
+    uint8_t command_resends;
+    /* Controller buffers. */
+    uint16_t acl_mtu, acl_free, acl_max;
+    uint16_t le_mtu, le_free, le_max;
+    uint8_t le_shared, le_supported, ssp_supported;
+    /* Links, channels, scan results, keys. */
+    btc_link links[BTC_LINKS];
+    btc_channel channels[BTC_CHANNELS];
+    btc_device devices[BTC_DEVICES];
+    uint8_t device_count;
+    uint8_t inquiring, le_scanning, naming, name_link_pending;
+    /* A2DP is set up or streaming: LE scanning drops to a low duty cycle so
+     * the CSR radio keeps time for the audio (set by the LE pump). */
+    uint8_t audio_busy, le_scan_duty;
+    /* While A2DP plays, a scan's inquiry runs in 1.28 s bursts with gaps
+     * for the audio: the bursts still to run and when the next may. */
+    uint8_t inquiry_bursts;
+    uint32_t burst_at;
+    uint8_t scan_requested, le_scan_background;
+    uint8_t transport_wait;                   /* the transport is still starting */
+    /* Automatic reconnection of the bonded devices (bt_reconnect.c). */
+    uint8_t rc_active, rc_count, rc_slow;
+    uint8_t rc_current[2];                    /* the Low Energy and the classic attempt */
+    uint32_t rc_began, rc_attempt_at[2];
+    btc_rc_entry rc[BTC_KEYS];
+    uint8_t deferred, deferred_profile;       /* a BR/EDR connect waiting for LE */
+    uint8_t deferred_address[6];
+    uint32_t scan_until, name_started;
+    btc_key keys[BTC_KEYS];
+    uint32_t keys_generation, links_generation, devices_generation;
+    /* Last user-visible problem, for the app. */
+    uint32_t last_problem;
+    uint8_t problem_address[6];
+    /* A pairing question for the user: Secure Simple Pairing's numeric
+     * comparison (Core 5.x, Vol 3 Part H 2.3.5.1) or a passkey to type
+     * (2.3.5.3).  prompt_value is the six digits to compare, for a
+     * confirmation.  The generation changes whenever the question
+     * appears, is answered or is withdrawn. */
+    uint8_t prompt_kind, prompt_address[6], remote_io, remote_io_address[6];
+    uint32_t prompt_value, prompt_generation, prompt_since;
+    uint8_t boot_rebase;     /* the bring-up's clocks start at the first pump */
+    uint8_t discoverable;    /* Inquiry Scan on: other devices can find us */
+    /* Names remembered across scans, and what the controller has said. */
+    btc_name_entry names[BTC_NAME_CACHE];
+    uint8_t name_next;
+    btc_stats stats;
+    /* A person's Connect that found nobody to page: repeated, a little later. */
+    uint8_t retry_pending, retry_profile, retry_address[6], retry_count;
+    uint32_t retry_at;
+    uint32_t naming_until;   /* the scan stops asking for names at this time */
+    uint8_t engine_call;     /* btc_connect is being called by the reconnection engine */
+    uint32_t le_background_since;
+    uint8_t scan_seconds, scan_retries, scan_retry_pending;
+    uint32_t scan_retry_at;
+    uint8_t name_refreshes;  /* remembered names asked for again in this scan */
+    struct btc_profiles *profiles;
+} btc_core;
+
+/* A line on the HAL debug channel: "[bt] core: <what> <value in hex>". */
+void btc_note(const char *what, uint32_t value);
+extern uint32_t btc_origin_ms;
+
+/* Lifecycle.  start opens the already inspected transport. */
+int btc_start(btc_core *core, struct btc_profiles *profiles,
+              btv_host_bridge_completion *completion, uint32_t now);
+void btc_pump(btc_core *core, uint32_t now);
+/* Asks for an orderly stop: links are disconnected first. */
+void btc_stop(btc_core *core);
+int btc_stopped(const btc_core *core);
+
+/* Discovery: classic inquiry and LE scanning for `seconds`, then names. */
+int btc_scan(btc_core *core, unsigned int seconds);
+void btc_scan_stop(btc_core *core);
+int btc_scanning(const btc_core *core);
+/* Passive-style LE scanning for bonded input devices that are away. */
+void btc_le_background(btc_core *core, int on);
+
+/* Discoverable (Write Scan Enable: page scan, plus inquiry scan). */
+void btc_discoverable(btc_core *core, int on);
+
+/* Connections.  profile chooses what the link is for. */
+int btc_connect(btc_core *core, const uint8_t address[6], int le,
+                uint8_t address_type, uint8_t profile);
+int btc_disconnect(btc_core *core, const uint8_t address[6]);
+btc_link *btc_link_by_handle(btc_core *core, uint16_t handle);
+btc_link *btc_link_by_address(btc_core *core, const uint8_t address[6]);
+int btc_link_index(const btc_core *core, const btc_link *link);
+
+/* The user's answer to the pending pairing question: accept (the six
+ * digits match, or the passkey typed) or refuse.  Returns 0 when none
+ * waits or the command could not be queued. */
+int btc_prompt_answer(btc_core *core, int accept, uint32_t passkey);
+
+/* Keys (the app persists them). */
+btc_key *btc_key_find(btc_core *core, const uint8_t address[6]);
+btc_key *btc_key_store(btc_core *core, const uint8_t address[6], int le);
+/* One entry of the bond file (Choices:Bluetooth.Keys) into a btc_key: an
+ * entry of this module's size, or of the first version's (BTC_KEY_V1_BYTES:
+ * the same, less what was added at the end; its kept GATT handles are
+ * marked not valid, so that the device is discovered once more and its
+ * consumer keys and controller layout are found).  Returns 0 for any other
+ * size. */
+int btc_key_unpack(btc_key *out, const uint8_t *entry, unsigned int bytes);
+int btc_key_forget(btc_core *core, const uint8_t address[6]);
+
+/* HCI commands. */
+int btc_command_queue(btc_core *core, uint16_t opcode,
+                      const uint8_t *parameters, uint8_t bytes,
+                      uint8_t kind, uint8_t link);
+
+/* Data: queue one complete L2CAP PDU (header included) on a link.
+ * Returns 1 queued, 0 no room (try later), -1 bad link. */
+int btc_send_pdu(btc_core *core, uint8_t link, const uint8_t *pdu,
+                 size_t bytes);
+/* Queue one L2CAP PDU built from a channel id and payload, without an
+ * intermediate copy.  Same results as btc_send_pdu. */
+int btc_send_l2cap(btc_core *core, uint8_t link, uint16_t cid,
+                   const uint8_t *data, size_t bytes);
+/* Ask to be the master of a classic link, once. */
+void btc_become_master(btc_core *core, uint8_t link);
+/* Authenticate and encrypt a classic link; btp_link_secured follows. */
+int btc_secure(btc_core *core, uint8_t link);
+/* Free space for a PDU of this size right now. */
+int btc_can_send(const btc_core *core, uint8_t link, size_t bytes);
+size_t btc_link_backlog(const btc_core *core, uint8_t link);
+
+btc_device *btc_device_find(btc_core *core, const uint8_t address[6]);
+btc_device *btc_device_add(btc_core *core, const uint8_t address[6]);
+/* How much a scan result is worth to a person (higher is more): what is
+ * connected or paired, then classic, input and audio devices, named ones and
+ * the nearer ones. */
+int btc_device_value(btc_core *core, const btc_device *d);
+/* A scan result (the table may be full of better: then 0). */
+btc_device *btc_device_add_scan(btc_core *core, const uint8_t address[6],
+                                int le, int8_t rssi);
+
+/* L2CAP (bt_l2cap). */
+int btc_l2cap_connect(btc_core *core, uint8_t link, uint16_t psm,
+                      uint8_t owner, uint16_t mtu);
+int btc_l2cap_disconnect(btc_core *core, int channel);
+int btc_l2cap_send(btc_core *core, int channel, const uint8_t *data,
+                   size_t bytes);
+int btc_l2cap_can_send(const btc_core *core, int channel, size_t bytes);
+int btc_l2cap_find(const btc_core *core, uint8_t link, uint8_t owner);
+void btc_l2cap_receive(btc_core *core, uint8_t link, const uint8_t *pdu,
+                       size_t bytes);
+void btc_l2cap_link_closed(btc_core *core, uint8_t link);
+void btc_l2cap_tick(btc_core *core);
+/* SDP server (bt_sdp_server): one request PDU on an SDP channel. */
+void btc_sdp_server_request(btc_core *core, int channel,
+                            const uint8_t *request, size_t bytes);
+/* LE fixed channels. */
+int btc_le_send(btc_core *core, uint8_t link, uint16_t cid,
+                const uint8_t *data, size_t bytes);
+
+extern uint32_t btc_profile_generation;
+
+#endif

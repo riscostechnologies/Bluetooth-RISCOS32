@@ -1,0 +1,111 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        hid_report
+ * Purpose:     HID report-mode input: parses a HID report descriptor (the
+ *              GATT Report Map, or an SDP HIDDescriptorList entry) and
+ *              decodes input reports with it, so a mouse or keyboard that
+ *              does not use the boot formats (report IDs, 16-bit X/Y,
+ *              wheel and pan, more than eight buttons) can drive the same
+ *              pointer and key paths as boot-protocol devices.
+ *              Pure: no SWIs, no statics, no allocation.
+ * Reference:   USB HID Device Class Definition 1.11, section 6.2.2
+ *              (report descriptor items); HID Usage Tables 1.3 (Generic
+ *              Desktop 0x01, Keyboard 0x07, LEDs 0x08, Button 0x09,
+ *              Consumer 0x0C: AC Pan 0x238); HID over GATT Profile 1.0
+ *              (a Report characteristic value does not carry the report
+ *              ID: it is in the Report Reference descriptor).
+ * Licence:     BSD-2-Clause (see LICENSE).
+ ******************************************************************/
+#ifndef BTV_HID_REPORT_H
+#define BTV_HID_REPORT_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#define BTV_HIDMAP_FIELDS 12     /* input fields kept (others are skipped) */
+#define BTV_HIDMAP_IDS 8         /* report IDs whose layout is tracked */
+#define BTV_HIDMAP_USAGES 8      /* usages remembered for one main item */
+
+enum btv_hid_field_kind
+{
+    BTV_HIDF_NONE,
+    BTV_HIDF_BUTTONS,   /* page 9: bit n is button aux+n, 1 bit each */
+    BTV_HIDF_X,         /* generic desktop X, relative or absolute */
+    BTV_HIDF_Y,
+    BTV_HIDF_WHEEL,
+    BTV_HIDF_PAN,       /* consumer AC Pan */
+    BTV_HIDF_MODIFIERS, /* keyboard page 0xE0-0xE7, bit n is modifier n */
+    BTV_HIDF_KEYS       /* keyboard page array, `count` codes of `size` bits */
+};
+
+typedef struct btv_hid_field
+{
+    uint8_t report_id;  /* 0: the device uses no report IDs */
+    uint8_t kind;
+    uint8_t size;       /* bits per element */
+    uint8_t count;      /* elements */
+    uint8_t is_signed;
+    uint8_t relative;
+    uint8_t aux;        /* first button number / first modifier bit */
+    uint8_t pad;
+    uint16_t offset;    /* first bit, after the report ID */
+} btv_hid_field;
+
+typedef struct btv_hid_globals
+{
+    uint16_t page;
+    int32_t minimum, maximum;
+    uint16_t size, count;
+    uint8_t report_id;
+    /* The top-level collection's usage on the Generic Desktop page (2 mouse,
+     * 6 keyboard, 4 joystick, 5 game pad), 0xff for another page, 0 before
+     * there is one.  Kept in the padding after report_id so that the map
+     * does not change size: it is stored with each bonded Low Energy
+     * device (c/bt_core.h, btc_gatt_cache). */
+    uint8_t application;
+} btv_hid_globals;
+
+typedef struct btv_hid_map
+{
+    uint8_t fields_used, overflow, error;
+    uint8_t has_pointer, has_keyboard;
+    uint8_t led_id, has_leds;          /* output report with page 8 LEDs */
+    uint8_t item_have, item_need, skip;
+    uint8_t item[5];
+    uint8_t id_count, depth;
+    uint8_t usage_count, have_range, collection_depth;
+    uint8_t ids[BTV_HIDMAP_IDS];
+    uint16_t bits[BTV_HIDMAP_IDS];     /* next free bit in each input report */
+    uint32_t usages[BTV_HIDMAP_USAGES];
+    uint32_t range_min, range_max;
+    btv_hid_globals g, stack[2];
+    btv_hid_field fields[BTV_HIDMAP_FIELDS];
+} btv_hid_map;
+
+/* One decoded input report. Values are in HID's sense: y grows downwards,
+ * a positive wheel is away from the user. */
+typedef struct btv_hid_event
+{
+    uint8_t pointer, keyboard;   /* which of the two this report carried */
+    uint8_t modifiers;           /* boot keyboard layout */
+    uint8_t keys[6];             /* first six non-zero key codes */
+    uint32_t buttons;            /* bit n: button n+1 down */
+    int32_t dx, dy, wheel, pan;
+} btv_hid_event;
+
+void btv_hid_map_init(btv_hid_map *m);
+/* Feed descriptor octets in order, in any piece sizes (a Report Map is
+ * read 22 octets at a time). */
+void btv_hid_map_feed(btv_hid_map *m, const uint8_t *data, size_t bytes);
+/* The map is complete: 1 if it holds a pointer or a keyboard we can use. */
+int btv_hid_map_finish(btv_hid_map *m);
+/* 1 when input report `id` (0 for none) carries pointer or keyboard fields. */
+int btv_hid_map_wants(const btv_hid_map *m, uint8_t id);
+/* Decode `bytes` octets of input report `id` (payload without the ID).
+ * Returns 1 when something was decoded. The event is fully written. */
+int btv_hid_map_decode(const btv_hid_map *m, uint8_t id,
+                       const uint8_t *report, size_t bytes,
+                       btv_hid_event *event);
+
+#endif

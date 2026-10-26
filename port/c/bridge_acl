@@ -1,0 +1,267 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/* Ticketed bridge binding for the NetBSD-derived classic ACL data path. */
+#include "bridge_acl.h"
+#include "hci_frame.h"
+#include <string.h>
+
+static uint16_t read16(const uint8_t *p)
+{
+    return (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
+}
+
+static int fail(btv_bridge_acl *acl, unsigned int error)
+{
+    acl->state = BTV_BA_FAILED;
+    acl->error = error;
+    return -1;
+}
+
+int btv_bridge_acl_start(btv_bridge_acl *acl,
+                         const btv_controller_info *controller,
+                         const btv_acl_link *link)
+{
+    uint16_t handle;
+    if (acl == 0 || controller == 0 || link == 0 ||
+        !btv_acl_link_handle(link, &handle) || controller->acl_bytes < 4 ||
+        controller->acl_packets == 0)
+        return 0;
+    memset(acl, 0, sizeof(*acl));
+    if (!btv_hci_stream_init(&acl->stream, BTV_HCI_ACL,
+                             acl->stream_storage,
+                             sizeof(acl->stream_storage)) ||
+        !btv_acl_receive_init(&acl->receive, handle, acl->receive_storage,
+                              sizeof(acl->receive_storage)) ||
+        !btv_acl_transmit_init(&acl->transmit, controller->acl_bytes,
+                               controller->acl_packets,
+                               BTV_HOST_BRIDGE_IO_BYTES) ||
+        btv_acl_transmit_bind(&acl->transmit, handle,
+                              acl->transmit_storage,
+                              sizeof(acl->transmit_storage)) != BTV_TX_OK)
+        return 0;
+    acl->handle = handle;
+    acl->state = BTV_BA_RUNNING;
+    return 1;
+}
+
+static int process_input(btv_bridge_acl *acl)
+{
+    const uint8_t *packet;
+    size_t consumed, packet_bytes;
+    int result, work;
+    work = 0;
+    while (acl->input_offset < acl->input_completion.bytes)
+    {
+        consumed = 0;
+        result = btv_hci_stream_feed(&acl->stream,
+                    acl->input_completion.data + acl->input_offset,
+                    acl->input_completion.bytes - acl->input_offset,
+                    &consumed);
+        acl->input_offset += consumed;
+        if (result == BTV_HCI_INVALID)
+            return fail(acl, BTV_TX_USB_ERROR);
+        work = 1;
+        if (result != BTV_HCI_COMPLETE)
+            break;
+        packet = btv_hci_stream_packet(&acl->stream, &packet_bytes);
+        result = btv_acl_receive_feed(&acl->receive, packet, packet_bytes);
+        if (result == BTV_ACL_BUSY)
+            break;
+        if (result == BTV_ACL_INVALID)
+            return fail(acl, BTV_TX_USB_ERROR);
+        if (!btv_hci_stream_take(&acl->stream))
+            return fail(acl, BTV_TX_USB_ERROR);
+        if (result == BTV_ACL_COMPLETE)
+            break;
+    }
+    if (acl->input_offset == acl->input_completion.bytes)
+    {
+        acl->input_offset = 0;
+        acl->input_completion.bytes = 0;
+    }
+    return work;
+}
+
+static int poll_input(btv_bridge_acl *acl)
+{
+    int result;
+    if (acl->input_ticket == 0) return 0;
+    result = btv_host_bridge_poll(acl->input_ticket,
+                                  &acl->input_completion);
+    if (result == BTV_HOST_BRIDGE_PENDING) return 0;
+    acl->input_ticket = 0;
+    if (result != BTV_HOST_BRIDGE_OK ||
+        acl->input_completion.kind != BTV_HOST_BRIDGE_ACL_IN ||
+        acl->input_completion.error != 0 ||
+        acl->input_completion.bytes == 0)
+        return fail(acl, BTV_TX_USB_ERROR);
+    acl->input_offset = 0;
+    return 1;
+}
+
+static int poll_output(btv_bridge_acl *acl)
+{
+    int result;
+    if (acl->output_ticket == 0) return 0;
+    result = btv_host_bridge_poll(acl->output_ticket,
+                                  &acl->output_completion);
+    if (result == BTV_HOST_BRIDGE_PENDING) return 0;
+    acl->output_ticket = 0;
+    if (result != BTV_HOST_BRIDGE_OK ||
+        acl->output_completion.kind != BTV_HOST_BRIDGE_ACL_OUT ||
+        acl->output_completion.error != 0 ||
+        acl->output_completion.bytes != acl->output_bytes ||
+        btv_acl_transmit_usb_done(&acl->transmit, acl->transmit_ticket, 1) !=
+            BTV_TX_OK)
+        return fail(acl, BTV_TX_USB_ERROR);
+    acl->output_bytes = 0;
+    return 1;
+}
+
+int btv_bridge_acl_pump(btv_bridge_acl *acl)
+{
+    uint32_t ticket;
+    size_t bytes;
+    int result, work;
+    if (acl == 0 || acl->state != BTV_BA_RUNNING) return 0;
+    work = 0;
+    result = poll_output(acl); if (result < 0) return -1; work |= result;
+    if (acl->input_completion.bytes != 0)
+    {
+        result = process_input(acl); if (result < 0) return -1; work |= result;
+    }
+    if (acl->input_completion.bytes == 0)
+    {
+        result = poll_input(acl); if (result < 0) return -1; work |= result;
+        if (acl->input_completion.bytes != 0)
+        {
+            result = process_input(acl); if (result < 0) return -1; work |= result;
+        }
+    }
+    if (acl->input_ticket == 0 && acl->input_completion.bytes == 0)
+    {
+        result = btv_host_bridge_submit(BTV_HOST_BRIDGE_ACL_IN, 0,
+                    BTV_HOST_BRIDGE_IO_BYTES, 0, &acl->input_ticket,
+                    &acl->windows_error);
+        if (result != BTV_HOST_BRIDGE_OK) return fail(acl, BTV_TX_USB_ERROR);
+        work = 1;
+    }
+    if (acl->output_ticket == 0)
+    {
+        bytes = btv_acl_transmit_peek(&acl->transmit, acl->output_packet,
+                                      sizeof(acl->output_packet), &ticket);
+        if (bytes != 0)
+        {
+            result = btv_host_bridge_submit(BTV_HOST_BRIDGE_ACL_OUT,
+                        acl->output_packet, (uint32_t)bytes, 0,
+                        &acl->output_ticket, &acl->windows_error);
+            if (result != BTV_HOST_BRIDGE_OK ||
+                btv_acl_transmit_sent(&acl->transmit, ticket) != BTV_TX_OK)
+                return fail(acl, BTV_TX_USB_ERROR);
+            acl->transmit_ticket = ticket;
+            acl->output_bytes = (uint32_t)bytes;
+            work = 1;
+        }
+    }
+    return work;
+}
+
+int btv_bridge_acl_event(btv_bridge_acl *acl, const uint8_t *event,
+                         size_t bytes)
+{
+    btv_acl_completed entries[63];
+    size_t expected;
+    unsigned int index, count;
+    if (acl == 0 || acl->state != BTV_BA_RUNNING ||
+        btv_hci_frame_size(BTV_HCI_EVENT, event, bytes, 255, &expected) !=
+            BTV_HCI_COMPLETE || expected != bytes)
+        return fail(acl, BTV_TX_CREDIT_ERROR);
+    if (event[0] != 0x13) return 0;
+    if (bytes < 3) return fail(acl, BTV_TX_CREDIT_ERROR);
+    count = event[2];
+    if (count == 0 || bytes != 3u + (size_t)count * 4u)
+        return fail(acl, BTV_TX_CREDIT_ERROR);
+    for (index = 0; index < count; ++index)
+    {
+        uint16_t raw_handle = read16(event + 3 + index * 4);
+        if ((raw_handle & 0xf000) != 0)
+            return fail(acl, BTV_TX_CREDIT_ERROR);
+        entries[index].handle = raw_handle;
+        entries[index].packets = read16(event + 5 + index * 4);
+    }
+    return btv_acl_transmit_completed(&acl->transmit, entries, count) ==
+           BTV_TX_OK ? 1 : fail(acl, BTV_TX_CREDIT_ERROR);
+}
+
+int btv_bridge_acl_queue(btv_bridge_acl *acl, const uint8_t *pdu,
+                         size_t bytes)
+{
+    return acl != 0 && acl->state == BTV_BA_RUNNING ?
+           btv_acl_transmit_queue(&acl->transmit, acl->handle, pdu, bytes) :
+           BTV_TX_INVALID;
+}
+
+const uint8_t *btv_bridge_acl_packet(const btv_bridge_acl *acl,
+                                     size_t *bytes)
+{
+    return acl != 0 && acl->state == BTV_BA_RUNNING ?
+           btv_acl_receive_packet(&acl->receive, bytes) : 0;
+}
+
+int btv_bridge_acl_take_packet(btv_bridge_acl *acl)
+{
+    return acl != 0 && acl->state == BTV_BA_RUNNING ?
+           btv_acl_receive_take(&acl->receive) : 0;
+}
+
+int btv_bridge_acl_take_transmit(btv_bridge_acl *acl)
+{
+    return acl != 0 && acl->state == BTV_BA_RUNNING ?
+           btv_acl_transmit_take(&acl->transmit, acl->handle) : BTV_TX_INVALID;
+}
+
+static int cancel_ticket(btv_bridge_acl *acl, uint32_t ticket,
+                         uint8_t *cancelled)
+{
+    int result;
+    if (ticket == 0 || *cancelled) return 1;
+    result = btv_host_bridge_cancel(ticket, &acl->windows_error);
+    if (result != BTV_HOST_BRIDGE_OK) return 0;
+    *cancelled = 1;
+    return 1;
+}
+
+static int drain_ticket(uint32_t *ticket,
+                        btv_host_bridge_completion *completion)
+{
+    int result;
+    if (*ticket == 0) return 1;
+    result = btv_host_bridge_poll(*ticket, completion);
+    if (result == BTV_HOST_BRIDGE_PENDING) return 0;
+    if (result != BTV_HOST_BRIDGE_OK) return -1;
+    *ticket = 0;
+    return 1;
+}
+
+int btv_bridge_acl_stop(btv_bridge_acl *acl)
+{
+    int input, output;
+    if (acl == 0) return -1;
+    if (acl->state == BTV_BA_CLOSED || acl->state == BTV_BA_IDLE) return 1;
+    if (acl->state == BTV_BA_FAILED) return -1;
+    if (acl->state == BTV_BA_RUNNING)
+    {
+        acl->state = BTV_BA_STOPPING;
+        acl->input_completion.bytes = 0;
+        acl->input_offset = 0;
+    }
+    if (!cancel_ticket(acl, acl->input_ticket, &acl->input_cancelled) ||
+        !cancel_ticket(acl, acl->output_ticket, &acl->output_cancelled))
+        return fail(acl, BTV_TX_USB_ERROR);
+    input = drain_ticket(&acl->input_ticket, &acl->input_completion);
+    output = drain_ticket(&acl->output_ticket, &acl->output_completion);
+    if (input < 0 || output < 0) return fail(acl, BTV_TX_USB_ERROR);
+    if (!input || !output) return 0;
+    acl->state = BTV_BA_CLOSED;
+    return 1;
+}

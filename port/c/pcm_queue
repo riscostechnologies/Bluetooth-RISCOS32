@@ -1,0 +1,77 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        pcm_queue
+ * Purpose:     Copied PCM buffering without allocation or blocking.
+ ******************************************************************/
+#include "pcm_queue.h"
+#include <string.h>
+
+/* Initialise only on valid, whole-frame storage. Failure leaves queue intact. */
+int btv_pcm_init(btv_pcm_queue *queue, void *storage, size_t capacity,
+                 size_t frame_bytes)
+{
+    if (queue == NULL || storage == NULL || frame_bytes == 0 ||
+        capacity == 0 || capacity % frame_bytes != 0)
+        return 0;
+    queue->storage = storage;
+    queue->capacity = capacity;
+    queue->frame_bytes = frame_bytes;
+    queue->head = 0;
+    queue->used = 0;
+    return 1;
+}
+
+/* Discard queued data only after the owner has synchronised its backend. */
+void btv_pcm_clear(btv_pcm_queue *queue)
+{
+    queue->head = 0;
+    queue->used = 0;
+}
+
+/* Copy whole frames into available space. Invalid lengths transfer nothing. */
+size_t btv_pcm_write(btv_pcm_queue *queue, const void *source, size_t bytes)
+{
+    size_t tail, first, space;
+    if (bytes == 0 || source == NULL || bytes % queue->frame_bytes != 0)
+        return 0;
+    space = queue->capacity - queue->used;
+    if (bytes > space)
+        bytes = space;
+    /* Subtraction avoids overflowing head + used for large caller storage. */
+    tail = queue->used >= queue->capacity - queue->head ?
+        queue->used - (queue->capacity - queue->head) :
+        queue->head + queue->used;
+    first = queue->capacity - tail;
+    if (first > bytes)
+        first = bytes;
+    memcpy(queue->storage + tail, source, first);
+    memcpy(queue->storage, (const uint8_t *)source + first, bytes - first);
+    queue->used += bytes;
+    return bytes;
+}
+
+/* Copy and consume whole frames without waiting for capture completion. */
+size_t btv_pcm_read(btv_pcm_queue *queue, void *destination, size_t bytes)
+{
+    size_t first;
+    if (bytes == 0 || destination == NULL || bytes % queue->frame_bytes != 0)
+        return 0;
+    if (bytes > queue->used)
+        bytes = queue->used;
+    first = queue->capacity - queue->head;
+    if (first > bytes)
+        first = bytes;
+    memcpy(destination, queue->storage + queue->head, first);
+    memcpy((uint8_t *)destination + first, queue->storage, bytes - first);
+    queue->head = bytes >= queue->capacity - queue->head ?
+        bytes - (queue->capacity - queue->head) : queue->head + bytes;
+    queue->used -= bytes;
+    return bytes;
+}
+
+/* Return the number of complete PCM frames currently queued. */
+size_t btv_pcm_frames(const btv_pcm_queue *queue)
+{
+    return queue->used / queue->frame_bytes;
+}

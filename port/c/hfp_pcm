@@ -1,0 +1,133 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        hfp_pcm
+ * Purpose:     Copied CVSD host-PCM buffering and loss substitution.
+ ******************************************************************/
+#include "hfp_pcm.h"
+#include <string.h>
+
+static int active(btv_hfp_pcm *pcm)
+{
+    if (pcm == NULL || pcm->failed || pcm->audio == NULL ||
+        pcm->audio->state != BTV_HA_RUNNING)
+    {
+        if (pcm != NULL) pcm->failed = 1;
+        return 0;
+    }
+    return 1;
+}
+
+int btv_hfp_pcm_init(btv_hfp_pcm *pcm, btv_hfp_audio *audio,
+                     uint16_t packet_bytes)
+{
+    if (pcm == NULL || audio == NULL || audio->state != BTV_HA_RUNNING ||
+        packet_bytes == 0 || packet_bytes > sizeof(pcm->playback_packet) ||
+        packet_bytes % BTV_HFP_PCM_FRAME_BYTES != 0 ||
+        packet_bytes > audio->transmit_mtu)
+        return 0;
+    memset(pcm, 0, sizeof(*pcm));
+    pcm->audio = audio;
+    pcm->packet_bytes = packet_bytes;
+    pcm->next_sequence = 1;
+    if (!btv_pcm_init(&pcm->playback, pcm->playback_storage,
+                      sizeof(pcm->playback_storage), BTV_HFP_PCM_FRAME_BYTES) ||
+        !btv_pcm_init(&pcm->capture, pcm->capture_storage,
+                      sizeof(pcm->capture_storage), BTV_HFP_PCM_FRAME_BYTES))
+        return 0;
+    return 1;
+}
+
+static int capture_step(btv_hfp_pcm *pcm)
+{
+    size_t bytes, space;
+    int result;
+    if (!pcm->capture_pending)
+    {
+        result = btv_hfp_audio_read(pcm->audio, pcm->capture_packet,
+                                    sizeof(pcm->capture_packet),
+                                    &pcm->capture_info);
+        if (result < 0) return -1;
+        if (result == 0) return 0;
+        if (pcm->capture_info.bytes % BTV_HFP_PCM_FRAME_BYTES != 0 ||
+            pcm->capture_info.sequence < pcm->next_sequence)
+            return -1;
+        pcm->capture_pending = 1;
+    }
+    if (pcm->capture_info.sequence > pcm->next_sequence)
+    {
+        bytes = pcm->packet_bytes;
+        space = pcm->capture.capacity - pcm->capture.used;
+        if (space < bytes) return 0;
+        if (btv_pcm_write(&pcm->capture, pcm->silence, bytes) != bytes)
+            return -1;
+        ++pcm->next_sequence;
+        if (pcm->concealed != 0xffffffffUL) ++pcm->concealed;
+        return 1;
+    }
+    bytes = pcm->capture_info.bytes;
+    if (pcm->capture_info.status != BTV_SCO_GOOD && bytes == 0)
+        bytes = pcm->packet_bytes;
+    space = pcm->capture.capacity - pcm->capture.used;
+    if (space < bytes) return 0;
+    if (pcm->capture_info.status != BTV_SCO_GOOD)
+    {
+        if (pcm->concealed != 0xffffffffUL) ++pcm->concealed;
+    }
+    if (bytes != 0 && btv_pcm_write(&pcm->capture,
+                                    pcm->capture_info.status == BTV_SCO_GOOD ?
+                                        pcm->capture_packet : pcm->silence,
+                                    bytes) != bytes)
+        return -1;
+    pcm->next_sequence = pcm->capture_info.sequence + 1;
+    pcm->capture_pending = 0;
+    return 1;
+}
+
+static int playback_step(btv_hfp_pcm *pcm)
+{
+    int result;
+    if (!pcm->playback_pending)
+    {
+        if (pcm->playback.used < pcm->packet_bytes) return 0;
+        if (btv_pcm_read(&pcm->playback, pcm->playback_packet,
+                         pcm->packet_bytes) != pcm->packet_bytes)
+            return -1;
+        pcm->playback_pending = 1;
+    }
+    result = btv_hfp_audio_write(pcm->audio, pcm->playback_packet,
+                                 pcm->packet_bytes);
+    if (result < 0) return -1;
+    if (result == 0) return 0;
+    pcm->playback_pending = 0;
+    return 1;
+}
+
+int btv_hfp_pcm_pump(btv_hfp_pcm *pcm)
+{
+    int captured, played;
+    if (!active(pcm)) return -1;
+    captured = capture_step(pcm);
+    if (captured < 0) goto failed;
+    played = playback_step(pcm);
+    if (played < 0) goto failed;
+    return captured || played ? 1 : 0;
+failed:
+    pcm->failed = 1;
+    btv_hfp_audio_stop(pcm->audio);
+    return -1;
+}
+
+size_t btv_hfp_pcm_playback_write(btv_hfp_pcm *pcm,
+                                  const void *data, size_t bytes)
+{
+    if (!active(pcm)) return 0;
+    return btv_pcm_write(&pcm->playback, data, bytes);
+}
+
+size_t btv_hfp_pcm_capture_read(btv_hfp_pcm *pcm,
+                                void *data, size_t bytes)
+{
+    if (!active(pcm)) return 0;
+    return btv_pcm_read(&pcm->capture, data, bytes);
+}

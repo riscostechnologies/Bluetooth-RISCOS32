@@ -1,0 +1,744 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        bridge_controller
+ * Purpose:     Own one raw host bridge controller during HCI bootstrap.
+ ******************************************************************/
+#include "bridge_controller.h"
+#include <string.h>
+
+#define EVENT_CAPACITY 260u
+#define CONFIG_TIMEOUT_MS 2000u
+#define CONFIG_STEPS 2u
+/* The controller's own page timeout (5.12 s by default) ends a name
+ * request; this only guards against a completion that never comes. */
+#define NAME_TIMEOUT_MS 8000u
+#define REMOTE_NAME_OPCODE 0x0419u
+/* LMP features page 0, byte 6 bit 3: Secure Simple Pairing (controller). */
+#define FEATURE_SSP_BYTE 6u
+#define FEATURE_SSP_BIT 0x08u
+
+static uint16_t read16(const uint8_t *p)
+{
+    return (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
+}
+
+static int fail(btv_bridge_controller *controller, unsigned int error)
+{
+    controller->error = error;
+    controller->state = BTV_BC_FAILED;
+    btv_hci_bootstrap_abort(&controller->bootstrap);
+    if (controller->commands_initialized)
+        btv_hci_commands_abort(&controller->commands);
+    return -1;
+}
+
+int btv_bridge_controller_start(btv_bridge_controller *controller,
+                                uint32_t now)
+{
+    int result;
+    if (controller == 0)
+        return 0;
+    memset(controller, 0, sizeof(*controller));
+    result = btv_host_bridge_open(&controller->windows_error);
+    if (result != BTV_HOST_BRIDGE_OK)
+    {
+        controller->error = (unsigned int)result;
+        controller->state = BTV_BC_FAILED;
+        return 0;
+    }
+    /* This older bridge has no ticker of its own to wait on. */
+    while ((result = btv_host_bridge_boot()) == 0) {}
+    if (result < 0)
+    {
+        controller->error = (unsigned int)BTV_HOST_BRIDGE_IO_ERROR;
+        controller->state = BTV_BC_FAILED;
+        return 0;
+    }
+    btv_hci_bootstrap_start(&controller->bootstrap, now, 0);
+    /* Keep the RISC OS bridge usable with the target CSR-compatible dongle,
+     * which does not complete the optional extended-features command. */
+    btv_hci_bootstrap_skip_extended(&controller->bootstrap);
+    controller->state = BTV_BC_BOOTING;
+    return 1;
+}
+
+static int poll_command(btv_bridge_controller *controller)
+{
+    int result;
+    if (controller->command_ticket == 0)
+        return 0;
+    result = btv_host_bridge_poll(controller->command_ticket,
+                                  &controller->command_completion);
+    if (result == BTV_HOST_BRIDGE_PENDING)
+        return 0;
+    controller->command_ticket = 0;
+    if (result != BTV_HOST_BRIDGE_OK ||
+        controller->command_completion.kind != BTV_HOST_BRIDGE_COMMAND ||
+        controller->command_completion.error != 0)
+        return fail(controller, BTV_BOOT_TRANSPORT_ERROR);
+    if (controller->state == BTV_BC_INQUIRING &&
+        !btv_hci_inquiry_usb_done(&controller->inquiry, 1))
+        return fail(controller, BTV_BOOT_TRANSPORT_ERROR);
+    if ((controller->state == BTV_BC_CONNECTING ||
+         controller->state == BTV_BC_DISCONNECTING) &&
+        !btv_acl_link_usb_done(&controller->link, 1))
+        return fail(controller, BTV_BOOT_TRANSPORT_ERROR);
+    if (controller->state == BTV_BC_SECURING &&
+        controller->pairing_usb_inflight)
+        controller->pairing_usb_inflight = 0;
+    else if (controller->state == BTV_BC_SECURING &&
+             !btv_hci_security_usb_done(&controller->security, 1))
+        return fail(controller, BTV_BOOT_TRANSPORT_ERROR);
+    return 1;
+}
+
+static int poll_event(btv_bridge_controller *controller, uint32_t now)
+{
+    int result;
+    if (controller->event_ticket == 0)
+        return 0;
+    result = btv_host_bridge_poll(controller->event_ticket,
+                                  &controller->event_completion);
+    if (result == BTV_HOST_BRIDGE_PENDING)
+        return 0;
+    controller->event_ticket = 0;
+    if (result != BTV_HOST_BRIDGE_OK ||
+        controller->event_completion.kind != BTV_HOST_BRIDGE_EVENT_IN ||
+        controller->event_completion.error != 0 ||
+        controller->event_completion.bytes > EVENT_CAPACITY)
+        return fail(controller, BTV_BOOT_TRANSPORT_ERROR);
+    if (controller->event_completion.data[0] == 0x0e &&
+        controller->event_completion.bytes >= 3)
+        controller->command_credits = controller->event_completion.data[2];
+    else if (controller->event_completion.data[0] == 0x0f &&
+             controller->event_completion.bytes == 6)
+        controller->command_credits = controller->event_completion.data[3];
+    if (controller->state == BTV_BC_BOOTING)
+    {
+        result = btv_hci_bootstrap_event(&controller->bootstrap,
+                        controller->event_completion.data,
+                        controller->event_completion.bytes, now);
+        return result < 0 ? fail(controller, controller->bootstrap.error) : 1;
+    }
+    if (controller->state == BTV_BC_CONFIGURING)
+    {
+        const uint8_t *event = controller->event_completion.data;
+        uint32_t bytes = controller->event_completion.bytes;
+        if (controller->config_awaiting && event[0] == 0x0e && bytes >= 6 &&
+            read16(event + 3) == controller->config_opcode)
+        {
+            if (event[5] != 0)
+                return fail(controller, BTV_BOOT_CONTROLLER_ERROR);
+            controller->config_awaiting = 0;
+            ++controller->config_step;
+        }
+        else if (controller->config_awaiting && event[0] == 0x0f &&
+                 bytes >= 6 && read16(event + 4) == controller->config_opcode &&
+                 event[2] != 0)
+            return fail(controller, BTV_BOOT_CONTROLLER_ERROR);
+        return 1;
+    }
+    if (controller->state == BTV_BC_NAMING)
+    {
+        const uint8_t *event = controller->event_completion.data;
+        uint32_t bytes = controller->event_completion.bytes;
+        btv_inquiry_device *entry;
+        if (!controller->name_awaiting) return 1;
+        entry = &controller->inquiry.devices[controller->name_index];
+        if (event[0] == 0x0f && bytes == 6 &&
+            read16(event + 4) == REMOTE_NAME_OPCODE)
+        {
+            controller->name_status_seen = 1;
+            if (event[2] != 0)
+            {
+                /* Refused: skip this device. */
+                controller->name_awaiting = 0;
+                ++controller->name_index;
+            }
+        }
+        else if (event[0] == 0x07 && bytes >= 9 &&
+                 memcmp(event + 3, entry->address, 6) == 0)
+        {
+            if (event[2] == 0)
+            {
+                size_t length = bytes - 9, copy;
+                const uint8_t *name = event + 9;
+                for (copy = 0; copy < length && name[copy] != 0 &&
+                     copy < BTV_INQUIRY_NAME_BYTES - 1; ++copy)
+                    entry->name[copy] = (char)name[copy];
+                entry->name[copy] = 0;
+            }
+            controller->name_awaiting = 0;
+            ++controller->name_index;
+        }
+        return 1;
+    }
+    if (controller->state == BTV_BC_INQUIRING)
+    {
+        result = btv_hci_inquiry_event(&controller->inquiry,
+                        controller->event_completion.data,
+                        controller->event_completion.bytes, now);
+        return result < 0 ? fail(controller, controller->inquiry.error) : 1;
+    }
+    if (controller->state == BTV_BC_SECURING)
+    {
+        int pairing_result;
+        if (controller->event_completion.data[0] == 0x0e &&
+            controller->pairing_hci_pending &&
+            controller->event_completion.bytes >= 6 &&
+            read16(controller->event_completion.data + 3) ==
+                controller->pairing_opcode)
+        {
+            if (controller->event_completion.data[5] != 0)
+                return fail(controller, BTV_SEC_COMMAND_ERROR);
+            controller->pairing_hci_pending = 0;
+        }
+        pairing_result = btv_hci_pairing_event(&controller->pairing,
+                        controller->event_completion.data,
+                        controller->event_completion.bytes,
+                        controller->pairing_command,
+                        sizeof(controller->pairing_command));
+        if (pairing_result < 0)
+            return fail(controller, BTV_SEC_BAD_EVENT);
+        if (pairing_result > 0)
+        {
+            if (controller->pairing_command_bytes != 0 ||
+                controller->pairing_hci_pending)
+                return fail(controller, BTV_SEC_BAD_EVENT);
+            controller->pairing_command_bytes = (uint8_t)pairing_result;
+            controller->pairing_opcode = read16(controller->pairing_command);
+        }
+        result = btv_hci_security_event(&controller->security,
+                        controller->event_completion.data,
+                        controller->event_completion.bytes, now);
+        return result < 0 ? fail(controller, controller->security.error) : 1;
+    }
+    if (controller->state == BTV_BC_SECURED)
+    {
+        result = btv_hci_commands_event(&controller->commands,
+                        controller->event_completion.data,
+                        controller->event_completion.bytes);
+        if (result == BTV_COMMAND_RECOVER)
+            return fail(controller, BTV_BOOT_TRANSPORT_ERROR);
+        if (result == BTV_COMMAND_OK) return 1;
+        if (controller->pending_event_bytes != 0)
+            return fail(controller, BTV_BOOT_TRANSPORT_ERROR);
+        memcpy(controller->pending_event, controller->event_completion.data,
+               controller->event_completion.bytes);
+        controller->pending_event_bytes = controller->event_completion.bytes;
+        return 1;
+    }
+    result = btv_acl_link_event(&controller->link,
+                    controller->event_completion.data,
+                    controller->event_completion.bytes, now);
+    return result < 0 ? fail(controller, controller->link.error) : 1;
+}
+
+static int poll_scheduled(btv_bridge_controller *controller)
+{
+    int result;
+    if (controller->scheduled_host_ticket == 0) return 0;
+    result = btv_host_bridge_poll(controller->scheduled_host_ticket,
+                                  &controller->command_completion);
+    if (result == BTV_HOST_BRIDGE_PENDING) return 0;
+    controller->scheduled_host_ticket = 0;
+    if (result != BTV_HOST_BRIDGE_OK ||
+        controller->command_completion.kind != BTV_HOST_BRIDGE_COMMAND ||
+        btv_hci_commands_usb_done(&controller->commands,
+              controller->scheduled_core_ticket,
+              controller->command_completion.error == 0) != BTV_COMMAND_OK)
+        return fail(controller, BTV_BOOT_TRANSPORT_ERROR);
+    controller->scheduled_core_ticket = 0;
+    return 1;
+}
+
+static int submit_scheduled(btv_bridge_controller *controller)
+{
+    uint8_t command[258];
+    uint32_t core_ticket;
+    size_t bytes;
+    int result;
+    if (controller->scheduled_host_ticket != 0 ||
+        controller->submitted_ticket != 0) return 0;
+    bytes = btv_hci_commands_peek(&controller->commands, command,
+                                   sizeof(command), &core_ticket);
+    if (bytes == 0) return 0;
+    result = btv_host_bridge_submit(BTV_HOST_BRIDGE_COMMAND, command,
+                (uint32_t)bytes, 0, &controller->scheduled_host_ticket,
+                &controller->windows_error);
+    if (result != BTV_HOST_BRIDGE_OK ||
+        btv_hci_commands_sent(&controller->commands, core_ticket) !=
+            BTV_COMMAND_OK)
+    {
+        controller->scheduled_host_ticket = 0;
+        return fail(controller, BTV_BOOT_TRANSPORT_ERROR);
+    }
+    controller->scheduled_core_ticket = core_ticket;
+    controller->submitted_ticket = core_ticket;
+    return 1;
+}
+
+static int submit_event(btv_bridge_controller *controller)
+{
+    int result;
+    if (controller->event_ticket != 0 || controller->pending_event_bytes != 0)
+        return 0;
+    result = btv_host_bridge_submit(BTV_HOST_BRIDGE_EVENT_IN, 0,
+                EVENT_CAPACITY, 0, &controller->event_ticket,
+                &controller->windows_error);
+    if (result != BTV_HOST_BRIDGE_OK)
+    {
+        controller->event_ticket = 0;
+        return fail(controller, BTV_BOOT_TRANSPORT_ERROR);
+    }
+    return 1;
+}
+
+static int submit_command(btv_bridge_controller *controller, uint32_t now)
+{
+    uint8_t command[68];
+    size_t bytes;
+    int result;
+    if (controller->command_ticket != 0)
+        return 0;
+    if (controller->state == BTV_BC_SECURING &&
+        controller->pairing_hci_pending &&
+        controller->pairing_command_bytes == 0)
+        return 0;
+    if (controller->state == BTV_BC_SECURING &&
+        controller->pairing_command_bytes != 0)
+    {
+        bytes = controller->pairing_command_bytes;
+        memcpy(command, controller->pairing_command, bytes);
+    }
+    else if (controller->state == BTV_BC_CONFIGURING)
+    {
+        /* BlueZ's Bluetooth 2.1 event mask: adds the SSP events (IO
+         * capability, user confirmation, simple pairing complete). */
+        static const uint8_t set_event_mask[] = {
+            0x01, 0x0c, 8, 0xff, 0xff, 0xfb, 0xff, 0x07, 0xf8, 0xbf, 0x3d };
+        static const uint8_t write_ssp_mode[] = { 0x56, 0x0c, 1, 0x01 };
+        if (controller->config_awaiting ||
+            controller->config_step >= CONFIG_STEPS)
+            return 0;
+        if (controller->config_step == 0)
+        {
+            bytes = sizeof(set_event_mask);
+            memcpy(command, set_event_mask, bytes);
+        }
+        else
+        {
+            bytes = sizeof(write_ssp_mode);
+            memcpy(command, write_ssp_mode, bytes);
+        }
+    }
+    else if (controller->state == BTV_BC_NAMING)
+    {
+        const btv_inquiry_device *entry;
+        if (controller->name_awaiting) return 0;
+        while (controller->name_index < controller->inquiry.count &&
+               controller->name_index < BTV_INQUIRY_RESULTS &&
+               controller->inquiry.devices[controller->name_index].name[0] != 0)
+            ++controller->name_index;
+        if (controller->name_index >= controller->inquiry.count ||
+            controller->name_index >= BTV_INQUIRY_RESULTS)
+            return 0;
+        entry = &controller->inquiry.devices[controller->name_index];
+        command[0] = (uint8_t)REMOTE_NAME_OPCODE;
+        command[1] = (uint8_t)(REMOTE_NAME_OPCODE >> 8);
+        command[2] = 10;
+        memcpy(command + 3, entry->address, 6);
+        command[9] = entry->page_scan_rep_mode;
+        command[10] = 0;
+        command[11] = (uint8_t)entry->clock_offset;
+        command[12] = (uint8_t)((entry->clock_offset >> 8) | 0x80);
+        bytes = 13;
+    }
+    else if (controller->state == BTV_BC_BOOTING)
+        bytes = btv_hci_bootstrap_command(&controller->bootstrap, command,
+                                          sizeof(command));
+    else if (controller->state == BTV_BC_INQUIRING)
+        bytes = btv_hci_inquiry_command(&controller->inquiry, command,
+                                        sizeof(command), now);
+    else if (controller->state == BTV_BC_CONNECTING ||
+             controller->state == BTV_BC_DISCONNECTING)
+        bytes = btv_acl_link_command(&controller->link, command,
+                                     sizeof(command), now);
+    else
+        bytes = btv_hci_security_command(&controller->security, command,
+                                         sizeof(command), now);
+    if (bytes == 0)
+        return 0;
+    result = btv_host_bridge_submit(BTV_HOST_BRIDGE_COMMAND, command,
+                (uint32_t)bytes, 0, &controller->command_ticket,
+                &controller->windows_error);
+    if (result != BTV_HOST_BRIDGE_OK)
+    {
+        controller->command_ticket = 0;
+        return fail(controller, BTV_BOOT_TRANSPORT_ERROR);
+    }
+    if (controller->state == BTV_BC_SECURING &&
+        controller->pairing_command_bytes != 0)
+    {
+        controller->pairing_command_bytes = 0;
+        controller->pairing_usb_inflight = 1;
+        controller->pairing_hci_pending = 1;
+        return 1;
+    }
+    if (controller->state == BTV_BC_NAMING)
+    {
+        controller->name_awaiting = 1;
+        controller->name_status_seen = 0;
+        controller->name_started = now;
+        return 1;
+    }
+    if (controller->state == BTV_BC_CONFIGURING)
+    {
+        controller->config_opcode = read16(command);
+        controller->config_awaiting = 1;
+        controller->config_started = now;
+        return 1;
+    }
+    if (!((controller->state == BTV_BC_BOOTING &&
+           btv_hci_bootstrap_sent(&controller->bootstrap, now)) ||
+          (controller->state == BTV_BC_INQUIRING &&
+           btv_hci_inquiry_sent(&controller->inquiry, now)) ||
+          ((controller->state == BTV_BC_CONNECTING ||
+            controller->state == BTV_BC_DISCONNECTING) &&
+           btv_acl_link_sent(&controller->link, now)) ||
+          (controller->state == BTV_BC_SECURING &&
+           btv_hci_security_sent(&controller->security, now))))
+        return fail(controller, BTV_BOOT_TRANSPORT_ERROR);
+    return 1;
+}
+
+int btv_bridge_controller_pump(btv_bridge_controller *controller,
+                               uint32_t now)
+{
+    int work;
+    if (controller == 0 || (controller->state != BTV_BC_BOOTING &&
+                            controller->state != BTV_BC_CONFIGURING &&
+                            controller->state != BTV_BC_NAMING &&
+                            controller->state != BTV_BC_INQUIRING &&
+                            controller->state != BTV_BC_CONNECTING &&
+                            controller->state != BTV_BC_DISCONNECTING &&
+                            controller->state != BTV_BC_SECURING &&
+                            controller->state != BTV_BC_SECURED))
+        return 0;
+    work = 0;
+    if (controller->state == BTV_BC_SECURED)
+    {
+        int scheduled = poll_scheduled(controller);
+        if (scheduled < 0) return -1;
+        work |= scheduled;
+    }
+    if (poll_command(controller) < 0 || poll_event(controller, now) < 0)
+        return -1;
+    if (controller->state == BTV_BC_BOOTING)
+    {
+        btv_hci_bootstrap_tick(&controller->bootstrap, now);
+        if (controller->bootstrap.stage == BTV_BOOT_FAILED)
+            return fail(controller, controller->bootstrap.error);
+        if (controller->bootstrap.stage == BTV_BOOT_DISCOVERED)
+        {
+            if (!btv_hci_bootstrap_snapshot(&controller->bootstrap,
+                                            &controller->info))
+                return fail(controller, BTV_BOOT_BAD_EVENT);
+            if (controller->command_ticket == 0)
+            {
+                if (controller->info.features[0][FEATURE_SSP_BYTE] &
+                    FEATURE_SSP_BIT)
+                {
+                    controller->state = BTV_BC_CONFIGURING;
+                    controller->config_step = 0;
+                    controller->config_awaiting = 0;
+                    return 1;
+                }
+                controller->state = BTV_BC_READY;
+            }
+            return controller->state == BTV_BC_READY ? 1 : 0;
+        }
+    }
+    else if (controller->state == BTV_BC_CONFIGURING)
+    {
+        if (controller->config_awaiting &&
+            now - controller->config_started >= CONFIG_TIMEOUT_MS)
+            return fail(controller, BTV_BOOT_TIMEOUT);
+        if (controller->config_step >= CONFIG_STEPS &&
+            controller->command_ticket == 0)
+        {
+            controller->state = BTV_BC_READY;
+            return 1;
+        }
+    }
+    else if (controller->state == BTV_BC_NAMING)
+    {
+        if (controller->name_awaiting &&
+            now - controller->name_started >= NAME_TIMEOUT_MS)
+        {
+            controller->name_awaiting = 0;
+            ++controller->name_index;
+        }
+        if (!controller->name_awaiting && controller->command_ticket == 0)
+        {
+            unsigned int index = controller->name_index;
+            while (index < controller->inquiry.count &&
+                   index < BTV_INQUIRY_RESULTS &&
+                   controller->inquiry.devices[index].name[0] != 0)
+                ++index;
+            if (index >= controller->inquiry.count ||
+                index >= BTV_INQUIRY_RESULTS)
+            {
+                controller->state = BTV_BC_READY;
+                return 1;
+            }
+        }
+    }
+    else if (controller->state == BTV_BC_INQUIRING)
+    {
+        btv_hci_inquiry_tick(&controller->inquiry, now);
+        if (controller->inquiry.state == BTV_IQ_RECOVER)
+            return fail(controller, controller->inquiry.error);
+        if (controller->inquiry.state == BTV_IQ_DONE ||
+            controller->inquiry.state == BTV_IQ_REJECTED)
+        {
+            if (controller->command_ticket == 0)
+                controller->state = BTV_BC_READY;
+            return controller->state == BTV_BC_READY ? 1 : 0;
+        }
+    }
+    else if (controller->state == BTV_BC_CONNECTING ||
+             controller->state == BTV_BC_DISCONNECTING)
+    {
+        btv_acl_link_tick(&controller->link, now);
+        if (controller->link.state == BTV_LINK_RECOVER)
+            return fail(controller, controller->link.error);
+        if (controller->link.state == BTV_LINK_OPEN)
+        {
+            if (controller->command_ticket == 0)
+                controller->state = BTV_BC_LINK_READY;
+            return controller->state == BTV_BC_LINK_READY ? 1 : 0;
+        }
+        if (controller->link.state == BTV_LINK_REJECTED)
+        {
+            if (controller->command_ticket == 0)
+                controller->state = BTV_BC_READY;
+            return controller->state == BTV_BC_READY ? 1 : 0;
+        }
+        if (controller->link.state == BTV_LINK_CLOSED)
+        {
+            if (controller->command_ticket == 0)
+                controller->state = BTV_BC_READY;
+            return controller->state == BTV_BC_READY ? 1 : 0;
+        }
+    }
+    else if (controller->state == BTV_BC_SECURING)
+    {
+        btv_hci_security_tick(&controller->security, now);
+        if (controller->security.state == BTV_SEC_RECOVER)
+            return fail(controller, controller->security.error);
+        if (controller->security.state == BTV_SEC_SECURED)
+        {
+            if (controller->command_ticket == 0 &&
+                !controller->pairing_hci_pending &&
+                controller->pairing_command_bytes == 0)
+            {
+                controller->state = BTV_BC_SECURED;
+                btv_hci_commands_init(&controller->commands,
+                    controller->command_credits ? controller->command_credits : 1);
+                controller->commands_initialized = 1;
+            }
+            return controller->state == BTV_BC_SECURED ? 1 : 0;
+        }
+        if (controller->security.state == BTV_SEC_REJECTED)
+        {
+            if (controller->command_ticket == 0)
+                controller->state = BTV_BC_LINK_READY;
+            return controller->state == BTV_BC_LINK_READY ? 1 : 0;
+        }
+    }
+    if (controller->event_ticket == 0)
+    {
+        if (submit_event(controller) < 0)
+            return -1;
+        work = 1;
+    }
+    if (controller->command_ticket == 0)
+    {
+        int submitted = submit_command(controller, now);
+        if (submitted < 0)
+            return -1;
+        if (submitted)
+            work = 1;
+    }
+    if (controller->state == BTV_BC_SECURED)
+    {
+        int submitted = submit_scheduled(controller);
+        if (submitted < 0) return -1;
+        work |= submitted;
+    }
+    return work;
+}
+
+int btv_bridge_controller_inquire(btv_bridge_controller *controller,
+                                  uint8_t duration, uint8_t maximum,
+                                  uint32_t now)
+{
+    if (controller == 0 || controller->state != BTV_BC_READY ||
+        controller->event_ticket != 0 || controller->command_ticket != 0)
+        return 0;
+    btv_hci_inquiry_init(&controller->inquiry);
+    if (!btv_hci_inquiry_start(&controller->inquiry, duration, maximum, now))
+        return 0;
+    controller->state = BTV_BC_INQUIRING;
+    return 1;
+}
+
+int btv_bridge_controller_request_names(btv_bridge_controller *controller,
+                                        uint32_t now)
+{
+    (void)now;
+    if (controller == 0 || controller->state != BTV_BC_READY ||
+        controller->event_ticket != 0 || controller->command_ticket != 0)
+        return 0;
+    controller->name_index = 0;
+    controller->name_awaiting = 0;
+    controller->name_status_seen = 0;
+    controller->state = BTV_BC_NAMING;
+    return 1;
+}
+
+int btv_bridge_controller_connect(btv_bridge_controller *controller,
+                                  unsigned int inquiry_index, uint32_t now)
+{
+    const btv_inquiry_device *entry;
+    if (controller == 0 || controller->state != BTV_BC_READY ||
+        controller->event_ticket != 0 || controller->command_ticket != 0)
+        return 0;
+    entry = btv_hci_inquiry_result(&controller->inquiry, inquiry_index);
+    if (entry == 0)
+        return 0;
+    btv_acl_link_init(&controller->link);
+    if (!btv_acl_link_connect(&controller->link, entry->address,
+                              entry->page_scan_rep_mode,
+                              entry->clock_offset, now))
+        return 0;
+    controller->state = BTV_BC_CONNECTING;
+    return 1;
+}
+
+int btv_bridge_controller_connect_address(btv_bridge_controller *controller,
+                                  const uint8_t address[6], uint32_t now)
+{
+    if (controller == 0 || address == 0 ||
+        controller->state != BTV_BC_READY ||
+        controller->event_ticket != 0 || controller->command_ticket != 0)
+        return 0;
+    btv_acl_link_init(&controller->link);
+    if (!btv_acl_link_connect(&controller->link, address, 1, 0, now))
+        return 0;
+    controller->state = BTV_BC_CONNECTING;
+    return 1;
+}
+
+int btv_bridge_controller_disconnect(btv_bridge_controller *controller,
+                                     uint32_t now)
+{
+    if (controller == 0 || (controller->state != BTV_BC_LINK_READY &&
+                            controller->state != BTV_BC_SECURED) ||
+        controller->pending_event_bytes != 0 ||
+        controller->command_ticket != 0 ||
+        !btv_acl_link_disconnect(&controller->link, now))
+        return 0;
+    controller->state = BTV_BC_DISCONNECTING;
+    return 1;
+}
+
+int btv_bridge_controller_secure(btv_bridge_controller *controller,
+                                 const uint8_t *pin, size_t pin_bytes,
+                                 const uint8_t *link_key,
+                                 uint8_t link_key_type,
+                                 int allow_just_works, uint32_t now)
+{
+    uint16_t handle;
+    if (controller == 0 || controller->state != BTV_BC_LINK_READY ||
+        controller->event_ticket != 0 || controller->command_ticket != 0 ||
+        !btv_acl_link_handle(&controller->link, &handle))
+        return 0;
+    btv_hci_security_init(&controller->security);
+    if (!btv_hci_pairing_init(&controller->pairing,
+                              controller->link.address, pin, pin_bytes,
+                              link_key, link_key_type, allow_just_works))
+        return 0;
+    if (!btv_hci_security_start(&controller->security, handle, now))
+        return 0;
+    controller->state = BTV_BC_SECURING;
+    return 1;
+}
+
+int btv_bridge_controller_stop(btv_bridge_controller *controller)
+{
+    int result;
+    if (controller == 0 || controller->state == BTV_BC_IDLE ||
+        controller->state == BTV_BC_CLOSED)
+        return 1;
+    controller->state = BTV_BC_CLOSING;
+    result = btv_host_bridge_close(&controller->windows_error);
+    if (result == BTV_HOST_BRIDGE_PENDING)
+        return 0;
+    if (result != BTV_HOST_BRIDGE_OK)
+    {
+        controller->state = BTV_BC_FAILED;
+        controller->error = BTV_BOOT_TRANSPORT_ERROR;
+        return -1;
+    }
+    controller->event_ticket = controller->command_ticket = 0;
+    controller->scheduled_host_ticket = controller->scheduled_core_ticket = 0;
+    controller->submitted_ticket = 0;
+    controller->state = BTV_BC_CLOSED;
+    return 1;
+}
+
+const btv_controller_info *btv_bridge_controller_info(
+                                const btv_bridge_controller *controller)
+{
+    return controller != 0 && controller->state == BTV_BC_READY ?
+           &controller->info : 0;
+}
+
+const uint8_t *btv_bridge_controller_event(
+                                const btv_bridge_controller *controller,
+                                size_t *bytes)
+{
+    if (bytes != 0) *bytes = 0;
+    if (controller == 0 || controller->state != BTV_BC_SECURED ||
+        controller->pending_event_bytes == 0)
+        return 0;
+    if (bytes != 0) *bytes = controller->pending_event_bytes;
+    return controller->pending_event;
+}
+
+int btv_bridge_controller_take_event(btv_bridge_controller *controller)
+{
+    if (controller == 0 || controller->pending_event_bytes == 0) return 0;
+    controller->pending_event_bytes = 0;
+    return 1;
+}
+
+btv_hci_commands *btv_bridge_controller_commands(
+                                btv_bridge_controller *controller)
+{
+    return controller != 0 && controller->state == BTV_BC_SECURED &&
+           controller->commands_initialized ? &controller->commands : 0;
+}
+
+uint32_t btv_bridge_controller_take_submitted(
+                                btv_bridge_controller *controller)
+{
+    uint32_t ticket;
+    if (controller == 0) return 0;
+    ticket = controller->submitted_ticket;
+    controller->submitted_ticket = 0;
+    return ticket;
+}

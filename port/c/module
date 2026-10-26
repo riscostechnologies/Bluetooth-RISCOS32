@@ -1,0 +1,509 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        module
+ * Purpose:     BluetoothVoice SWI boundary with honest backend discovery.
+ *              No controller is advertised until a transport is registered.
+ ******************************************************************/
+#include "modhead.h"
+#include <host_bridge>
+#include <bridge_session>
+#include <sound_device>
+#include <stddef.h>
+#include <string.h>
+
+#define BTV_ABI_VERSION 0x00010000
+#define BTV_CAP_PLAYBACK (1u << 0)
+#define BTV_CAP_CAPTURE (1u << 1)
+#define BTV_CAP_NATIVE_TRANSPORT (1u << 2)
+#define BTV_CAP_HFP (1u << 5)
+#define BTV_CAPABILITIES (BTV_CAP_PLAYBACK | BTV_CAP_CAPTURE | \
+                          BTV_CAP_NATIVE_TRANSPORT | BTV_CAP_HFP)
+#define BTV_ENDPOINT_BYTES 96
+#define BTV_STATUS_BYTES 64
+
+static btv_host_bridge_info host_info;
+static int host_transport_ready;
+static btv_bridge_session native_session;
+static uint32_t session_handle, next_session_handle;
+static int sound_output;
+static _kernel_oserror error_BufferOverflowLocal = { 0x1e4, "Buffer overflow" };
+
+/* Inspect only. host_bridge selects the emulator transport when its private
+ * SWI is present, otherwise it inspects the native DeviceFS USB backend.
+ * Controller ownership is still deferred until BluetoothVoice_Connect. */
+void btm_init(void *pw);
+int btm_active(void);
+int btm_final(void);
+_kernel_oserror *btm_swi(int swi, _kernel_swi_regs *r);
+
+_kernel_oserror *Mod_Init(const char *tail, int podule, void *pw)
+{
+    (void)tail;
+    (void)podule;
+    btm_init(pw);
+    host_transport_ready = btv_host_bridge_inspect(&host_info) &&
+                           (int)host_info.result == BTV_HOST_BRIDGE_OK;
+    memset(&native_session, 0, sizeof(native_session));
+    session_handle = 0;
+    next_session_handle = 1;
+    return NULL;
+}
+
+/* The controller may enumerate after this module loads (for example when
+ * the USB stack was just reloaded), so discovery is retried on demand. */
+static void ensure_transport(void)
+{
+    if (host_transport_ready || session_handle != 0) return;
+    host_transport_ready = btv_host_bridge_inspect(&host_info) &&
+                           (int)host_info.result == BTV_HOST_BRIDGE_OK;
+}
+
+_kernel_oserror *Mod_Final(int fatal, int podule, void *pw)
+{
+    (void)podule;
+    (void)pw;
+    if (session_handle != 0 || !btm_final()) return error_Busy;
+    btv_sound_device_sync(NULL, 0);
+    /* Leaving a live device behind strands a node in the kernel's hardware
+     * device list: walking it then aborts inside the kernel and locks the
+     * machine.  Refuse while we can; a finalisation we cannot refuse gets
+     * an inert device instead. */
+    if (btv_sound_device_registered())
+    {
+        if (!fatal) return error_Busy;
+        btv_sound_device_orphan();
+    }
+    return NULL;
+}
+
+void Mod_Service(int service, _kernel_swi_regs *r, void *pw)
+{
+    (void)pw;
+    if (service == 0x79)
+        btv_host_bridge_device_dead(0x79, (uint32_t)r->r[2],
+            (uint32_t)r->r[2] != 0 && r->r[3] != 0 ? (const char *)r->r[3] : 0);
+    else if (service == 0xd2 &&
+             ((uint32_t)r->r[0] == 4u || (uint32_t)r->r[0] == 5u))
+        btv_host_bridge_device_dead(0xd2, (uint32_t)r->r[0], 0);
+    else
+        return;
+    /* Rediscover on next use; an open session keeps its failed state. */
+    if (session_handle == 0 && !btv_host_bridge_present())
+        host_transport_ready = 0;
+}
+
+/* Reserved flags are rejected before touching any other input. */
+static _kernel_oserror *check_flags(const _kernel_swi_regs *registers)
+{
+    return registers->r[0] != 0 ? error_InvalidArgument : NULL;
+}
+
+/* Transport capabilities are published only when the selected emulator or
+ * native DeviceFS backend is usable. */
+_kernel_oserror *SWI_Version(int swi, _kernel_swi_regs *r, void *pw)
+{
+    _kernel_oserror *error;
+    (void)swi;
+    (void)pw;
+    error = check_flags(r);
+    if (error != NULL)
+        return error;
+    ensure_transport();
+    r->r[1] = BTV_ABI_VERSION;
+    r->r[2] = host_transport_ready ? BTV_CAPABILITIES : 0;
+    return NULL;
+}
+
+static void write_endpoint(unsigned int *words)
+{
+    static const char name[] = "CSR 0A12:0001 Bluetooth USB";
+    unsigned int index;
+    unsigned char *bytes;
+    for (index = 0; index < BTV_ENDPOINT_BYTES / 4; ++index)
+        words[index] = 0;
+    words[0] = BTV_ENDPOINT_BYTES;
+    words[1] = 1;
+    words[2] = 1;
+    words[3] = BTV_CAPABILITIES;
+    words[4] = 1;
+    bytes = (unsigned char *)words;
+    for (index = 0; index < sizeof(name); ++index)
+        bytes[20 + index] = (unsigned char)name[index];
+}
+
+/* Enumerate the raw controller only when the host plug-in can open it. */
+_kernel_oserror *SWI_Enumerate(int swi, _kernel_swi_regs *r, void *pw)
+{
+    _kernel_oserror *error;
+    (void)swi;
+    (void)pw;
+    error = check_flags(r);
+    if (error != NULL)
+        return error;
+    if (r->r[1] != 0)
+        return error_InvalidHandle;
+    ensure_transport();
+    if (r->r[3] < 0 || (r->r[2] == 0 && r->r[3] != 0) ||
+        (r->r[2] & 3) != 0)
+        return error_InvalidArgument;
+    if (r->r[2] != 0)
+    {
+        if (!host_transport_ready)
+            r->r[1] = -1;
+        else if (r->r[3] < BTV_ENDPOINT_BYTES)
+        {
+            r->r[3] = -BTV_ENDPOINT_BYTES;
+            return &error_BufferOverflowLocal;
+        }
+        else
+        {
+            write_endpoint((unsigned int *)r->r[2]);
+            r->r[1] = -1;
+        }
+    }
+    r->r[3] = host_transport_ready ? BTV_ENDPOINT_BYTES : 0;
+    return NULL;
+}
+
+static uint32_t monotonic_time(void)
+{
+    register uint32_t value __asm("r0");
+    __asm volatile("swi 0x42" : "=r" (value) : : "cc", "lr");
+    /* OS_ReadMonotonicTime is centiseconds; the portable state machines and
+     * Windows host use milliseconds.  Unsigned multiplication preserves the
+     * intended wrapping elapsed-time arithmetic. */
+    return value * 10u;
+}
+
+static int valid_memory(const void *address, size_t bytes)
+{
+    uint32_t lower, upper;
+    if (bytes == 0) return 1;
+    lower = (uint32_t)address;
+    /* OS_ValidateAddress takes an inclusive range. */
+    upper = lower + (uint32_t)bytes - 1;
+    /* CMunge handlers run in SVC mode. Calling OS_ValidateAddress here asks
+     * the kernel to validate the module's SVC address space and can wait on
+     * Service_ValidateAddress rather than the originating application's map.
+     * Reject null/low and wrapped ranges; like established RISC OS buffer
+     * SWIs, the caller remains responsible for keeping a supplied buffer
+     * mapped for the duration of the call. */
+    return lower >= 0x8000u && upper >= lower;
+}
+
+static int valid_handle(const _kernel_swi_regs *r)
+{
+    return session_handle != 0 && (uint32_t)r->r[1] == session_handle;
+}
+
+_kernel_oserror *SWI_Connect(int swi, _kernel_swi_regs *r, void *pw)
+{
+    _kernel_oserror *error;
+    const uint32_t *configuration;
+    btv_bridge_session_options options;
+    uint32_t profile, capture, size, version;
+    const unsigned char *bytes;
+    (void)swi;
+    (void)pw;
+    error = check_flags(r);
+    if (error != NULL) return error;
+    ensure_transport();
+    if (!host_transport_ready) return error_BackendUnavailable;
+    if (r->r[1] != 1 || r->r[2] == 0 || (r->r[2] & 3) != 0 ||
+        !valid_memory((const void *)r->r[2], 8)) return error_InvalidArgument;
+    configuration = (const uint32_t *)r->r[2];
+    size = configuration[0];
+    version = configuration[1];
+    if (!((size == 16 && version == 1) || (size == 64 && version == 2)) ||
+        !valid_memory((const void *)r->r[2], size)) return error_InvalidArgument;
+    profile = configuration[2];
+    capture = configuration[3];
+    if (capture > 1) return error_InvalidArgument;
+    if (profile != 0 && profile != 2) return error_UnsupportedProfile;
+    /* The shared core owns the controller while it runs. */
+    if (session_handle != 0 || btm_active()) return error_Busy;
+    memset(&options, 0, sizeof(options));
+    options.capture = (uint8_t)capture;
+    options.pin[0] = options.pin[1] = options.pin[2] = options.pin[3] = '0';
+    options.pin_bytes = 4;
+    if (version == 2)
+    {
+        bytes = (const unsigned char *)configuration;
+        if (configuration[4] > 1 || configuration[5] > 16 ||
+            bytes[30] != 0 || bytes[31] != 0 ||
+            configuration[12] > 1 || configuration[13] > 1 ||
+            configuration[14] != 0 || configuration[15] != 0)
+            return error_InvalidArgument;
+        options.address_valid = (uint8_t)configuration[4];
+        memcpy(options.address, bytes + 24, 6);
+        options.pin_bytes = (uint8_t)configuration[5];
+        options.scan_only = (uint8_t)configuration[13];
+        memcpy(options.pin, bytes + 32, 16);
+    }
+    sound_output = version == 2 && configuration[12] != 0;
+    if (!btv_bridge_session_start_with_options(&native_session, &options,
+                                               monotonic_time()))
+        return error_BackendUnavailable;
+    session_handle = next_session_handle++;
+    if (next_session_handle == 0) next_session_handle = 1;
+    r->r[1] = (int)session_handle;
+    return NULL;
+}
+
+static unsigned int public_state(void)
+{
+    if (native_session.state == BTV_BX_READY) return 3;
+    if (native_session.state == BTV_BX_DISCONNECTED) return 4;
+    if (native_session.state == BTV_BX_FAILED) return 5;
+    if (native_session.state == BTV_BX_CLOSING) return 6;
+    if (native_session.state == BTV_BX_SCANNED) return 7;
+    return native_session.state >= BTV_BX_NEGOTIATING ? 2 : 1;
+}
+
+static void write_status(uint32_t *words)
+{
+    unsigned int index;
+    for (index = 0; index < BTV_STATUS_BYTES / 4; ++index) words[index] = 0;
+    words[0] = BTV_STATUS_BYTES;
+    words[1] = 1;
+    words[2] = public_state();
+    words[3] = 1;
+    words[4] = 2;
+    if (native_session.state == BTV_BX_READY)
+    {
+        words[5] = 8000;
+        words[6] = 1;
+        words[7] = 1;
+        words[8] = 2;
+        words[9] = (uint32_t)btv_pcm_frames(&native_session.pcm.playback);
+        words[10] = (uint32_t)btv_pcm_frames(&native_session.pcm.capture);
+        /* Without capture, word 10 carries the system sound meter. */
+        if (!native_session.capture && btv_sound_device_running())
+            words[10] = btv_sound_device_meter();
+    }
+    /* Word 11 is reserved in the public layout; it carries hardware
+     * bring-up diagnostics until the native backend is qualified. Bit 31
+     * selects the voice-stage layout once HFP negotiation has started. */
+    if (native_session.voice.state != 0)
+    {
+        uint32_t in_count, out_count;
+        btv_host_bridge_acl_counts(&in_count, &out_count);
+        words[11] = 0x80000000u |
+            (native_session.voice.discovery.session.state & 15u) |
+            ((native_session.voice.discovery.state & 15u) << 4) |
+            ((native_session.voice.acl.state & 15u) << 8) |
+            ((native_session.voice.acl.error & 15u) << 12) |
+            ((native_session.voice.state >= 5u ?
+                  btv_host_bridge_voice_state() :
+                  native_session.voice.discovery.session.outcome) & 15u) << 16 |
+            (native_session.voice.state >= 5u ?
+                ((native_session.voice.audio.input.failed ? 1u : 0u) << 20) |
+                ((native_session.voice.audio.output.failed ? 1u : 0u) << 21) |
+                ((native_session.pcm.failed ? 1u : 0u) << 22) |
+                ((native_session.voice.audio_failed ? 1u : 0u) << 23) |
+                ((native_session.voice.audio.state & 15u) << 24) :
+                ((in_count > 15u ? 15u : in_count) << 20) |
+                ((out_count > 15u ? 15u : out_count) << 24)) |
+            ((native_session.voice.acl.input_ticket != 0) << 28) |
+            ((native_session.voice.acl.output_ticket != 0) << 29);
+    }
+    else
+    words[11] = (native_session.controller.bootstrap.stage & 15u) |
+                ((native_session.controller.bootstrap.failed_stage & 15u) << 4) |
+                ((native_session.controller.bootstrap.error & 15u) << 8) |
+                ((native_session.controller.inquiry.state & 15u) << 12) |
+                ((native_session.controller.inquiry.error & 15u) << 16) |
+                ((native_session.controller.command_credits & 15u) << 20) |
+                ((native_session.controller.error & 15u) << 24);
+    /* Low half: capture overruns. High half: SCO input resynchronisations
+     * (bring-up diagnostic). */
+    words[12] = (native_session.pcm.capture_overruns & 0xffffu) |
+        ((native_session.voice.audio.input.receiver.resyncs & 0xffffu) << 16);
+    words[13] = native_session.error;
+    /* Bit 0 capture; bits 1 up: system sound controller state. */
+    words[14] = native_session.capture | (btv_sound_device_state() << 1);
+    words[15] = (native_session.state & 15u) |
+                ((native_session.controller.state & 15u) << 4) |
+                ((native_session.controller.link.state & 15u) << 8) |
+                ((native_session.controller.link.error & 15u) << 12) |
+                ((native_session.controller.security.state & 15u) << 16) |
+                ((native_session.controller.security.error & 15u) << 20) |
+                ((native_session.voice.state & 15u) << 24) |
+                ((native_session.voice.error & 15u) << 28);
+}
+
+/* The system sound controller exists only while the voice link is ready,
+ * and the client's continuous SWIs are what feed it. */
+static void pump_session(void)
+{
+    btv_bridge_session_pump(&native_session, monotonic_time());
+    btv_sound_device_sync(&native_session.pcm, sound_output &&
+                          native_session.state == BTV_BX_READY);
+}
+
+_kernel_oserror *SWI_Status(int swi, _kernel_swi_regs *r, void *pw)
+{
+    _kernel_oserror *error;
+    (void)swi;
+    (void)pw;
+    error = check_flags(r);
+    if (error != NULL) return error;
+    if (!valid_handle(r)) return error_InvalidHandle;
+    pump_session();
+    if (r->r[3] < 0 || (r->r[2] == 0 && r->r[3] != 0) ||
+        (r->r[2] & 3) != 0) return error_InvalidArgument;
+    if (r->r[2] != 0)
+    {
+        if (r->r[3] < BTV_STATUS_BYTES)
+        {
+            r->r[3] = -BTV_STATUS_BYTES;
+            return &error_BufferOverflowLocal;
+        }
+        if (!valid_memory((void *)r->r[2], BTV_STATUS_BYTES))
+            return error_InvalidArgument;
+        write_status((uint32_t *)r->r[2]);
+        /* Bring-up extension: a larger buffer also receives the native
+         * packet trace after the fixed status block. */
+        if (r->r[3] > BTV_STATUS_BYTES &&
+            valid_memory((void *)r->r[2], (size_t)r->r[3]))
+        {
+            uint32_t traced = btv_host_bridge_trace(
+                (uint8_t *)r->r[2] + BTV_STATUS_BYTES,
+                (uint32_t)r->r[3] - BTV_STATUS_BYTES);
+            r->r[3] = BTV_STATUS_BYTES + (int)traced;
+            return NULL;
+        }
+    }
+    r->r[3] = BTV_STATUS_BYTES;
+    return NULL;
+}
+
+_kernel_oserror *SWI_Write(int swi, _kernel_swi_regs *r, void *pw)
+{
+    _kernel_oserror *error;
+    size_t accepted;
+    (void)swi; (void)pw;
+    error = check_flags(r);
+    if (error != NULL) return error;
+    if (!valid_handle(r)) return error_InvalidHandle;
+    pump_session();
+    if (native_session.state != BTV_BX_READY) return error_NotReady;
+    if (r->r[3] < 0 || (r->r[3] & 1) ||
+        !valid_memory((const void *)r->r[2], (size_t)r->r[3]))
+        return error_InvalidArgument;
+    accepted = btv_sound_device_running() ? (size_t)r->r[3] :
+        btv_bridge_pcm_write(&native_session.pcm,
+                    (const void *)r->r[2], (size_t)r->r[3]);
+    r->r[3] = (int)accepted;
+    return NULL;
+}
+
+_kernel_oserror *SWI_Read(int swi, _kernel_swi_regs *r, void *pw)
+{
+    _kernel_oserror *error;
+    size_t copied;
+    (void)swi; (void)pw;
+    error = check_flags(r);
+    if (error != NULL) return error;
+    if (!valid_handle(r)) return error_InvalidHandle;
+    pump_session();
+    if (native_session.state != BTV_BX_READY) return error_NotReady;
+    if (!native_session.capture) return error_CaptureDisabled;
+    if (r->r[3] < 0 || (r->r[3] & 1) ||
+        !valid_memory((void *)r->r[2], (size_t)r->r[3]))
+        return error_InvalidArgument;
+    copied = btv_bridge_pcm_read(&native_session.pcm,
+                    (void *)r->r[2], (size_t)r->r[3]);
+    r->r[3] = (int)copied;
+    return NULL;
+}
+
+_kernel_oserror *SWI_Disconnect(int swi, _kernel_swi_regs *r, void *pw)
+{
+    _kernel_oserror *error;
+    (void)swi; (void)pw;
+    error = check_flags(r);
+    if (error != NULL) return error;
+    if (!valid_handle(r)) return error_InvalidHandle;
+    btv_sound_device_sync(NULL, 0);
+    if (native_session.state == BTV_BX_DISCONNECTED)
+    {
+        session_handle = 0;
+        memset(&native_session, 0, sizeof(native_session));
+        return NULL;
+    }
+    if (!btv_bridge_session_close(&native_session, monotonic_time()))
+        return error_Busy;
+    return NULL;
+}
+
+#define BTV_DEVICE_HEADER_BYTES 8u
+#define BTV_DEVICE_ENTRY_BYTES 80u
+
+/* BluetoothVoice_Devices (chunk offset 7, not yet in the decoding table):
+ * R0 = flags (0), R1 = session, R2 = buffer or 0, R3 = size.
+ * Buffer: word count, word inquiry state; then per device 80 bytes:
+ * +0 BD_ADDR (least significant byte first), +6 class of device (3),
+ * +9 RSSI (signed), +10 flags (bit 0 RSSI valid, bit 1 audio class,
+ * bit 2 hands-free/headset service), +12 name (64, NUL-terminated).
+ * On exit R3 = bytes written (or needed, negated, when R2 = 0). */
+static _kernel_oserror *swi_devices(_kernel_swi_regs *r)
+{
+    const btv_hci_inquiry *inquiry = &native_session.controller.inquiry;
+    unsigned int count, index, capacity, needed;
+    uint8_t *out;
+    _kernel_oserror *error = check_flags(r);
+    if (error != NULL) return error;
+    if (!valid_handle(r)) return error_InvalidHandle;
+    pump_session();
+    count = native_session.state >= BTV_BX_INQUIRING ? inquiry->count : 0;
+    if (count > BTV_INQUIRY_RESULTS) count = BTV_INQUIRY_RESULTS;
+    needed = BTV_DEVICE_HEADER_BYTES + count * BTV_DEVICE_ENTRY_BYTES;
+    if (r->r[2] == 0)
+    {
+        r->r[3] = -(int)needed;
+        return NULL;
+    }
+    if (r->r[3] < (int)BTV_DEVICE_HEADER_BYTES || (r->r[2] & 3) != 0 ||
+        !valid_memory((void *)r->r[2], (size_t)r->r[3]))
+        return error_InvalidArgument;
+    capacity = ((unsigned int)r->r[3] - BTV_DEVICE_HEADER_BYTES) /
+               BTV_DEVICE_ENTRY_BYTES;
+    if (count > capacity) count = capacity;
+    out = (uint8_t *)r->r[2];
+    memset(out, 0, BTV_DEVICE_HEADER_BYTES + count * BTV_DEVICE_ENTRY_BYTES);
+    ((uint32_t *)r->r[2])[0] = count;
+    ((uint32_t *)r->r[2])[1] = inquiry->state;
+    for (index = 0; index < count; ++index)
+    {
+        const btv_inquiry_device *device = btv_hci_inquiry_result(inquiry, index);
+        uint8_t *entry = out + BTV_DEVICE_HEADER_BYTES +
+                         index * BTV_DEVICE_ENTRY_BYTES;
+        if (device == NULL) continue;
+        memcpy(entry, device->address, 6);
+        memcpy(entry + 6, device->device_class, 3);
+        entry[9] = (uint8_t)device->rssi;
+        entry[10] = (uint8_t)((device->has_rssi ? 1u : 0u) |
+                              (device->audio_class ? 2u : 0u) |
+                              (device->voice_service ? 4u : 0u));
+        memcpy(entry + 12, device->name, BTV_INQUIRY_NAME_BYTES - 1);
+    }
+    r->r[3] = (int)(BTV_DEVICE_HEADER_BYTES + count * BTV_DEVICE_ENTRY_BYTES);
+    return NULL;
+}
+
+/* CMunge routes named SWIs directly; unnamed offsets arrive here. */
+_kernel_oserror *Mod_SWI(int swi, _kernel_swi_regs *r, void *pw)
+{
+    (void)pw;
+    if (swi == 7) return swi_devices(r);
+    if (swi >= 8 && swi <= 16)
+    {
+        /* The core and a hands-free session never share the controller. */
+        if (swi == 8 && r->r[1] == 0 && session_handle != 0)
+            return error_Busy;
+        return btm_swi(swi, r);
+    }
+    return error_BAD_SWI;
+}

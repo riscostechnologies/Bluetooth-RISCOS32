@@ -1,0 +1,61 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#ifndef BTV_SCO_RECEIVE_H
+#define BTV_SCO_RECEIVE_H
+#include "sco_link.h"
+#include "sco_frame.h"
+#include "hci_stream.h"
+typedef struct btv_sco_packet_info {
+    uint32_t sequence, received_at;
+    uint16_t bytes;
+    uint8_t status;
+} btv_sco_packet_info;
+typedef struct btv_sco_receive {
+    const btv_sco_link *link;
+    uint16_t handle;
+    unsigned int head, count, failed;
+    uint32_t next_sequence, dropped;
+    btv_sco_packet_info info[8];
+    uint8_t data[8][255];
+} btv_sco_receive;
+/* Bind to an OPEN synchronous link. Opaque audio bytes, not assumed PCM.
+ * One serialized owner; buffers/objects must not overlap. Reinitialization
+ * requires old USB input drained and queued data disposed by the parent. */
+int btv_sco_receive_init(btv_sco_receive *queue, const btv_sco_link *link);
+/* Exact reassembled HCI packet. 1 copied, 0 other handle, 2 dropped newest
+ * because queue full, -1 malformed/closed/recovery. USB memory can be released
+ * after this call. Full queues preserve old entries and advance sequence;
+ * consumer sees the gap on later packets. received_at is caller monotonic ms,
+ * not a radio timestamp or a substitute for negotiated audio timing. */
+int btv_sco_receive_feed(btv_sco_receive *queue, const uint8_t *packet, size_t bytes, uint32_t received_at);
+/* 1 whole packet copied (including zero-length loss reports), 0 empty,
+ * -1 invalid/closed, -2 output too small. Nothing consumed/output modified on
+ * failure. Does not conceal loss or decode codec data. */
+int btv_sco_receive_read(btv_sco_receive *queue, uint8_t *output, size_t capacity, btv_sco_packet_info *info);
+
+typedef struct btv_sco_usb_receive {
+    btv_sco_receive queue;
+    btv_hci_stream stream;
+    uint8_t assembly[258];
+    /* Misframing recovery: after a lost or corrupt USB frame the byte
+     * stream is re-aligned on two consecutive headers carrying this link's
+     * handle and the packet length learned from the first good packet. */
+    uint8_t hunt[2 * 258], replay[2 * 258];
+    size_t hunt_used, replay_used, replay_pos;
+    uint8_t hunting, sync_length;
+    uint32_t resyncs;
+} btv_sco_usb_receive;
+/* Initialize only at an established HCI boundary, after old USB requests have
+ * drained. Object is not movable: stream storage points into this object.
+ * Read audio through receiver.queue; do not feed that queue separately. */
+int btv_sco_usb_receive_init(btv_sco_usb_receive *receiver, const btv_sco_link *link);
+/* Feed ONE USB frame's valid bytes in submission/frame order, excluding gaps.
+ * status is the USB frame status (zero success), not HCI packet status.
+ * Returns 1 after consuming all bytes, including partial HCI packets and queue
+ * overflow drops; -1 freezes reception on USB loss/invalid framing/link loss.
+ * A failed transfer must be reported with nonzero status even with no bytes.
+ * No automatic resynchronization: the parent must reestablish a boundary.
+ * Input must not overlap receiver. Timestamp applies when a packet completes. */
+int btv_sco_usb_receive_frame(btv_sco_usb_receive *receiver, const uint8_t *data,
+                              size_t bytes, uint32_t status, uint32_t now);
+#endif

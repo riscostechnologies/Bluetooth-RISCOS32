@@ -1,0 +1,178 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/* Authentication/encryption link policy adapted from NetBSD hci_link.c. */
+#include "hci_security.h"
+#include "hci_frame.h"
+#include <string.h>
+
+static uint16_t read16(const uint8_t *p)
+{
+    return (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
+}
+
+static int recover(btv_hci_security *security, unsigned int error)
+{
+    security->state = BTV_SEC_RECOVER;
+    security->error = error;
+    return -1;
+}
+
+static void clear_phase(btv_hci_security *security)
+{
+    security->submitted = security->usb_done = security->status_seen = 0;
+    security->status = security->event_seen = security->event_status = 0;
+}
+
+static void advance(btv_hci_security *security)
+{
+    if (!security->usb_done || !security->status_seen)
+        return;
+    if (security->status != 0)
+    {
+        security->state = BTV_SEC_REJECTED;
+        security->error = BTV_SEC_COMMAND_ERROR;
+        return;
+    }
+    if (!security->event_seen)
+        return;
+    if (security->event_status != 0 ||
+        (security->state == BTV_SEC_ENCRYPT_WAIT && !security->encrypted))
+    {
+        security->state = BTV_SEC_REJECTED;
+        security->error = BTV_SEC_EVENT_ERROR;
+        return;
+    }
+    if (security->state == BTV_SEC_AUTH_WAIT)
+    {
+        clear_phase(security);
+        security->state = BTV_SEC_ENCRYPT_QUEUED;
+    }
+    else
+        security->state = BTV_SEC_SECURED;
+}
+
+void btv_hci_security_init(btv_hci_security *security)
+{
+    if (security != 0) memset(security, 0, sizeof(*security));
+}
+
+int btv_hci_security_start(btv_hci_security *security, uint16_t handle,
+                           uint32_t now)
+{
+    if (security == 0 || security->state != BTV_SEC_IDLE || handle > 0x0fff)
+        return 0;
+    security->handle = handle;
+    security->started = now;
+    security->state = BTV_SEC_AUTH_QUEUED;
+    return 1;
+}
+
+void btv_hci_security_tick(btv_hci_security *security, uint32_t now)
+{
+    if (security != 0 && security->state >= BTV_SEC_AUTH_QUEUED &&
+        security->state <= BTV_SEC_ENCRYPT_WAIT &&
+        (uint32_t)(now - security->started) >= 30000u)
+        recover(security, BTV_SEC_TIMEOUT);
+}
+
+size_t btv_hci_security_command(btv_hci_security *security, uint8_t *output,
+                                size_t capacity, uint32_t now)
+{
+    uint8_t parameters[3];
+    uint16_t opcode;
+    btv_hci_security_tick(security, now);
+    if (security == 0 || (security->state != BTV_SEC_AUTH_QUEUED &&
+                          security->state != BTV_SEC_ENCRYPT_QUEUED))
+        return 0;
+    parameters[0] = (uint8_t)security->handle;
+    parameters[1] = (uint8_t)(security->handle >> 8);
+    parameters[2] = 1;
+    opcode = security->state == BTV_SEC_AUTH_QUEUED ? 0x0411 : 0x0413;
+    return btv_hci_command(output, capacity, opcode, parameters,
+                           opcode == 0x0411 ? 2 : 3);
+}
+
+int btv_hci_security_sent(btv_hci_security *security, uint32_t now)
+{
+    btv_hci_security_tick(security, now);
+    if (security == 0 || (security->state != BTV_SEC_AUTH_QUEUED &&
+                          security->state != BTV_SEC_ENCRYPT_QUEUED))
+        return 0;
+    security->submitted = 1;
+    security->started = now;
+    security->state = security->state == BTV_SEC_AUTH_QUEUED ?
+                      BTV_SEC_AUTH_WAIT : BTV_SEC_ENCRYPT_WAIT;
+    return 1;
+}
+
+int btv_hci_security_usb_done(btv_hci_security *security, int success)
+{
+    if (security == 0 || !security->submitted || security->usb_done ||
+        (security->state != BTV_SEC_AUTH_WAIT &&
+         security->state != BTV_SEC_ENCRYPT_WAIT))
+        return 0;
+    security->usb_done = 1;
+    if (!success) return recover(security, BTV_SEC_USB_ERROR);
+    advance(security);
+    return 1;
+}
+
+int btv_hci_security_event(btv_hci_security *security, const uint8_t *event,
+                           size_t bytes, uint32_t now)
+{
+    size_t expected;
+    uint16_t opcode, handle;
+    btv_hci_security_tick(security, now);
+    if (security == 0 || security->state == BTV_SEC_RECOVER) return -1;
+    if (btv_hci_frame_size(BTV_HCI_EVENT, event, bytes, 255, &expected) !=
+        BTV_HCI_COMPLETE || expected != bytes)
+        return recover(security, BTV_SEC_BAD_EVENT);
+    if (event[0] == 0x10)
+        return recover(security, bytes == 3 ? BTV_SEC_HARDWARE_ERROR :
+                       BTV_SEC_BAD_EVENT);
+    if (event[0] == 0x0f)
+    {
+        if (bytes != 6) return recover(security, BTV_SEC_BAD_EVENT);
+        opcode = read16(event + 4);
+        if (!security->submitted || opcode !=
+            (security->state == BTV_SEC_AUTH_WAIT ? 0x0411 : 0x0413))
+            return 0;
+        if (security->status_seen) return 0;
+        security->status_seen = 1;
+        security->status = event[2];
+        if (event[2] != 0 && security->usb_done)
+        {
+            security->state = BTV_SEC_REJECTED;
+            security->error = BTV_SEC_COMMAND_ERROR;
+        }
+        return 1;
+    }
+    if (security->state != BTV_SEC_AUTH_WAIT &&
+        security->state != BTV_SEC_ENCRYPT_WAIT)
+        return 0;
+    if (event[0] != (security->state == BTV_SEC_AUTH_WAIT ? 0x06 : 0x08))
+        return 0;
+    if (bytes != (security->state == BTV_SEC_AUTH_WAIT ? 5u : 6u))
+        return recover(security, BTV_SEC_BAD_EVENT);
+    handle = read16(event + 3);
+    if (handle != security->handle) return 0;
+    if (!security->submitted || security->event_seen)
+        return recover(security, BTV_SEC_BAD_EVENT);
+    security->event_seen = 1;
+    security->event_status = event[2];
+    if (security->state == BTV_SEC_ENCRYPT_WAIT)
+    {
+        /* BR/EDR reports 1 for E0 and newer controllers may report 2 for
+         * AES-CCM. Both are encrypted; other values are reserved. */
+        if (event[5] > 2) return recover(security, BTV_SEC_BAD_EVENT);
+        security->encrypted = event[5];
+    }
+    advance(security);
+    return 1;
+}
+
+int btv_hci_security_ready(const btv_hci_security *security)
+{
+    return security != 0 && security->state == BTV_SEC_SECURED &&
+           security->encrypted;
+}

@@ -1,0 +1,332 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        bt_sdp_server
+ * Purpose:     A minimal SDP server for the Bluetooth core.  Speakers
+ *              look up the source's records before they answer AVDTP and
+ *              AVCTP, so three are published: the A2DP "Audio Source", and
+ *              the two AVRCP roles (Controller, which sets a speaker's
+ *              absolute volume, and Target, which takes its volume buttons).
+ *              A device that reads the records with ServiceSearch,
+ *              ServiceAttribute or ServiceSearchAttribute gets each one
+ *              that has every UUID of its search pattern.
+ ******************************************************************/
+#include "bt_core.h"
+#include <string.h>
+
+/* A service record: (attribute id, value) pairs in data element form,
+ * ascending by id. */
+
+/* A2DP Audio Source. */
+static const uint8_t record_a2dp[] = {
+    0x09, 0x00, 0x00, 0x0a, 0x00, 0x01, 0x00, 0x00,     /* handle 0x10000 */
+    0x09, 0x00, 0x01, 0x35, 0x03, 0x19, 0x11, 0x0a,     /* class: source */
+    0x09, 0x00, 0x04, 0x35, 0x10,                       /* protocols */
+        0x35, 0x06, 0x19, 0x01, 0x00, 0x09, 0x00, 0x19, /*  L2CAP, PSM 25 */
+        0x35, 0x06, 0x19, 0x00, 0x19, 0x09, 0x01, 0x03, /*  AVDTP 1.3 */
+    0x09, 0x00, 0x05, 0x35, 0x03, 0x19, 0x10, 0x02,     /* public browse */
+    0x09, 0x00, 0x09, 0x35, 0x08,                       /* profile */
+        0x35, 0x06, 0x19, 0x11, 0x0d, 0x09, 0x01, 0x03, /*  A2DP 1.3 */
+    0x09, 0x01, 0x00, 0x25, 0x0d,                       /* name */
+        'R', 'I', 'S', 'C', ' ', 'O', 'S', ' ', 'A', 'u', 'd', 'i', 'o',
+    0x09, 0x03, 0x11, 0x09, 0x00, 0x01                  /* features: player */
+};
+
+/* A/V Remote Control Controller: classes 0x110E and 0x110F, AVCTP 1.3 on
+ * PSM 0x17, profile AVRCP 1.4, supported features Category 1.  (Version
+ * 1.4 is what makes a speaker send absolute volume events; unverified
+ * against a speaker.) */
+static const uint8_t record_avrcp_ct[] = {
+    0x09, 0x00, 0x00, 0x0a, 0x00, 0x01, 0x00, 0x01,     /* handle 0x10001 */
+    0x09, 0x00, 0x01, 0x35, 0x06,                       /* classes */
+        0x19, 0x11, 0x0e, 0x19, 0x11, 0x0f,
+    0x09, 0x00, 0x04, 0x35, 0x10,                       /* protocols */
+        0x35, 0x06, 0x19, 0x01, 0x00, 0x09, 0x00, 0x17, /*  L2CAP, PSM 23 */
+        0x35, 0x06, 0x19, 0x00, 0x17, 0x09, 0x01, 0x03, /*  AVCTP 1.3 */
+    0x09, 0x00, 0x05, 0x35, 0x03, 0x19, 0x10, 0x02,     /* public browse */
+    0x09, 0x00, 0x09, 0x35, 0x08,                       /* profile */
+        0x35, 0x06, 0x19, 0x11, 0x0e, 0x09, 0x01, 0x04, /*  AVRCP 1.4 */
+    0x09, 0x01, 0x00, 0x25, 0x0e,                       /* name */
+        'R', 'I', 'S', 'C', ' ', 'O', 'S', ' ', 'R', 'e', 'm', 'o', 't', 'e',
+    0x09, 0x03, 0x11, 0x09, 0x00, 0x01                  /* features: cat 1 */
+};
+
+/* A/V Remote Control Target: class 0x110C, the same transport. */
+static const uint8_t record_avrcp_tg[] = {
+    0x09, 0x00, 0x00, 0x0a, 0x00, 0x01, 0x00, 0x02,     /* handle 0x10002 */
+    0x09, 0x00, 0x01, 0x35, 0x03, 0x19, 0x11, 0x0c,     /* class: target */
+    0x09, 0x00, 0x04, 0x35, 0x10,                       /* protocols */
+        0x35, 0x06, 0x19, 0x01, 0x00, 0x09, 0x00, 0x17,
+        0x35, 0x06, 0x19, 0x00, 0x17, 0x09, 0x01, 0x03,
+    0x09, 0x00, 0x05, 0x35, 0x03, 0x19, 0x10, 0x02,
+    0x09, 0x00, 0x09, 0x35, 0x08,
+        0x35, 0x06, 0x19, 0x11, 0x0e, 0x09, 0x01, 0x04,
+    0x09, 0x01, 0x00, 0x25, 0x0e,
+        'R', 'I', 'S', 'C', ' ', 'O', 'S', ' ', 'R', 'e', 'm', 'o', 't', 'e',
+    0x09, 0x03, 0x11, 0x09, 0x00, 0x01
+};
+
+typedef struct sdp_record
+{
+    uint32_t handle;
+    const uint8_t *data;
+    size_t bytes;
+    uint16_t uuids[8];       /* every UUID a search pattern may name */
+    unsigned int uuid_count;
+} sdp_record;
+
+static const sdp_record records[] = {
+    { 0x00010000u, record_a2dp, sizeof record_a2dp,
+      { 0x110a, 0x0100, 0x0019, 0x1002, 0x110d }, 5 },
+    { 0x00010001u, record_avrcp_ct, sizeof record_avrcp_ct,
+      { 0x110e, 0x110f, 0x0100, 0x0017, 0x1002 }, 5 },
+    { 0x00010002u, record_avrcp_tg, sizeof record_avrcp_tg,
+      { 0x110c, 0x110e, 0x0100, 0x0017, 0x1002 }, 5 }
+};
+#define RECORD_COUNT (sizeof records / sizeof records[0])
+
+static uint16_t read16(const uint8_t *p)
+{
+    return (uint16_t)((p[0] << 8) | p[1]);
+}
+
+static uint32_t read32(const uint8_t *p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) | p[3];
+}
+
+/* Reads a data element sequence header: returns the body offset and
+ * sets *length, or 0 if malformed. */
+static size_t sequence(const uint8_t *p, size_t bytes, size_t *length)
+{
+    if (bytes < 2 || (p[0] & 0xf8u) != 0x30) return 0;
+    switch (p[0] & 7u)
+    {
+    case 5: *length = p[1]; return (size_t)*length + 2u <= bytes ? 2 : 0;
+    case 6:
+        if (bytes < 3) return 0;
+        *length = read16(p + 1);
+        return *length + 3u <= bytes ? 3 : 0;
+    default: return 0;
+    }
+}
+
+/* Does the record have every UUID the search pattern names? */
+static int pattern_matches(const sdp_record *r, const uint8_t *p, size_t bytes)
+{
+    size_t offset = 0;
+    int any = 0;
+    while (offset < bytes)
+    {
+        uint32_t uuid;
+        unsigned int index;
+        int found = 0;
+        if (p[offset] == 0x19 && offset + 3 <= bytes)
+        {
+            uuid = read16(p + offset + 1);
+            offset += 3;
+        }
+        else if (p[offset] == 0x1a && offset + 5 <= bytes)
+        {
+            uuid = read32(p + offset + 1);
+            offset += 5;
+        }
+        else if (p[offset] == 0x1c && offset + 17 <= bytes)
+        {
+            /* Only base-UUID 128-bit forms of 16-bit UUIDs. */
+            uuid = read32(p + offset + 1);
+            offset += 17;
+        }
+        else
+            return 0;
+        for (index = 0; index < r->uuid_count; ++index)
+            if (uuid == r->uuids[index]) found = 1;
+        if (!found) return 0;
+        any = 1;
+    }
+    return any;
+}
+
+static int wanted(uint16_t id, const uint8_t *list, size_t bytes)
+{
+    size_t offset = 0;
+    while (offset < bytes)
+    {
+        if (list[offset] == 0x09 && offset + 3 <= bytes)
+        {
+            if (read16(list + offset + 1) == id) return 1;
+            offset += 3;
+        }
+        else if (list[offset] == 0x0a && offset + 5 <= bytes)
+        {
+            if (id >= read16(list + offset + 1) &&
+                id <= read16(list + offset + 3))
+                return 1;
+            offset += 5;
+        }
+        else
+            return 0;
+    }
+    return 0;
+}
+
+/* The record's attributes filtered by an id list, as a sequence. */
+static size_t attributes(const sdp_record *r, uint8_t *out, size_t capacity,
+                         const uint8_t *list, size_t list_bytes)
+{
+    const uint8_t *record = r->data;
+    size_t offset = 0, used = 2;
+    while (offset < r->bytes)
+    {
+        uint16_t id = read16(record + offset + 1);
+        size_t value = offset + 3, size, next;
+        uint8_t d = record[value];
+        /* Element size: fixed types or sized sequences/strings here. */
+        if (d == 0x09) size = 3;
+        else if (d == 0x0a) size = 5;
+        else if (d == 0x19) size = 3;
+        else size = 2u + record[value + 1];
+        next = value + size;
+        if (wanted(id, list, list_bytes))
+        {
+            if (used + (next - offset) > capacity) return 0;
+            memcpy(out + used, record + offset, next - offset);
+            used += next - offset;
+        }
+        offset = next;
+    }
+    out[0] = 0x35;
+    out[1] = (uint8_t)(used - 2);
+    return used;
+}
+
+#define OUT_BYTES 600
+
+static void reply(btc_core *core, int channel, uint8_t pdu,
+                  const uint8_t *request, const uint8_t *body, size_t bytes)
+{
+    uint8_t out[OUT_BYTES + 8];
+    if (bytes + 6 > sizeof(out)) return;
+    out[0] = pdu;
+    out[1] = request[1];
+    out[2] = request[2];
+    out[3] = (uint8_t)(bytes >> 8);
+    out[4] = (uint8_t)bytes;
+    memcpy(out + 5, body, bytes);
+    (void)btc_l2cap_send(core, channel, out, bytes + 5);
+}
+
+static void error(btc_core *core, int channel, const uint8_t *request,
+                  uint16_t code)
+{
+    uint8_t body[2];
+    body[0] = (uint8_t)(code >> 8);
+    body[1] = (uint8_t)code;
+    reply(core, channel, 0x01, request, body, 2);
+}
+
+void btc_sdp_server_request(btc_core *core, int channel,
+                            const uint8_t *p, size_t bytes)
+{
+    uint8_t body[OUT_BYTES];
+    size_t offset, length, header, used;
+    unsigned int index;
+    if (bytes < 5) return;
+    offset = 5;
+    switch (p[0])
+    {
+    case 0x02: /* ServiceSearch */
+    {
+        unsigned int match = 0;
+        header = sequence(p + offset, bytes - offset, &length);
+        if (header == 0) { error(core, channel, p, 3); return; }
+        used = 4;
+        for (index = 0; index < RECORD_COUNT; ++index)
+            if (pattern_matches(&records[index], p + offset + header, length))
+            {
+                body[used++] = (uint8_t)(records[index].handle >> 24);
+                body[used++] = (uint8_t)(records[index].handle >> 16);
+                body[used++] = (uint8_t)(records[index].handle >> 8);
+                body[used++] = (uint8_t)records[index].handle;
+                ++match;
+            }
+        body[0] = 0; body[1] = (uint8_t)match;     /* total */
+        body[2] = 0; body[3] = (uint8_t)match;     /* current */
+        body[used++] = 0;                          /* no continuation */
+        reply(core, channel, 0x03, p, body, used);
+        return;
+    }
+    case 0x04: /* ServiceAttribute */
+    {
+        size_t list;
+        const sdp_record *r = 0;
+        if (bytes < offset + 6) { error(core, channel, p, 3); return; }
+        for (index = 0; index < RECORD_COUNT; ++index)
+            if (read32(p + offset) == records[index].handle)
+                r = &records[index];
+        if (r == 0)
+        {
+            error(core, channel, p, 2);            /* bad handle */
+            return;
+        }
+        offset += 6;                               /* handle, max bytes */
+        header = sequence(p + offset, bytes - offset, &length);
+        if (header == 0) { error(core, channel, p, 3); return; }
+        list = attributes(r, body + 2, sizeof(body) - 3,
+                          p + offset + header, length);
+        body[0] = (uint8_t)(list >> 8);
+        body[1] = (uint8_t)list;
+        body[2 + list] = 0;
+        reply(core, channel, 0x05, p, body, list + 3);
+        return;
+    }
+    case 0x06: /* ServiceSearchAttribute */
+    {
+        const uint8_t *pattern;
+        size_t pattern_bytes, list = 2;
+        header = sequence(p + offset, bytes - offset, &length);
+        if (header == 0) { error(core, channel, p, 3); return; }
+        pattern = p + offset + header;
+        pattern_bytes = length;
+        offset += header + length + 2;             /* max bytes */
+        if (offset > bytes) { error(core, channel, p, 3); return; }
+        header = sequence(p + offset, bytes - offset, &length);
+        if (header == 0) { error(core, channel, p, 3); return; }
+        /* A sequence of one attribute list per matching record. */
+        for (index = 0; index < RECORD_COUNT; ++index)
+        {
+            size_t one;
+            if (!pattern_matches(&records[index], pattern, pattern_bytes))
+                continue;
+            one = attributes(&records[index], body + 2 + list,
+                             sizeof(body) - 3 - list, p + offset + header,
+                             length);
+            if (one == 0) break;                   /* does not fit */
+            list += one;
+        }
+        /* The outer sequence: 0x36 and a 16-bit length once it passes 255. */
+        if (list - 2 > 255)
+        {
+            memmove(body + 2 + 3, body + 2 + 2, list - 2);
+            body[2] = 0x36;
+            body[3] = (uint8_t)((list - 2) >> 8);
+            body[4] = (uint8_t)(list - 2);
+            list += 1;
+        }
+        else
+        {
+            body[2] = 0x35;
+            body[3] = (uint8_t)(list - 2);
+        }
+        body[0] = (uint8_t)(list >> 8);
+        body[1] = (uint8_t)list;
+        body[2 + list] = 0;
+        reply(core, channel, 0x07, p, body, list + 3);
+        return;
+    }
+    default:
+        error(core, channel, p, 3);                /* invalid syntax */
+        return;
+    }
+}

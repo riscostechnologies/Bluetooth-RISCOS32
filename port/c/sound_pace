@@ -1,0 +1,48 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        sound_pace
+ * Purpose:     See sound_pace.h.  Kept apart from sound_device so the
+ *              arithmetic can be tested on the host.
+ ******************************************************************/
+#include "sound_pace.h"
+
+void btv_sound_pace_start(btv_sound_pace *pace, uint32_t frames,
+                          uint32_t buffers)
+{
+    pace->credit = frames * buffers;
+    pace->remainder = 0;
+    pace->primed = (uint8_t)(frames != 0);
+}
+
+void btv_sound_pace_tick(btv_sound_pace *pace, uint32_t elapsed,
+                         uint32_t rate, uint32_t frames, uint32_t cap)
+{
+    uint32_t owed;
+    if (frames != 0 && !pace->primed)
+    {
+        /* SoundDMA only says how big its buffers are when it enables
+         * them, which is after registration. */
+        btv_sound_pace_start(pace, frames, cap / 2u ? cap / 2u : 1u);
+        return;
+    }
+    if (elapsed > 1000u) elapsed = 1000u;     /* a long gap: resynchronise */
+    owed = elapsed * rate + pace->remainder;
+    pace->credit += owed / 1000u;
+    pace->remainder = owed % 1000u;
+    if (frames != 0 && pace->credit > frames * cap)
+        pace->credit = frames * cap;
+}
+
+int btv_sound_pace_take(btv_sound_pace *pace, uint32_t frames)
+{
+    if (frames == 0 || pace->credit < frames) return 0;
+    pace->credit -= frames;
+    return 1;
+}
+
+void btv_sound_pace_idle(btv_sound_pace *pace)
+{
+    pace->credit = 0;
+    pace->remainder = 0;
+}

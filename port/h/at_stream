@@ -1,0 +1,24 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#ifndef BTV_AT_STREAM_H
+#define BTV_AT_STREAM_H
+#include <stddef.h>
+#include <stdint.h>
+typedef struct btv_at_stream {
+    char line[257];
+    size_t used;
+    unsigned int ready, failed;
+} btv_at_stream;
+/* CR-terminated printable ASCII command collector. Leading/inter-command LF
+ * is tolerated; LF inside a command is invalid. No grammar/case conversion.
+ * One serialized owner. Invalid byte or >256 characters fails closed until
+ * a new session; never interpret a suffix of a truncated command. */
+void btv_at_stream_init(btv_at_stream *stream);
+/* Returns consumed input bytes. Stops after one nonempty complete line and
+ * retains it until take. Caller retains all unconsumed input, including when
+ * ready/failed. On error the offending byte is included in consumed count. */
+size_t btv_at_stream_feed(btv_at_stream *stream, const uint8_t *data, size_t bytes);
+/* Borrowed NUL-terminated command excludes CR; valid until take/reinit. */
+const char *btv_at_stream_line(const btv_at_stream *stream);
+int btv_at_stream_take(btv_at_stream *stream);
+#endif

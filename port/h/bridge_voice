@@ -1,0 +1,59 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#ifndef BTV_BRIDGE_VOICE_H
+#define BTV_BRIDGE_VOICE_H
+#include "bridge_controller.h"
+#include "bridge_sdp.h"
+#include "bridge_rfcomm.h"
+#include "hfp_link.h"
+#include "bridge_sco.h"
+
+enum btv_bridge_voice_state
+{
+    BTV_BV_IDLE, BTV_BV_DISCOVERING, BTV_BV_RFCOMM, BTV_BV_HFP,
+    BTV_BV_READY, BTV_BV_AUDIO_SETUP, BTV_BV_AUDIO_RUNNING,
+    BTV_BV_AUDIO_DRAINING, BTV_BV_AUDIO_DISCONNECTING,
+    BTV_BV_CLOSING_RFCOMM, BTV_BV_DRAINING_ACL,
+    BTV_BV_DISCONNECTING, BTV_BV_CLOSING_CONTROLLER,
+    BTV_BV_DONE, BTV_BV_FAILED
+};
+
+typedef struct btv_bridge_voice
+{
+    btv_bridge_controller *controller;
+    btv_bridge_acl acl;
+    btv_bridge_sdp discovery;
+    btv_bridge_rfcomm rfcomm;
+    btv_hfp_link hfp;
+    btv_sco_link sco_link;
+    btv_bridge_sco audio;
+    btv_sco_parameters audio_parameters;
+    btv_sdp_service service;
+    uint8_t indicators[7];
+    uint32_t input_bytes, input_packets, output_bytes, output_packets;
+    uint16_t transmit_mtu;
+    uint8_t alternate, audio_cancel, audio_failed;
+    unsigned int state, error;
+} btv_bridge_voice;
+
+/* Start HFP service discovery on an already authenticated and encrypted ACL
+ * link. This object then exclusively owns controller events and ACL traffic. */
+int btv_bridge_voice_start(btv_bridge_voice *voice,
+                           btv_bridge_controller *controller,
+                           const uint8_t indicators[7], uint32_t now);
+int btv_bridge_voice_pump(btv_bridge_voice *voice, uint32_t now);
+int btv_bridge_voice_close(btv_bridge_voice *voice, uint32_t now);
+int btv_bridge_voice_update(btv_bridge_voice *voice,
+                            const uint8_t indicators[7]);
+int btv_bridge_voice_start_audio(btv_bridge_voice *voice,
+                         const btv_sco_parameters *parameters,
+                         uint8_t alternate, uint16_t transmit_mtu,
+                         uint32_t input_bytes, uint32_t input_packets,
+                         uint32_t output_bytes, uint32_t output_packets,
+                         uint32_t now);
+int btv_bridge_voice_write(btv_bridge_voice *voice,
+                           const uint8_t *audio, size_t bytes);
+int btv_bridge_voice_read(btv_bridge_voice *voice, uint8_t *audio,
+                          size_t capacity, btv_sco_packet_info *info);
+
+#endif

@@ -1,0 +1,242 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        btsettings
+ * Purpose:     Reads and writes the Bluetooth desktop choices.
+ ******************************************************************/
+#include "btsettings.h"
+#include <kernel.h>
+#include <swis.h>
+#include <ctype.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define CHOICES_READ "Choices:Bluetooth.Settings"
+
+/* Normally the choices are read through the Choices path.  A test (or
+ * someone diagnosing a machine) can point this at another file with the
+ * system variable Bluetooth$ChoicesFile. */
+static const char *choices_read(void)
+{
+    const char *path = getenv("Bluetooth$ChoicesFile");
+    return path != NULL && path[0] != '\0' ? path : CHOICES_READ;
+}
+#define TASK_LEAF "Boot.Tasks.Bluetooth"
+#define PREDESK_LEAF "Boot.PreDesk.Bluetooth"
+#define OBEY_TYPE 0xfeb
+#define TEXT_TYPE 0xfff
+
+void bt_settings_default(bt_settings *settings)
+{
+    memset(settings, 0, sizeof(*settings));
+    strcpy(settings->pin, "0000");
+    settings->system_sound = 1;
+}
+
+static int yes(const char *value)
+{
+    return value[0] == 'y' || value[0] == 'Y' || value[0] == '1';
+}
+
+static void copy_field(char *destination, size_t capacity, const char *value)
+{
+    strncpy(destination, value, capacity - 1);
+    destination[capacity - 1] = '\0';
+}
+
+void bt_settings_load(bt_settings *settings)
+{
+    char line[128];
+    FILE *file;
+    bt_settings_default(settings);
+    file = fopen(choices_read(), "r");
+    if (file == NULL) return;
+    while (fgets(line, sizeof(line), file) != NULL)
+    {
+        char *key = line, *value, *end;
+        /* A file written by *Echo redirection ends its lines LF then CR,
+         * so every line after the first starts with a stray control
+         * character: skip anything before the key. */
+        while (*key != '\0' && (unsigned char)*key <= ' ') ++key;
+        value = strchr(key, ':');
+        if (*key == '#' || value == NULL) continue;
+        *value++ = '\0';
+        while (*value == ' ') ++value;
+        end = value + strlen(value);
+        while (end > value && (unsigned char)end[-1] <= ' ') *--end = '\0';
+        if (strcmp(key, "Address") == 0)
+        {
+            if (bt_settings_address_valid(value))
+                copy_field(settings->address, sizeof(settings->address), value);
+        }
+        else if (strcmp(key, "Name") == 0)
+            copy_field(settings->name, sizeof(settings->name), value);
+        else if (strcmp(key, "PIN") == 0)
+            copy_field(settings->pin, sizeof(settings->pin), value);
+        else if (strcmp(key, "SystemSound") == 0)
+            settings->system_sound = yes(value);
+        else if (strcmp(key, "ConnectAtStart") == 0)
+            settings->connect_at_start = yes(value);
+        else if (strcmp(key, "LoadUSBDrivers") == 0)
+            settings->load_usb_drivers = yes(value);
+    }
+    fclose(file);
+}
+
+static const char *choices_write(void)
+{
+    const char *root = getenv("Choices$Write");
+    return root != NULL && root[0] != '\0' ? root : NULL;
+}
+
+static int ensure_directory(const char *path)
+{
+    _kernel_swi_regs regs;
+    memset(&regs, 0, sizeof(regs));
+    regs.r[0] = 8; /* OS_File: create directory */
+    regs.r[1] = (int)path;
+    return _kernel_swi(OS_File, &regs, &regs) == NULL;
+}
+
+static void set_type(const char *path, int type)
+{
+    _kernel_swi_regs regs;
+    memset(&regs, 0, sizeof(regs));
+    regs.r[0] = 18;
+    regs.r[1] = (int)path;
+    regs.r[2] = type;
+    (void)_kernel_swi(OS_File, &regs, &regs);
+}
+
+int bt_settings_save(const bt_settings *settings)
+{
+    const char *root = choices_write();
+    char path[256];
+    FILE *file;
+    if (root == NULL) return 0;
+    snprintf(path, sizeof(path), "%s.Bluetooth", root);
+    if (!ensure_directory(path)) return 0;
+    snprintf(path, sizeof(path), "%s.Bluetooth.Settings", root);
+    file = fopen(path, "w");
+    if (file == NULL) return 0;
+    fprintf(file, "# Bluetooth choices, written by Configure\n");
+    fprintf(file, "Address: %s\n", settings->address);
+    fprintf(file, "Name: %s\n", settings->name);
+    fprintf(file, "PIN: %s\n", settings->pin);
+    fprintf(file, "SystemSound: %s\n", settings->system_sound ? "yes" : "no");
+    fprintf(file, "ConnectAtStart: %s\n",
+            settings->connect_at_start ? "yes" : "no");
+    fprintf(file, "LoadUSBDrivers: %s\n",
+            settings->load_usb_drivers ? "yes" : "no");
+    if (fclose(file) != 0) return 0;
+    set_type(path, TEXT_TYPE);
+    return 1;
+}
+
+static int hex_digit(int character)
+{
+    if (character >= '0' && character <= '9') return character - '0';
+    character = tolower(character);
+    if (character >= 'a' && character <= 'f') return character - 'a' + 10;
+    return -1;
+}
+
+int bt_settings_parse_address(const char *address, unsigned char bytes[6])
+{
+    int index;
+    if (strlen(address) != 17) return 0;
+    for (index = 0; index < 6; ++index)
+    {
+        const char *field = address + index * 3;
+        int high = hex_digit(field[0]), low = hex_digit(field[1]);
+        if (high < 0 || low < 0) return 0;
+        if (index < 5 && field[2] != ':') return 0;
+        bytes[index] = (unsigned char)(high << 4 | low);
+    }
+    return 1;
+}
+
+int bt_settings_address_valid(const char *address)
+{
+    unsigned char bytes[6];
+    return address[0] == '\0' || bt_settings_parse_address(address, bytes);
+}
+
+static int choices_path(const char *leaf, char *path, size_t capacity)
+{
+    const char *root = choices_write();
+    if (root == NULL) return 0;
+    snprintf(path, capacity, "%s.%s", root, leaf);
+    return 1;
+}
+
+static int file_exists(const char *leaf)
+{
+    char path[256];
+    _kernel_swi_regs regs;
+    if (!choices_path(leaf, path, sizeof(path))) return 0;
+    memset(&regs, 0, sizeof(regs));
+    regs.r[0] = 17; /* read catalogue information, no path */
+    regs.r[1] = (int)path;
+    if (_kernel_swi(OS_File, &regs, &regs) != NULL) return 0;
+    return regs.r[0] == 1;
+}
+
+int bt_settings_start_with_desktop(void)
+{
+    return file_exists(TASK_LEAF);
+}
+
+/* Writes (or deletes) an Obey file under Choices, creating Boot.<dir>. */
+static int set_boot_entry(const char *subdirectory, const char *leaf,
+                          int enabled, const char *const *lines)
+{
+    const char *root = choices_write();
+    char path[256], directory[256];
+    FILE *file;
+    _kernel_swi_regs regs;
+    if (root == NULL || !choices_path(leaf, path, sizeof(path))) return 0;
+    if (!enabled)
+    {
+        if (!file_exists(leaf)) return 1;
+        memset(&regs, 0, sizeof(regs));
+        regs.r[0] = 6; /* delete */
+        regs.r[1] = (int)path;
+        return _kernel_swi(OS_File, &regs, &regs) == NULL;
+    }
+    snprintf(directory, sizeof(directory), "%s.Boot", root);
+    (void)ensure_directory(directory);
+    snprintf(directory, sizeof(directory), "%s.Boot.%s", root, subdirectory);
+    (void)ensure_directory(directory);
+    file = fopen(path, "w");
+    if (file == NULL) return 0;
+    for (; *lines != NULL; ++lines) fprintf(file, "%s\n", *lines);
+    if (fclose(file) != 0) return 0;
+    set_type(path, OBEY_TYPE);
+    return 1;
+}
+
+int bt_settings_load_usb_at_start(void)
+{
+    return file_exists(PREDESK_LEAF);
+}
+
+int bt_settings_set_load_usb_at_start(int enabled)
+{
+    /* The icon bar task honours LoadUSBDrivers after checking for an
+     * adapter. Remove the legacy PreDesk entry, which swapped USBDriver
+     * before that check and could take down the machine during boot. */
+    (void)enabled;
+    return set_boot_entry("PreDesk", PREDESK_LEAF, 0, NULL);
+}
+
+int bt_settings_set_start_with_desktop(int enabled)
+{
+    static const char *const lines[] = {
+        "| Start the Bluetooth icon bar task (set by Configure)",
+        "IfThere BootResources:!Bluetooth Then Filer_Run BootResources:!Bluetooth",
+        NULL
+    };
+    return set_boot_entry("Tasks", TASK_LEAF, enabled, lines);
+}

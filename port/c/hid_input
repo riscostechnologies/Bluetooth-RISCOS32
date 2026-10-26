@@ -1,0 +1,338 @@
+/*******************************************************************
+ * File:        hid_input
+ * Purpose:     Boot-protocol HID keyboard and mouse reports to RISC OS
+ *              key numbers and pointer movement, without SWIs.
+ *
+ * The key table and the event order are ported from RISC OS 5's
+ * USBDriver, build/c/usbkboard and build/c/usbmouse:
+ *
+ *   Copyright 2003 Tematic Ltd
+ *   Licensed under the Apache License, Version 2.0 (the "License");
+ *   you may not use this file except in compliance with the License.
+ *   You may obtain a copy of the License at
+ *       http://www.apache.org/licenses/LICENSE-2.0
+ *   Unless required by applicable law or agreed to in writing, software
+ *   distributed under the License is distributed on an "AS IS" BASIS,
+ *   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+ *   implied.  See the License for the specific language governing
+ *   permissions and limitations under the License.
+ *
+ * Differences from usbkboard: the key-down set is a byte bitmap indexed
+ * by shifts (no division); release_all also lifts held modifiers, which
+ * usbkboard's detach_keyboard leaves down; forget also forgets modifiers
+ * so KeyV_EnableDrivers re-sends them.
+ ******************************************************************/
+#include "hid_input.h"
+#include <string.h>
+
+#define NONE 0xFFu
+#define KEYCODES 6u
+#define ERROR_ROLLOVER 0x01u
+#define MODIFIER_USAGE 0xE0u
+
+/* HID keyboard usage -> low-level key number (PRM 1-156).  Index is the
+ * usage; 0xE0-0xE7 are the modifier bits 0-7 of byte 0. */
+static const uint8_t usage_to_key[256] = {
+NONE,               NONE,            NONE,             NONE,             /*0*/
+BTV_KEY_LetterA,      BTV_KEY_LetterB,   BTV_KEY_LetterC,    BTV_KEY_LetterD,
+BTV_KEY_LetterE,      BTV_KEY_LetterF,   BTV_KEY_LetterG,    BTV_KEY_LetterH,
+BTV_KEY_LetterI,      BTV_KEY_LetterJ,   BTV_KEY_LetterK,    BTV_KEY_LetterL,
+BTV_KEY_LetterM,      BTV_KEY_LetterN,   BTV_KEY_LetterO,    BTV_KEY_LetterP,    /*1*/
+BTV_KEY_LetterQ,      BTV_KEY_LetterR,   BTV_KEY_LetterS,    BTV_KEY_LetterT,
+BTV_KEY_LetterU,      BTV_KEY_LetterV,   BTV_KEY_LetterW,    BTV_KEY_LetterX,
+BTV_KEY_LetterY,      BTV_KEY_LetterZ,   BTV_KEY_Digit1,     BTV_KEY_Digit2,
+BTV_KEY_Digit3,       BTV_KEY_Digit4,    BTV_KEY_Digit5,     BTV_KEY_Digit6,     /*2*/
+BTV_KEY_Digit7,       BTV_KEY_Digit8,    BTV_KEY_Digit9,     BTV_KEY_Digit0,
+BTV_KEY_Return,       BTV_KEY_Escape,    BTV_KEY_BackSpace,  BTV_KEY_Tab,
+BTV_KEY_Space,        BTV_KEY_Minus,     BTV_KEY_Equals,     BTV_KEY_OpenSquare,
+BTV_KEY_CloseSquare,  BTV_KEY_BackSlash, BTV_KEY_BackSlash,  BTV_KEY_SemiColon,  /*3*/
+BTV_KEY_Tick,         BTV_KEY_BackTick,  BTV_KEY_Comma,      BTV_KEY_Dot,
+BTV_KEY_Slash,        BTV_KEY_CapsLock,  BTV_KEY_Function1,  BTV_KEY_Function2,
+BTV_KEY_Function3,    BTV_KEY_Function4, BTV_KEY_Function5,  BTV_KEY_Function6,
+BTV_KEY_Function7,    BTV_KEY_Function8, BTV_KEY_Function9,  BTV_KEY_Function10, /*4*/
+BTV_KEY_Function11,   BTV_KEY_Function12,BTV_KEY_Print,      BTV_KEY_ScrollLock,
+BTV_KEY_Break,        BTV_KEY_Insert,    BTV_KEY_Home,       BTV_KEY_PageUp,
+BTV_KEY_Delete,       BTV_KEY_Copy,      BTV_KEY_PageDown,   BTV_KEY_CursorRight,
+BTV_KEY_CursorLeft,   BTV_KEY_CursorDown,BTV_KEY_CursorUp,   BTV_KEY_NumLock,    /*5*/
+BTV_KEY_NumPadSlash,  BTV_KEY_NumPadStar,BTV_KEY_NumPadMinus,BTV_KEY_NumPadPlus,
+BTV_KEY_NumPadEnter,  BTV_KEY_NumPad1,   BTV_KEY_NumPad2,    BTV_KEY_NumPad3,
+BTV_KEY_NumPad4,      BTV_KEY_NumPad5,   BTV_KEY_NumPad6,    BTV_KEY_NumPad7,
+BTV_KEY_NumPad8,      BTV_KEY_NumPad9,   BTV_KEY_NumPad0,    BTV_KEY_NumPadDot,  /*6*/
+BTV_KEY_NotFittedLeft,BTV_KEY_Menu,      NONE,             BTV_KEY_NumPadHash,
+NONE,               NONE,            NONE,             NONE,
+NONE,               NONE,            NONE,             NONE,
+NONE,               NONE,            NONE,             NONE,             /*7*/
+NONE,               NONE,            NONE,             NONE,
+NONE,               NONE,            NONE,             NONE,
+NONE,               NONE,            NONE,             NONE,
+NONE,               NONE,            NONE,             NONE,             /*8*/
+NONE,               NONE,            NONE,             BTV_KEY_NotFittedRight,
+BTV_KEY_Kana,         BTV_KEY_Pound,     BTV_KEY_Convert,    BTV_KEY_NoConvert,
+NONE,               NONE,            NONE,             NONE,
+NONE,               NONE,            NONE,             NONE,             /*9*/
+NONE,               NONE,            NONE,             NONE,
+NONE,               NONE,            NONE,             NONE,
+NONE,               NONE,            NONE,             NONE,
+NONE,               NONE,            NONE,             NONE,             /*a*/
+NONE,               NONE,            NONE,             NONE,
+NONE,               NONE,            NONE,             NONE,
+NONE,               NONE,            NONE,             NONE,
+NONE,               NONE,            NONE,             NONE,             /*b*/
+NONE,               NONE,            NONE,             NONE,
+NONE,               NONE,            NONE,             NONE,
+NONE,               NONE,            NONE,             NONE,
+NONE,               NONE,            NONE,             NONE,             /*c*/
+NONE,               NONE,            NONE,             NONE,
+NONE,               NONE,            NONE,             NONE,
+NONE,               NONE,            NONE,             NONE,
+NONE,               NONE,            NONE,             NONE,             /*d*/
+NONE,               NONE,            NONE,             NONE,
+NONE,               NONE,            NONE,             NONE,
+NONE,               NONE,            NONE,             NONE,
+BTV_KEY_CtrlLeft,     BTV_KEY_ShiftLeft, BTV_KEY_AltLeft,    BTV_KEY_AcornLeft,  /*e*/
+BTV_KEY_CtrlRight,    BTV_KEY_ShiftRight,BTV_KEY_AltRight,   BTV_KEY_AcornRight,
+NONE,               NONE,            NONE,             NONE,
+NONE,               NONE,            NONE,             NONE,
+NONE,               NONE,            NONE,             NONE,             /*f*/
+NONE,               NONE,            NONE,             NONE,
+NONE,               NONE,            NONE,             NONE,
+NONE,               NONE,            NONE,             NONE
+};
+
+int btv_hid_key_number(unsigned int usage)
+{
+    if (usage > 0xFFu || usage_to_key[usage] == NONE) return -1;
+    return (int)usage_to_key[usage];
+}
+
+static void emit_key(const btv_hid_sink *sink, int down, unsigned int key)
+{
+    if (sink != NULL && sink->key != NULL)
+        sink->key(sink->context, down, key);
+}
+
+void btv_hid_keyboard_init(btv_hid_keyboard *k)
+{
+    memset(k, 0, sizeof(*k));
+}
+
+void btv_hid_keyboard_forget(btv_hid_keyboard *k)
+{
+    k->last[0] = 0;
+    memset(k->down, 0, sizeof(k->down));
+}
+
+void btv_hid_keyboard_report(btv_hid_keyboard *k, const uint8_t *report,
+                             size_t bytes, const btv_hid_sink *sink)
+{
+    uint8_t now[16];
+    unsigned int index, key, bit, changed;
+    if (report == NULL || bytes < 8u) return;
+    /* usbkboard ignores the whole report in the phantom state. */
+    if (report[2] == ERROR_ROLLOVER) return;
+
+    /* Each modifier bit that changed. */
+    changed = (unsigned int)(report[0] ^ k->last[0]);
+    for (index = 0; index < 8u; ++index)
+    {
+        if (changed & (1u << index))
+            emit_key(sink, (report[0] >> index) & 1u,
+                     usage_to_key[MODIFIER_USAGE + index]);
+    }
+
+    /* Build the new set first, then report keys not previously down. */
+    memset(now, 0, sizeof(now));
+    for (index = 0; index < KEYCODES; ++index)
+    {
+        key = usage_to_key[report[2u + index]];
+        if (key >= 128u) continue; /* NONE */
+        bit = 1u << (key & 7u);
+        /* A key repeated within the report is reported once. */
+        if (((now[key >> 3] | k->down[key >> 3]) & bit) == 0)
+            emit_key(sink, 1, key);
+        now[key >> 3] |= (uint8_t)bit;
+    }
+
+    /* Keys previously down that are no longer reported. */
+    for (index = 0; index < 128u; ++index)
+    {
+        if ((k->down[index >> 3] & ~now[index >> 3]) & (1u << (index & 7u)))
+            emit_key(sink, 0, index);
+    }
+
+    memcpy(k->down, now, sizeof(now));
+    memcpy(k->last, report, sizeof(k->last));
+}
+
+void btv_hid_keyboard_release_all(btv_hid_keyboard *k,
+                                  const btv_hid_sink *sink)
+{
+    unsigned int index;
+    for (index = 0; index < 8u; ++index)
+    {
+        if (k->last[0] & (1u << index))
+            emit_key(sink, 0, usage_to_key[MODIFIER_USAGE + index]);
+    }
+    for (index = 0; index < 128u; ++index)
+    {
+        if (k->down[index >> 3] & (1u << (index & 7u)))
+            emit_key(sink, 0, index);
+    }
+    btv_hid_keyboard_init(k);
+}
+
+uint8_t btv_hid_keyboard_leds(unsigned int riscos_led_flags)
+{
+    uint8_t leds = 0;
+    if (riscos_led_flags & BTV_RISCOS_LED_NUM) leds |= BTV_HID_LED_NUM;
+    if (riscos_led_flags & BTV_RISCOS_LED_CAPS) leds |= BTV_HID_LED_CAPS;
+    if (riscos_led_flags & BTV_RISCOS_LED_SCROLL) leds |= BTV_HID_LED_SCROLL;
+    return leds;
+}
+
+void btv_hid_mouse_init(btv_hid_mouse *m)
+{
+    memset(m, 0, sizeof(*m));
+    m->opt.scale_q8 = 256;
+    m->opt.accel = 1;
+    m->opt.hscroll = 1;
+    m->opt.wheel_unit = 1;
+}
+
+int32_t btv_hid_accel_q8(int32_t counts)
+{
+    int32_t a = counts < 0 ? -counts : counts, extra;
+    if (a <= 3) return 256;
+    extra = (a - 3) * 16;
+    return 256 + (extra > 256 ? 256 : extra);
+}
+
+int32_t btv_hid_scale(int32_t d, int32_t gain_q8, int32_t *rem)
+{
+    int32_t v = d * gain_q8 + *rem, out;
+    out = v >= 0 ? (v >> 8) : -((-v) >> 8);
+    *rem = v - out * 256;
+    return out;
+}
+
+int32_t btv_hid_steps(int32_t counts, int32_t unit, int32_t *rem)
+{
+    int32_t v = counts + *rem, out = 0;
+    if (unit <= 1)
+    {
+        *rem = 0;
+        return counts;
+    }
+    while (v >= unit) { v -= unit; ++out; }
+    while (v <= -unit) { v += unit; --out; }
+    *rem = v;
+    return out;
+}
+
+/* Sign-extend a HID 8-bit relative value. */
+static int relative(uint8_t value)
+{
+    return value >= 0x80u ? (int)value - 0x100 : (int)value;
+}
+
+/* usbmouse process_buttons: bit 0 LeftMouse, bit 1 RightMouse, bit 2
+ * CentreMouse; higher bits travel with the wheel reason. */
+static void buttons_changed(btv_hid_mouse *m, uint8_t buttons, int dz,
+                            int dw, const btv_hid_sink *sink)
+{
+    static const uint8_t keys[3] = {
+        BTV_KEY_LeftMouse, BTV_KEY_RightMouse, BTV_KEY_CentreMouse
+    };
+    unsigned int index, change = (unsigned int)(m->buttons ^ buttons);
+    m->buttons = buttons;
+    for (index = 0; index < 3u; ++index)
+    {
+        if (change & (1u << index))
+            emit_key(sink, (buttons >> index) & 1u, keys[index]);
+    }
+    if ((dz != 0 || dw != 0 || (change & ~7u) != 0) &&
+        sink != NULL && sink->wheel != NULL)
+        sink->wheel(sink->context, dz, dw, (unsigned int)buttons >> 3);
+}
+
+/* Unscaled: what a boot-protocol report means. */
+static void mouse_raw(btv_hid_mouse *m, uint32_t buttons, int32_t dx,
+                      int32_t dy, int32_t wheel, int32_t pan,
+                      const btv_hid_sink *sink)
+{
+    if ((dx != 0 || dy != 0) && sink != NULL && sink->pointer != NULL)
+        sink->pointer(sink->context, (int)dx, (int)-dy);
+    buttons_changed(m, (uint8_t)(buttons & 0xffu), (int)-wheel, (int)pan, sink);
+}
+
+void btv_hid_mouse_event(btv_hid_mouse *m, uint32_t buttons, int32_t dx,
+                         int32_t dy, int32_t wheel, int32_t pan,
+                         const btv_hid_sink *sink)
+{
+    int32_t gain = m->opt.scale_q8, mx, my, sx, sy;
+    if (m->opt.accel)
+    {
+        int32_t ax = dx < 0 ? -dx : dx, ay = dy < 0 ? -dy : dy;
+        gain = (gain * btv_hid_accel_q8(ax > ay ? ax : ay)) >> 8;
+    }
+    {
+        /* Extra buttons that start an application: on the press only, and
+         * not passed on as a click. */
+        uint32_t mapped = m->opt.mapped & ~7u, pressed, bit;
+        pressed = buttons & mapped & ~m->down_mapped;
+        m->down_mapped = buttons & mapped;
+        buttons &= ~mapped;
+        for (bit = 3; pressed != 0 && bit < 32; ++bit)
+            if ((pressed >> bit) & 1u)
+            {
+                if (sink != NULL && sink->launch != NULL)
+                    sink->launch(sink->context, bit + 1u);
+                pressed &= ~(1u << bit);
+            }
+    }
+    mx = btv_hid_scale(dx, gain, &m->rem_x);
+    my = btv_hid_scale(dy, gain, &m->rem_y);
+    sx = btv_hid_steps(wheel, m->opt.wheel_unit, &m->rem_wheel);
+    sy = btv_hid_steps(pan, m->opt.wheel_unit, &m->rem_pan);
+    if (m->opt.natural) sx = -sx;
+    if (!m->opt.hscroll) sy = 0;
+    mouse_raw(m, buttons, mx, my, sx, sy, sink);
+}
+
+void btv_hid_mouse_report(btv_hid_mouse *m, const uint8_t *report,
+                          size_t bytes, const btv_hid_sink *sink)
+{
+    int dx, dy, dz = 0, dw = 0;
+    if (report == NULL || bytes < 3u) return;
+    dx = relative(report[1]);
+    dy = relative(report[2]);
+    if (bytes >= 4u) dz = relative(report[3]);
+    if (bytes >= 5u && (m->flags & BTV_HID_MOUSE_PAN_BYTE4))
+        dw = relative(report[4]);
+    mouse_raw(m, report[0], dx, dy, dz, dw, sink);
+}
+
+void btv_hid_mouse_release_all(btv_hid_mouse *m, const btv_hid_sink *sink)
+{
+    buttons_changed(m, 0, 0, 0, sink);
+}
+
+unsigned int btv_hid_classic_input(const uint8_t *frame, size_t bytes,
+                                   const uint8_t **payload,
+                                   size_t *payload_bytes)
+{
+    if (frame == NULL || bytes < 2u || frame[0] != BTV_HID_DATA_INPUT ||
+        frame[1] == 0)
+        return 0;
+    if (payload != NULL) *payload = frame + 2;
+    if (payload_bytes != NULL) *payload_bytes = bytes - 2u;
+    return frame[1];
+}
+
+size_t btv_hid_classic_led_frame(uint8_t *frame, uint8_t leds)
+{
+    frame[0] = BTV_HID_DATA_OUTPUT;
+    frame[1] = BTV_HID_BOOT_KEYBOARD;
+    frame[2] = leds;
+    return 3u;
+}

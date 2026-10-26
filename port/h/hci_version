@@ -1,0 +1,25 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#ifndef BTV_HCI_VERSION_H
+#define BTV_HCI_VERSION_H
+#include <stddef.h>
+#include <stdint.h>
+#define BTV_HCI_READ_LOCAL_VERSION 0x1001u
+typedef struct btv_hci_version
+{
+    uint8_t status, hci_version, lmp_version;
+    uint16_t hci_revision, manufacturer, lmp_subversion;
+} btv_hci_version;
+enum btv_hci_version_result
+{
+    BTV_VERSION_INVALID = -1,
+    BTV_VERSION_FAILED = -2,
+    BTV_VERSION_WAIT = 0,
+    BTV_VERSION_READY = 1
+};
+/* Decode one complete USB HCI event, with no H4 prefix. WAIT includes unrelated
+ * events and successful Command Status (which is not the version response).
+ * Invalid/WAIT leave output untouched; FAILED publishes status and zeros all
+ * version fields. A successful reply must have the exact defined length. */
+int btv_hci_version_event(const uint8_t *packet, size_t bytes, btv_hci_version *output);
+#endif

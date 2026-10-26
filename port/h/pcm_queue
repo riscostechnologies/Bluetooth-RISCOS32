@@ -1,0 +1,32 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        pcm_queue
+ * Purpose:     Bounded, whole-frame PCM queue for BluetoothVoice.
+ ******************************************************************/
+#ifndef BTV_PCM_QUEUE_H
+#define BTV_PCM_QUEUE_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+/* All accesses must be serialised by the owner. No caller buffer is retained
+ * by read/write. The storage passed to init remains owned by the queue's owner
+ * and must stay alive until all backend callbacks have been cancelled. */
+typedef struct btv_pcm_queue
+{
+    uint8_t *storage;
+    size_t capacity;
+    size_t frame_bytes;
+    size_t head;
+    size_t used;
+} btv_pcm_queue;
+
+int btv_pcm_init(btv_pcm_queue *queue, void *storage, size_t capacity,
+                 size_t frame_bytes);
+void btv_pcm_clear(btv_pcm_queue *queue);
+size_t btv_pcm_write(btv_pcm_queue *queue, const void *source, size_t bytes);
+size_t btv_pcm_read(btv_pcm_queue *queue, void *destination, size_t bytes);
+size_t btv_pcm_frames(const btv_pcm_queue *queue);
+
+#endif

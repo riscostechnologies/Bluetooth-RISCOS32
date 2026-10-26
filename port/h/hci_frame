@@ -1,0 +1,39 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        hci_frame
+ * Purpose:     Validate HCI packet boundaries on USB transports.
+ ******************************************************************/
+#ifndef BTV_HCI_FRAME_H
+#define BTV_HCI_FRAME_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+enum btv_hci_type
+{
+    BTV_HCI_COMMAND = 1,
+    BTV_HCI_ACL = 2,
+    BTV_HCI_SCO = 3,
+    BTV_HCI_EVENT = 4
+};
+
+enum btv_hci_result
+{
+    BTV_HCI_INVALID = -1,
+    BTV_HCI_MORE = 0,
+    BTV_HCI_COMPLETE = 1
+};
+
+/* USB packets omit the H4 packet-type octet; type is supplied separately.
+ * Frame length is zero until a complete header is available. A complete
+ * frame may have trailing bytes belonging to subsequent frames. */
+int btv_hci_frame_size(unsigned int type, const uint8_t *data, size_t bytes,
+                        size_t maximum_payload, size_t *frame_bytes);
+
+/* Build an HCI command for the USB control endpoint, without an H4 prefix.
+ * Invalid input or insufficient output capacity leaves output untouched. */
+size_t btv_hci_command(uint8_t *output, size_t capacity, uint16_t opcode,
+                       const uint8_t *parameters, size_t parameter_bytes);
+
+#endif

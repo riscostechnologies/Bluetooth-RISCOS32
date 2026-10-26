@@ -1,0 +1,115 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        bt_le
+ * Purpose:     Bluetooth Low Energy input devices: Security Manager
+ *              (LE Secure Connections and legacy pairing, stored keys) and a
+ *              GATT client for HID over GATT, in report mode (the Report
+ *              Map, parsed by hid_report) or boot protocol mode.
+ ******************************************************************/
+#ifndef BTP_LE_H
+#define BTP_LE_H
+
+#include <stddef.h>
+#include <stdint.h>
+#include "hid_input.h"
+#include "hid_report.h"
+#include "hid_extras.h"
+#include "hid_pad.h"
+
+#define BTP_LE_MAX_CHARS 24
+
+enum btp_le_state
+{
+    BTP_LE_IDLE,
+    BTP_LE_ENCRYPTING,       /* with a stored key */
+    BTP_LE_PAIRING,
+    BTP_LE_KEYS,             /* encrypted, receiving keys */
+    BTP_LE_SERVICE,
+    BTP_LE_CHARACTERISTICS,
+    BTP_LE_DESCRIPTORS,
+    BTP_LE_MAP,              /* reading the Report Map */
+    BTP_LE_SUBSCRIBING,
+    BTP_LE_READY,
+    BTP_LE_FAILED
+};
+
+enum btp_smp_step
+{
+    BTP_SMP_NONE, BTP_SMP_RESPONSE, BTP_SMP_RANDOM, BTP_SMP_CONFIRM,
+    BTP_SMP_PEER_RANDOM, BTP_SMP_ENCRYPT,
+    /* LE Secure Connections. */
+    BTP_SMP_SC_RANDOM,       /* collecting random numbers from the controller */
+    BTP_SMP_SC_KEY,          /* sent our public key, waiting for theirs */
+    BTP_SMP_SC_CONFIRM,      /* just works: waiting for their confirm */
+    BTP_SMP_SC_NONCE,        /* just works: sent ours, waiting for theirs */
+    BTP_SMP_SC_ROUND_CONFIRM,/* passkey entry: round confirm */
+    BTP_SMP_SC_ROUND_NONCE,  /* passkey entry: round nonce */
+    BTP_SMP_SC_CHECK         /* waiting for their DHKey check */
+};
+
+/* The Secure Connections working set: only one pairing runs at a time, so
+ * every link shares one (and it is wiped when the pairing ends). */
+typedef struct btp_sc
+{
+    uint8_t owner;               /* link + 1, or 0 when free */
+    uint8_t rand_have, round, passkey_entry;
+    uint32_t passkey;
+    uint8_t rnd[48];             /* private key (32) and nonce seed (16) */
+    uint8_t pka[64], pkb[64];    /* public keys, X then Y, LSB-first */
+    uint8_t dhkey[32];
+    uint8_t na[16], nb[16], cb[16];
+    uint8_t mackey[16];
+} btp_sc;
+
+typedef struct btp_le_characteristic
+{
+    uint16_t declaration, value, uuid, cccd, reference;
+    uint8_t properties;
+    uint8_t report_id, report_type;   /* from the Report Reference: 1 input,
+                                         2 output, 3 feature */
+    uint8_t want;                     /* an input we subscribe to */
+} btp_le_characteristic;
+
+typedef struct btp_le
+{
+    uint8_t fast_link;       /* link at the mouse's own 7.5-15 ms rate */
+    uint8_t active, state, link;
+    uint32_t step_started, error;
+    /* Security Manager. */
+    uint8_t smp_step, rand_have, passkey_entry, key_size, sc;
+    uint8_t expected_keys, received_keys, stored_key_tried;
+    uint8_t preq[7], pres[7];
+    uint8_t tk[16], mrand[16], mconfirm[16], sconfirm[16], srand[16];
+    uint8_t ltk[16], ediv[2], rand[8], irk[16], identity[7];
+    /* GATT. */
+    uint16_t service_start, service_end, cursor;
+    btp_le_characteristic chars[BTP_LE_MAX_CHARS];
+    uint8_t char_count, descriptor_index, subscribe_index;
+    uint8_t waiting_opcode, reading_reference, report_mode, drop, secure_retries, encrypted, keys_sent, from_cache;
+    uint32_t drop_at;                  /* disconnect a failed link then */
+    uint16_t map_value, map_offset;
+    btv_hid_map map;
+    uint16_t protocol_mode, keyboard_in, keyboard_out, mouse_in;
+    uint8_t keyboard, mouse, leds;
+    uint32_t reports;
+    btv_hid_keyboard kb;
+    btv_hid_mouse pointer;
+    /* Consumer keys and a game controller, from the same Report Map. */
+    btv_hid_extras extras;
+    btv_hid_extras_parser xparser;
+    btv_hid_pad pad;
+    uint8_t pad_attached;
+    uint16_t last_consumer[BTV_XCONSUMER_MAX];
+    /* Battery Service (0x180F), found once the device is set up. */
+    uint8_t bat_state;
+    uint8_t battery;                  /* percent, or 0xff not known */
+    uint8_t bat_notify;               /* the characteristic notifies */
+    uint16_t bat_end, bat_value, bat_cccd;
+    uint32_t bat_at;
+} btp_le;
+
+enum { BTP_BAT_NONE, BTP_BAT_WAIT, BTP_BAT_SERVICE, BTP_BAT_CHARACTERISTIC,
+       BTP_BAT_DESCRIPTORS, BTP_BAT_READ, BTP_BAT_ENABLE, BTP_BAT_DONE };
+
+#endif

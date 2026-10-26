@@ -1,0 +1,37 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#ifndef BTV_RFCOMM_MUX_H
+#define BTV_RFCOMM_MUX_H
+#include "rfcomm_frame.h"
+enum btv_mux_state
+{
+    BTV_MUX_IDLE, BTV_MUX_WAIT, BTV_MUX_OPEN, BTV_MUX_CLOSING,
+    BTV_MUX_CLOSED, BTV_MUX_FAILED
+};
+typedef struct btv_rfcomm_mux
+{
+    unsigned int state;
+    uint8_t initiator, awaiting, request[4], response[4], response_state;
+    size_t request_bytes, response_bytes;
+    uint32_t started;
+} btv_rfcomm_mux;
+/* DLCI-0 lifecycle on an already OPEN RFCOMM L2CAP channel. L2CAP origin fixes
+ * the initiator role. Fresh init requires old traffic and IO to be drained. */
+void btv_rfcomm_mux_init(btv_rfcomm_mux *mux);
+int btv_rfcomm_mux_start(btv_rfcomm_mux *mux, int initiator, uint32_t now);
+int btv_rfcomm_mux_close(btv_rfcomm_mux *mux, uint32_t now);
+/* Raw RFCOMM payload for the ordered L2CAP/ACL queue. token 1=request,
+ * 2=response. sent immediately follows acceptance of copied output, before any
+ * other mux operation. Backpressure consumes nothing. No physical IO here. */
+size_t btv_rfcomm_mux_output(btv_rfcomm_mux *mux, uint8_t *output,
+                             size_t capacity, unsigned int *token, uint32_t now);
+int btv_rfcomm_mux_sent(btv_rfcomm_mux *mux, unsigned int token);
+/* Frame must first pass rfcomm_frame_decode. 1 consumed, 0 unowned (DLC/MCC or
+ * stale response), 2 busy response slot (retain/retry), -1 lifecycle failure.
+ * OPEN only establishes the multiplexer, not an individual DLC or headset. */
+int btv_rfcomm_mux_receive(btv_rfcomm_mux *mux, const btv_rfcomm_frame *frame, uint32_t now);
+void btv_rfcomm_mux_tick(btv_rfcomm_mux *mux, uint32_t now);
+void btv_rfcomm_mux_abort(btv_rfcomm_mux *mux);
+/* FAILED requires parent L2CAP teardown. CLOSED still requires draining queued
+ * response/ACL/USB traffic and closing L2CAP; never free on this state alone. */
+#endif

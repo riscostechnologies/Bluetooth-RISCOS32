@@ -1,0 +1,131 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#include "rfcomm_connect.h"
+#include <string.h>
+
+int btv_rfcomm_connect_start(btv_rfcomm_connect *c, const btv_sdp_session *discovery,
+    uint16_t receive_mtu, uint32_t now)
+{
+    const btv_sdp_service *service = btv_sdp_session_result(discovery);
+    const btv_l2cap_channel *previous;
+    if (c == NULL || service == NULL || discovery->dispatch == NULL ||
+        discovery->dispatch->failed || receive_mtu < 48 || receive_mtu > 518) return 0;
+    previous = btv_l2cap_dispatch_channel(discovery->dispatch, discovery->local_cid);
+    if (previous == NULL || previous->state != BTV_CHANNEL_CLOSED) return 0;
+    memset(c, 0, sizeof(*c));
+    c->dispatch = discovery->dispatch;
+    c->service = *service;
+    c->started = now;
+    c->local_cid = btv_l2cap_dispatch_connect(c->dispatch, 3, receive_mtu, now);
+    if (!c->local_cid)
+    {
+        c->state = BTV_RC_FAILED;
+        c->error = c->needs_acl_recovery = 1;
+        return 0;
+    }
+    c->state = BTV_RC_OPENING;
+    return 1;
+}
+
+void btv_rfcomm_connect_tick(btv_rfcomm_connect *c, uint32_t now)
+{
+    const btv_l2cap_channel *channel;
+    if (c == NULL || c->dispatch == NULL || c->state == BTV_RC_IDLE || c->state >= BTV_RC_DONE) return;
+    btv_l2cap_dispatch_tick(c->dispatch, now);
+    channel = btv_l2cap_dispatch_channel(c->dispatch, c->local_cid);
+    if (c->dispatch->failed || channel == NULL) goto recovery;
+    if (channel->state == BTV_CHANNEL_CLOSED)
+    {
+        if (c->state != BTV_RC_CLOSING) c->error = 1;
+        if (c->binding.channel != NULL) btv_rfcomm_l2cap_tick(&c->binding, now);
+        c->state = c->error ? BTV_RC_FAILED : BTV_RC_DONE;
+        return;
+    }
+    if (channel->state == BTV_CHANNEL_FAILED)
+    {
+        if (c->state == BTV_RC_CLOSING) goto recovery;
+        c->error = 1;
+        c->state = BTV_RC_CLOSING;
+        if (!channel->remote_cid)
+        {
+            if (channel->result < 2 || channel->result > 4) goto recovery;
+            c->state = BTV_RC_FAILED;
+            return;
+        }
+    }
+    if (channel->state == BTV_CHANNEL_CLOSING)
+    {
+        if (c->binding.channel != NULL) btv_rfcomm_l2cap_tick(&c->binding, now);
+        c->state = BTV_RC_CLOSING;
+        return;
+    }
+    if (c->state == BTV_RC_OPENING && channel->state == BTV_CHANNEL_OPEN)
+    {
+        if (!btv_rfcomm_l2cap_start(&c->binding, channel, 1, c->service.rfcomm_channel, now))
+        { c->error = 2; c->state = BTV_RC_CLOSING; }
+        else c->state = BTV_RC_RUNNING;
+    }
+    if (c->state == BTV_RC_RUNNING)
+    {
+        btv_rfcomm_l2cap_tick(&c->binding, now);
+        if (c->binding.session.state == BTV_RS_READY) c->established = 1;
+        if (c->binding.session.state == BTV_RS_FAILED || c->binding.session.state == BTV_RS_CLOSED)
+        {
+            c->error = c->binding.session.state == BTV_RS_FAILED ? 2 : 0;
+            c->state = BTV_RC_CLOSING;
+        }
+    }
+    if (!c->established && (c->state == BTV_RC_OPENING || (c->state == BTV_RC_RUNNING &&
+        c->binding.session.state != BTV_RS_READY)) && (uint32_t)(now - c->started) >= 180000UL)
+    { c->error = 3; c->state = BTV_RC_CLOSING; }
+    if (c->state == BTV_RC_CLOSING)
+    {
+        if (!c->cleanup_timed) { c->cleanup_started = now; c->cleanup_timed = 1; }
+        if ((uint32_t)(now - c->cleanup_started) >= 60000UL) goto recovery;
+        if (c->binding.channel != NULL && c->binding.session.state != BTV_RS_CLOSED)
+            btv_rfcomm_session_abort(&c->binding.session);
+        if (!channel->remote_cid) goto recovery;
+        if (!btv_l2cap_dispatch_disconnect(c->dispatch, c->local_cid, now) &&
+            (c->dispatch->next_identifier > 255 || channel->state == BTV_CHANNEL_FAILED)) goto recovery;
+    }
+    return;
+recovery:
+    if (c->binding.channel != NULL) btv_rfcomm_session_abort(&c->binding.session);
+    c->needs_acl_recovery = 1;
+    if (!c->error) c->error = 1;
+    c->state = BTV_RC_FAILED;
+}
+
+size_t btv_rfcomm_connect_output(btv_rfcomm_connect *c, uint8_t *pdu, size_t capacity, uint32_t now)
+{
+    btv_rfcomm_connect_tick(c, now);
+    return c != NULL && c->state == BTV_RC_RUNNING ? btv_rfcomm_l2cap_output(&c->binding, pdu, capacity, now) : 0;
+}
+
+int btv_rfcomm_connect_sent(btv_rfcomm_connect *c, uint32_t now)
+{
+    int result;
+    if (c == NULL || c->state != BTV_RC_RUNNING) return 0;
+    result = btv_rfcomm_l2cap_sent(&c->binding, now);
+    btv_rfcomm_connect_tick(c, now);
+    return result;
+}
+
+int btv_rfcomm_connect_receive(btv_rfcomm_connect *c, const uint8_t *pdu, size_t bytes, uint32_t now)
+{
+    int result;
+    btv_rfcomm_connect_tick(c, now);
+    if (c == NULL || c->state != BTV_RC_RUNNING) return 0;
+    result = btv_rfcomm_l2cap_receive(&c->binding, pdu, bytes, now);
+    btv_rfcomm_connect_tick(c, now);
+    return result;
+}
+
+int btv_rfcomm_connect_close(btv_rfcomm_connect *c, uint32_t now)
+{
+    if (c == NULL || (c->state != BTV_RC_OPENING && c->state != BTV_RC_RUNNING)) return 0;
+    if (c->state == BTV_RC_RUNNING && btv_rfcomm_session_close(&c->binding.session, now)) return 1;
+    c->state = BTV_RC_CLOSING;
+    btv_rfcomm_connect_tick(c, now);
+    return 1;
+}

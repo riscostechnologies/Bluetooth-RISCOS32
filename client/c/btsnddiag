@@ -1,0 +1,66 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/* Diagnostic: SoundDMA controllers and BluetoothVoice sound-device state. */
+#include <kernel.h>
+#include <swis.h>
+#include <stdio.h>
+#include <string.h>
+
+static _kernel_oserror *swi(int n, _kernel_swi_regs *r) { return _kernel_swi(n, r, r); }
+
+int main(void)
+{
+    _kernel_swi_regs r;
+    _kernel_oserror *e;
+    char id[80], name[80];
+    unsigned int status[16];
+    int handle;
+    id[0] = 0;
+    printf("Controllers:\n");
+    for (;;)
+    {
+        char next[80];
+        memset(&r, 0, sizeof(r));
+        r.r[0] = (int)id; r.r[1] = (int)next; r.r[2] = sizeof(next);
+        e = swi(0x60149, &r);
+        if (e) { printf("  Enumerate error: %s\n", e->errmess); break; }
+        if (next[0] == 0) break;
+        strcpy(id, next);
+        memset(&r, 0, sizeof(r));
+        r.r[0] = (int)id; r.r[1] = (int)name; r.r[2] = sizeof(name); r.r[3] = 0;
+        name[0] = 0;
+        e = swi(0x6014A, &r);
+        printf("  %s  %s\n", id, e ? e->errmess : name);
+    }
+    memset(&r, 0, sizeof(r));
+    r.r[0] = 0;
+    e = swi(0x60146, &r); /* Sound_SampleRate 0: number of rates */
+    printf("SampleRate(0): %s nrates=%d\n", e ? e->errmess : "ok", r.r[1]);
+    memset(&r, 0, sizeof(r));
+    r.r[0] = 1;
+    e = swi(0x60146, &r);
+    printf("SampleRate(1): %s index=%d rate=%d Hz\n", e ? e->errmess : "ok", r.r[1], r.r[2] / 1024);
+    memset(&r, 0, sizeof(r));
+    e = swi(0x60140, &r); /* Sound_Configure read */
+    printf("Configure: %s channels=%d samples=%d period=%d\n", e ? e->errmess : "ok", r.r[0], r.r[1], r.r[2]);
+    memset(&r, 0, sizeof(r));
+    r.r[0] = 0;
+    e = swi(0x60141, &r); /* Sound_Enable read */
+    printf("Enable: %s state=%d\n", e ? e->errmess : "ok", r.r[0]);
+    for (handle = 1; handle < 12; ++handle)
+    {
+        memset(&r, 0, sizeof(r));
+        memset(status, 0, sizeof(status));
+        r.r[1] = handle; r.r[2] = (int)status; r.r[3] = sizeof(status);
+        if (swi(0xD7BC3 | 0x20000, &r) == NULL)
+        {
+            unsigned int s = status[14] >> 1;
+            printf("Session %d: state %u queued out %u word14 &%X -> registered %u running %u buffers %u\n",
+                   handle, status[2], status[9], status[14], s & 1, (s >> 1) & 1, s >> 8);
+            printf("  diag &%08X phases &%08X\n", status[11], status[15]);
+            printf("  meter: peak %u, buffers with sound %u\n",
+                   status[10] & 0xffff, status[10] >> 16);
+        }
+    }
+    return 0;
+}

@@ -1,0 +1,134 @@
+/*	$NetBSD: rfcomm.h,v 1.19 2022/05/28 21:14:57 andvar Exp $	*/
+
+/*-
+ * Copyright (c) 2006 Itronix Inc.
+ * All rights reserved.
+ *
+ * Written by Iain Hibbert for Itronix Inc.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. The name of Itronix Inc. may not be used to endorse
+ *    or promote products derived from this software without specific
+ *    prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY ITRONIX INC. ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL ITRONIX INC. BE LIABLE FOR ANY
+ * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+/*-
+ * Copyright (c) 2001-2003 Maksim Yevmenkin <m_evmenkin@yahoo.com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ *
+ * $Id: rfcomm.h,v 1.19 2022/05/28 21:14:57 andvar Exp $
+ * $FreeBSD: src/sys/netgraph/bluetooth/include/ng_btsocket_rfcomm.h,v 1.4 2005/01/11 01:39:53 emax Exp $
+ */
+
+/* MCC wire adaptation from the pinned NetBSD rfcomm_session.c. */
+#include "rfcomm_mcc.h"
+#include <string.h>
+
+static int valid_length(uint8_t type, size_t bytes)
+{
+    switch (type)
+    {
+        case 0x20: return bytes == 8; /* PN */
+        case 0x38: return bytes == 2 || bytes == 3; /* MSC, optional break */
+        case 0x24: return bytes == 1 || bytes == 8; /* RPN query/full */
+        case 0x14: return bytes == 2; /* RLS */
+        case 0x04: return bytes == 1; /* NSC */
+        case 0x28: /* FCON */
+        case 0x18: return bytes == 0; /* FCOFF */
+        default: return 1; /* TEST and unknown types */
+    }
+}
+
+int btv_rfcomm_mcc_decode(const uint8_t *data, size_t bytes, btv_rfcomm_mcc *mcc)
+{
+    btv_rfcomm_mcc result;
+    size_t length, offset;
+    unsigned int shift;
+    uint8_t value;
+    if (data == NULL || mcc == NULL || bytes < 2 || bytes > 32767 || !(data[0] & 1))
+        return -1;
+    offset = 1;
+    shift = 0;
+    length = 0;
+    do
+    {
+        if (offset == bytes || offset > 3)
+            return -1;
+        value = data[offset++];
+        length |= (size_t)(value >> 1) << shift;
+        shift += 7;
+    } while (!(value & 1));
+    if (length != bytes - offset || !valid_length(data[0] >> 2, length))
+        return -1;
+    result.type = data[0] >> 2;
+    result.command = (data[0] >> 1) & 1;
+    result.data = data + offset;
+    result.bytes = length;
+    *mcc = result;
+    return 1;
+}
+
+size_t btv_rfcomm_mcc_encode(uint8_t *output, size_t capacity, uint8_t type,
+                            int command, const uint8_t *data, size_t bytes)
+{
+    size_t header, offset, remaining;
+    if (output == NULL || type > 63 || (command != 0 && command != 1) ||
+        bytes > 32763 || (bytes != 0 && data == NULL) || !valid_length(type, bytes))
+        return 0;
+    header = bytes < 128 ? 2 : (bytes < 16384 ? 3 : 4);
+    if (capacity < header + bytes)
+        return 0;
+    output[0] = (uint8_t)((type << 2) | (command << 1) | 1);
+    remaining = bytes;
+    offset = 1;
+    do
+    {
+        output[offset] = (uint8_t)((remaining & 0x7f) << 1);
+        remaining >>= 7;
+        if (remaining == 0)
+            output[offset] |= 1;
+        ++offset;
+    } while (remaining != 0);
+    if (bytes != 0)
+        memcpy(output + header, data, bytes);
+    return header + bytes;
+}

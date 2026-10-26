@@ -1,0 +1,155 @@
+/*	$NetBSD: rfcomm.h,v 1.19 2022/05/28 21:14:57 andvar Exp $	*/
+
+/*-
+ * Copyright (c) 2006 Itronix Inc.
+ * All rights reserved.
+ *
+ * Written by Iain Hibbert for Itronix Inc.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. The name of Itronix Inc. may not be used to endorse
+ *    or promote products derived from this software without specific
+ *    prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY ITRONIX INC. ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL ITRONIX INC. BE LIABLE FOR ANY
+ * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+/*-
+ * Copyright (c) 2001-2003 Maksim Yevmenkin <m_evmenkin@yahoo.com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ *
+ * $Id: rfcomm.h,v 1.19 2022/05/28 21:14:57 andvar Exp $
+ * $FreeBSD: src/sys/netgraph/bluetooth/include/ng_btsocket_rfcomm.h,v 1.4 2005/01/11 01:39:53 emax Exp $
+ */
+
+/* Outgoing PN adaptation from NetBSD rfcomm_dlc.c and rfcomm_session.c. */
+#include "rfcomm_pn.h"
+#include <string.h>
+
+void btv_rfcomm_pn_init(btv_rfcomm_pn *pn)
+{
+    if (pn != NULL)
+        memset(pn, 0, sizeof(*pn));
+}
+
+int btv_rfcomm_pn_start(btv_rfcomm_pn *pn, uint8_t dlci, uint16_t mtu,
+                        uint8_t receive_credits, int mode, uint32_t now)
+{
+    if (pn == NULL || pn->state != BTV_PN_IDLE || dlci < 2 || dlci > 61 ||
+        mtu < 23 || mtu > 32767 || receive_credits > 7 || mode < -1 || mode > 1)
+        return 0;
+    pn->dlci = dlci;
+    pn->offered_mtu = mtu;
+    pn->receive_credits = mode == 0 ? 0 : receive_credits;
+    pn->session_mode = mode;
+    pn->started = now;
+    pn->state = BTV_PN_READY;
+    return 1;
+}
+
+void btv_rfcomm_pn_tick(btv_rfcomm_pn *pn, uint32_t now)
+{
+    if (pn != NULL && (pn->state == BTV_PN_READY || pn->state == BTV_PN_WAIT) &&
+        (uint32_t)(now - pn->started) >= 20000UL)
+        pn->state = BTV_PN_FAILED;
+}
+
+size_t btv_rfcomm_pn_output(btv_rfcomm_pn *pn, uint8_t *output,
+                            size_t capacity, uint32_t now)
+{
+    uint8_t parameters[8];
+    if (pn == NULL)
+        return 0;
+    btv_rfcomm_pn_tick(pn, now);
+    if (pn->state != BTV_PN_READY)
+        return 0;
+    memset(parameters, 0, sizeof(parameters));
+    parameters[0] = pn->dlci;
+    parameters[1] = pn->session_mode == 0 ? 0 : 0xf0;
+    parameters[2] = pn->dlci | 7;
+    parameters[4] = (uint8_t)pn->offered_mtu;
+    parameters[5] = (uint8_t)(pn->offered_mtu >> 8);
+    parameters[7] = pn->receive_credits;
+    return btv_rfcomm_mcc_encode(output, capacity, 0x20, 1, parameters, 8);
+}
+
+int btv_rfcomm_pn_sent(btv_rfcomm_pn *pn)
+{
+    if (pn == NULL || pn->state != BTV_PN_READY)
+        return 0;
+    pn->state = BTV_PN_WAIT;
+    return 1;
+}
+
+int btv_rfcomm_pn_receive(btv_rfcomm_pn *pn, const btv_rfcomm_mcc *mcc, uint32_t now)
+{
+    uint16_t mtu;
+    unsigned int mode;
+    if (pn == NULL || mcc == NULL)
+        return -1;
+    btv_rfcomm_pn_tick(pn, now);
+    if (pn->state == BTV_PN_FAILED)
+        return -1;
+    if (pn->state != BTV_PN_WAIT || mcc->type != 0x20 || mcc->command)
+        return 0;
+    if (mcc->bytes != 8 || mcc->data == NULL)
+    {
+        pn->state = BTV_PN_FAILED;
+        return -1;
+    }
+    if ((mcc->data[0] & 0x3f) != pn->dlci)
+        return 0;
+    mtu = (uint16_t)(mcc->data[4] | ((unsigned int)mcc->data[5] << 8));
+    mode = mcc->data[1] == 0xe0;
+    if (mtu < 23 || mtu > pn->offered_mtu ||
+        (mcc->data[1] != 0 && mcc->data[1] != 0xe0) ||
+        (pn->session_mode >= 0 && mode != (unsigned int)pn->session_mode))
+    {
+        pn->state = BTV_PN_FAILED;
+        return -1;
+    }
+    pn->mtu = mtu;
+    pn->credit_mode = (uint8_t)mode;
+    pn->transmit_credits = mode ? mcc->data[7] & 7 : 0;
+    if (!mode)
+        pn->receive_credits = 0;
+    pn->state = BTV_PN_DONE;
+    return 1;
+}

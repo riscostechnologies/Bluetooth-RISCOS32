@@ -1,0 +1,32 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#ifndef BTV_RFCOMM_RX_H
+#define BTV_RFCOMM_RX_H
+#include "rfcomm_dlc.h"
+#define BTV_RFCOMM_RX_SLOTS 32
+typedef struct btv_rfcomm_rx
+{
+    btv_rfcomm_dlc *dlc;
+    uint8_t *storage;
+    uint16_t lengths[BTV_RFCOMM_RX_SLOTS];
+    unsigned int head, count;
+    size_t offset;
+} btv_rfcomm_rx;
+/* Attach the PN-backed credit window to actual MTU-sized packet slots. May
+ * attach while SABM waits, but no data is accepted until OPEN. Credit mode only.
+ * storage must fit credits.slots * mtu, with 1..32 slots. No occupied slots
+ * may exist at attachment. Storage, object and incoming/output buffers must
+ * not overlap. One serialized owner; no external release of these credits. */
+int btv_rfcomm_rx_init(btv_rfcomm_rx *rx, btv_rfcomm_dlc *dlc,
+                       uint8_t *storage, size_t capacity);
+/* One RFCOMM frame (L2CAP payload): 1 consumed, 0 another DLC/control frame,
+ * -1 invalid/failed. Verifies frame/FCS, role, negotiated MTU and receive credit
+ * before copying payload. Credit-only frames update credits without a slot.
+ * Physical receive input may be released after return. */
+int btv_rfcomm_rx_feed(btv_rfcomm_rx *rx, const uint8_t *packet, size_t bytes, uint32_t now);
+/* Byte-stream read. A partial read retains its packet slot; only consuming the
+ * final byte releases that slot for a future grant. Returns copied byte count.
+ * Parent gates application reads on MSC/profile readiness and sends new grants
+ * through its ordered TX path; this function does not transmit credits. */
+size_t btv_rfcomm_rx_read(btv_rfcomm_rx *rx, uint8_t *output, size_t capacity);
+#endif

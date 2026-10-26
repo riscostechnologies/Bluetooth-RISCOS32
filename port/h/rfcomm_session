@@ -1,0 +1,50 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#ifndef BTV_RFCOMM_SESSION_H
+#define BTV_RFCOMM_SESSION_H
+#include "rfcomm_control.h"
+#include "rfcomm_rx.h"
+#include "rfcomm_tx.h"
+enum btv_rfcomm_session_state {
+    BTV_RS_IDLE, BTV_RS_MUX, BTV_RS_PN, BTV_RS_DLC, BTV_RS_MSC,
+    BTV_RS_READY, BTV_RS_CLOSING, BTV_RS_CLOSED, BTV_RS_FAILED
+};
+typedef struct btv_rfcomm_session {
+    unsigned int state, selected, token;
+    uint16_t receive_limit, transmit_limit, mtu;
+    uint8_t dlci;
+    btv_rfcomm_mux mux;
+    btv_rfcomm_pn pn;
+    btv_rfcomm_dlc dlc;
+    btv_rfcomm_msc msc;
+    btv_rfcomm_control control;
+    btv_rfcomm_rx rx;
+    btv_rfcomm_tx tx;
+    uint8_t receive_storage[2048], transmit_storage[1024];
+    uint8_t control_storage[518], scratch[518];
+} btv_rfcomm_session;
+/* One outgoing DLC on an already OPEN, authenticated/encrypted according to
+ * caller policy, dedicated RFCOMM L2CAP channel. Role comes from L2CAP origin;
+ * server_channel comes from validated SDP. Local receive MTU is 48..518,
+ * peer MTU >=48. Four real RX slots back PN credits. Currently credit mode
+ * only: a peer falling back to non-credit mode fails explicitly.
+ * Fresh start only after all old channel traffic and IO are drained. */
+int btv_rfcomm_session_start(btv_rfcomm_session *session, int initiator,
+    uint8_t server_channel, uint16_t receive_limit, uint16_t transmit_limit, uint32_t now);
+void btv_rfcomm_session_tick(btv_rfcomm_session *session, uint32_t now);
+/* One complete L2CAP payload. 1 consumed, 0 unowned (incoming DLC/PN or stale),
+ * 2 busy (retain/retry), -1 failed. Input/output/storage never overlap.
+ * All operations run on one serialized owner. */
+int btv_rfcomm_session_receive(btv_rfcomm_session *session, const uint8_t *data, size_t bytes, uint32_t now);
+/* Raw RFCOMM frame; parent adds L2CAP. sent must immediately follow acceptance
+ * of the most recent output by the ordered copied queue, before any other
+ * session call. BUSY consumes nothing; always obtain output anew on retry. */
+size_t btv_rfcomm_session_output(btv_rfcomm_session *session, uint8_t *output, size_t capacity, uint32_t now);
+int btv_rfcomm_session_sent(btv_rfcomm_session *session, uint32_t now);
+int btv_rfcomm_session_write(btv_rfcomm_session *session, const uint8_t *data, size_t bytes);
+size_t btv_rfcomm_session_read(btv_rfcomm_session *session, uint8_t *output, size_t capacity);
+int btv_rfcomm_session_close(btv_rfcomm_session *session, uint32_t now);
+void btv_rfcomm_session_abort(btv_rfcomm_session *session);
+/* READY is RFCOMM byte-stream readiness, not HFP or audio. CLOSED/FAILED
+ * require parent L2CAP teardown and physical IO drainage before reuse. */
+#endif

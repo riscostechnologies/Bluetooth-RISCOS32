@@ -1,0 +1,210 @@
+/*-
+ * Copyright (c) 2005 Iain Hibbert.
+ * Copyright (c) 2006 Itronix Inc.
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. The name of Itronix Inc. may not be used to endorse
+ *    or promote products derived from this software without specific
+ *    prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY ITRONIX INC. ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL ITRONIX INC. BE LIABLE FOR ANY
+ * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
+/* RISC OS adaptation of controller discovery from NetBSD hci_unit.c 1.16
+ * and hci_event.c 1.26, pinned by upstream/manifest.json. This replaces mbuf
+ * command queues and blocking initialization with one outstanding command.
+ * It does not yet port link management, packet masks or the rest of HCI. */
+#include "hci_bootstrap.h"
+#include "hci_frame.h"
+#include <string.h>
+
+/* NetBSD's default command mask for controllers predating HCI 1.2. */
+static const uint8_t commands_v10[64] = {
+    0xff, 0xff, 0xff, 0x01, 0xfe, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0x7f, 0x32, 0x03, 0xb8, 0xfe,
+    0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+static const uint16_t opcodes[] = {0x0c03, 0x1009, 0x1005, 0x1003, 0x1004, 0x1001, 0x1002};
+static const uint8_t reply_sizes[] = {6, 12, 13, 14, 16, 14, 70};
+
+static uint16_t read16(const uint8_t *p)
+{
+    return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+}
+
+static int fail(btv_hci_bootstrap *boot, unsigned int reason, uint8_t status)
+{
+    boot->failed_stage = (uint8_t)boot->stage;
+    boot->stage = BTV_BOOT_FAILED;
+    boot->error = reason;
+    boot->status = status;
+    boot->awaiting = 0;
+    return -1;
+}
+
+void btv_hci_bootstrap_start(btv_hci_bootstrap *boot, uint32_t now, int power_up_noop)
+{
+    memset(boot, 0, sizeof(*boot));
+    memcpy(boot->info.commands, commands_v10, sizeof(commands_v10));
+    boot->credits = power_up_noop ? 0 : 1;
+    boot->started = boot->changed = now;
+}
+
+void btv_hci_bootstrap_tick(btv_hci_bootstrap *boot, uint32_t now)
+{
+    if (boot->stage < BTV_BOOT_DISCOVERED &&
+        ((uint32_t)(now - boot->changed) >= 5000u || (uint32_t)(now - boot->started) >= 30000u))
+        fail(boot, BTV_BOOT_TIMEOUT, 0);
+}
+
+int btv_hci_bootstrap_use_scheduler(btv_hci_bootstrap *boot)
+{
+    if (boot->stage != BTV_BOOT_RESET || boot->awaiting) return 0;
+    boot->scheduler_owned = 1;
+    return 1;
+}
+
+int btv_hci_bootstrap_skip_extended(btv_hci_bootstrap *boot)
+{
+    if (boot->stage != BTV_BOOT_RESET || boot->awaiting) return 0;
+    boot->skip_extended = 1;
+    return 1;
+}
+
+void btv_hci_bootstrap_abort(btv_hci_bootstrap *boot)
+{
+    if (boot->stage != BTV_BOOT_FAILED)
+        fail(boot, BTV_BOOT_TRANSPORT_ERROR, 0);
+}
+
+size_t btv_hci_bootstrap_command(const btv_hci_bootstrap *boot, uint8_t *output, size_t capacity)
+{
+    if (boot->stage >= BTV_BOOT_DISCOVERED || boot->awaiting || (!boot->scheduler_owned && boot->credits == 0))
+        return 0;
+    return btv_hci_command(output, capacity, opcodes[boot->stage],
+                           boot->stage == BTV_BOOT_EXTENDED ? &boot->page : NULL,
+                           boot->stage == BTV_BOOT_EXTENDED ? 1 : 0);
+}
+
+int btv_hci_bootstrap_sent(btv_hci_bootstrap *boot, uint32_t now)
+{
+    btv_hci_bootstrap_tick(boot, now);
+    if (boot->stage >= BTV_BOOT_DISCOVERED || boot->awaiting || (!boot->scheduler_owned && boot->credits == 0))
+        return 0;
+    if (!boot->scheduler_owned) --boot->credits;
+    boot->awaiting = 1;
+    boot->changed = now;
+    return 1;
+}
+
+int btv_hci_bootstrap_event(btv_hci_bootstrap *boot, const uint8_t *packet, size_t bytes, uint32_t now)
+{
+    size_t expected;
+    uint16_t opcode;
+    uint8_t status, credits;
+    btv_hci_bootstrap_tick(boot, now);
+    if (boot->stage >= BTV_BOOT_DISCOVERED) return 0;
+    if (btv_hci_frame_size(BTV_HCI_EVENT, packet, bytes, 255, &expected) != BTV_HCI_COMPLETE || expected != bytes)
+        return fail(boot, BTV_BOOT_BAD_EVENT, 0);
+    if (packet[0] == 0x10)
+        return fail(boot, bytes == 3 ? BTV_BOOT_HARDWARE_ERROR : BTV_BOOT_BAD_EVENT,
+                    bytes == 3 ? packet[2] : 0);
+    if (packet[0] == 0x0f)
+    {
+        if (bytes != 6) return fail(boot, BTV_BOOT_BAD_EVENT, 0);
+        status = packet[2]; credits = packet[3]; opcode = read16(packet + 4);
+    }
+    else if (packet[0] == 0x0e)
+    {
+        if (bytes < 5) return fail(boot, BTV_BOOT_BAD_EVENT, 0);
+        credits = packet[2]; opcode = read16(packet + 3);
+        status = bytes >= 6 ? packet[5] : 0;
+    }
+    else return 0;
+    /* The event advertises the current allowance, not additional credits. */
+    boot->credits = credits;
+    if (!boot->awaiting || opcode != opcodes[boot->stage]) return 0;
+    if (status != 0) return fail(boot, BTV_BOOT_CONTROLLER_ERROR, status);
+    if (packet[0] == 0x0f) return 0;
+    if (bytes != reply_sizes[boot->stage]) return fail(boot, BTV_BOOT_BAD_EVENT, 0);
+    switch (boot->stage)
+    {
+        case BTV_BOOT_RESET:
+            boot->stage = BTV_BOOT_ADDRESS;
+            break;
+        case BTV_BOOT_ADDRESS:
+            memcpy(boot->info.address, packet + 6, 6);
+            boot->stage = BTV_BOOT_BUFFERS;
+            break;
+        case BTV_BOOT_BUFFERS:
+            boot->info.acl_bytes = read16(packet + 6);
+            boot->info.sco_bytes = packet[8];
+            boot->info.acl_packets = read16(packet + 9);
+            boot->info.sco_packets = read16(packet + 11);
+            boot->stage = BTV_BOOT_FEATURES;
+            break;
+        case BTV_BOOT_FEATURES:
+            memcpy(boot->info.features[0], packet + 6, 8);
+            boot->info.feature_pages = 1;
+            boot->stage = (packet[13] & 0x80) && !boot->skip_extended
+                        ? BTV_BOOT_EXTENDED : BTV_BOOT_VERSION;
+            break;
+        case BTV_BOOT_EXTENDED:
+            if (packet[6] != boot->page || packet[7] < boot->page ||
+                (boot->page != 0 && packet[7] != boot->info.max_feature_page))
+                return fail(boot, BTV_BOOT_BAD_EVENT, 0);
+            boot->info.max_feature_page = packet[7];
+            if (boot->page > 0 && boot->page < 3)
+            {
+                memcpy(boot->info.features[boot->page], packet + 8, 8);
+                boot->info.feature_pages = boot->page + 1;
+            }
+            if (boot->page < packet[7]) ++boot->page;
+            else boot->stage = BTV_BOOT_VERSION;
+            break;
+        case BTV_BOOT_VERSION:
+            if (btv_hci_version_event(packet, bytes, &boot->info.version) != BTV_VERSION_READY)
+                return fail(boot, BTV_BOOT_BAD_EVENT, 0);
+            boot->stage = boot->info.version.hci_version >= 2 ? BTV_BOOT_COMMANDS : BTV_BOOT_DISCOVERED;
+            break;
+        case BTV_BOOT_COMMANDS:
+            memcpy(boot->info.commands, packet + 6, 64);
+            boot->info.commands_reported = 1;
+            boot->stage = BTV_BOOT_DISCOVERED;
+            break;
+        default: return fail(boot, BTV_BOOT_BAD_EVENT, 0);
+    }
+    boot->awaiting = 0;
+    boot->changed = now;
+    return 1;
+}
+
+int btv_hci_bootstrap_snapshot(const btv_hci_bootstrap *boot, btv_controller_info *output)
+{
+    if (boot->stage != BTV_BOOT_DISCOVERED || output == NULL) return 0;
+    *output = boot->info;
+    return 1;
+}

@@ -1,0 +1,317 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#include <stddef.h>
+#include <stdarg.h>
+void *memcpy(void *destination, const void *source, size_t bytes)
+{
+    unsigned char *d = destination;
+    const unsigned char *s = source;
+    while (bytes--) *d++ = *s++;
+    return destination;
+}
+void *memmove(void *destination, const void *source, size_t bytes)
+{
+    unsigned char *d = destination;
+    const unsigned char *s = source;
+    if (d < s) while (bytes--) *d++ = *s++;
+    else { d += bytes; s += bytes; while (bytes--) *--d = *--s; }
+    return destination;
+}
+void *memset(void *destination, int value, size_t bytes)
+{
+    unsigned char *d = destination;
+    while (bytes--) *d++ = (unsigned char)value;
+    return destination;
+}
+int memcmp(const void *left, const void *right, size_t bytes)
+{
+    const unsigned char *a = left, *b = right;
+    while (bytes--) { if (*a != *b) return *a - *b; ++a; ++b; }
+    return 0;
+}
+size_t strlen(const char *text)
+{
+    const char *end = text;
+    while (*end) ++end;
+    return (size_t)(end - text);
+}
+int strcmp(const char *left, const char *right)
+{
+    while (*left && *left == *right) { ++left; ++right; }
+    return (unsigned char)*left - (unsigned char)*right;
+}
+int strncmp(const char *left, const char *right, size_t bytes)
+{
+    while (bytes && *left && *left == *right)
+    { ++left; ++right; --bytes; }
+    return bytes ? (unsigned char)*left - (unsigned char)*right : 0;
+}
+char *strcpy(char *destination, const char *source)
+{
+    char *result = destination;
+    do { *destination++ = *source; } while (*source++);
+    return result;
+}
+
+static unsigned int divide(unsigned int numerator, unsigned int denominator,
+                           unsigned int *remainder)
+{
+    unsigned int quotient, value, carry, index;
+    quotient = value = 0;
+    if (denominator == 0)
+    {
+        if (remainder != 0) *remainder = numerator;
+        return 0;
+    }
+    for (index = 0; index < 32; ++index)
+    {
+        carry = value >> 31;
+        value = (value << 1) | (numerator >> 31);
+        numerator <<= 1;
+        quotient <<= 1;
+        if (carry || value >= denominator)
+        {
+            value -= denominator;
+            quotient |= 1;
+        }
+    }
+    if (remainder != 0) *remainder = value;
+    return quotient;
+}
+
+unsigned int __udivsi3(unsigned int numerator, unsigned int denominator)
+{
+    return divide(numerator, denominator, 0);
+}
+
+unsigned int __umodsi3(unsigned int numerator, unsigned int denominator)
+{
+    unsigned int remainder;
+    divide(numerator, denominator, &remainder);
+    return remainder;
+}
+
+/* ---- added for the 64-bit core (bv70) --------------------------------- */
+
+int __divsi3(int numerator, int denominator)
+{
+    unsigned int n = numerator < 0 ? 0u - (unsigned int)numerator : (unsigned int)numerator;
+    unsigned int d = denominator < 0 ? 0u - (unsigned int)denominator : (unsigned int)denominator;
+    unsigned int q = __udivsi3(n, d);
+    return (numerator < 0) != (denominator < 0) ? -(int)q : (int)q;
+}
+
+int __modsi3(int numerator, int denominator)
+{
+    unsigned int n = numerator < 0 ? 0u - (unsigned int)numerator : (unsigned int)numerator;
+    unsigned int d = denominator < 0 ? 0u - (unsigned int)denominator : (unsigned int)denominator;
+    unsigned int r = __umodsi3(n, d);
+    return numerator < 0 ? -(int)r : (int)r;
+}
+
+/* 64-bit helpers by shift and subtract: no libgcc (its 64-bit divide pulls
+ * in the unwinder). */
+static unsigned long long udivmod64(unsigned long long n, unsigned long long d,
+                                    unsigned long long *rem)
+{
+    unsigned long long q = 0, r = 0;
+    int i;
+    if (d == 0) { if (rem) *rem = 0; return 0; }
+    for (i = 63; i >= 0; --i)
+    {
+        unsigned long long top = r >> 63;
+        r = (r << 1) | ((n >> i) & 1u);
+        if (top != 0 || r >= d) { r -= d; q |= 1ull << i; }
+    }
+    if (rem) *rem = r;
+    return q;
+}
+
+unsigned long long __udivdi3(unsigned long long n, unsigned long long d)
+{
+    return udivmod64(n, d, 0);
+}
+
+unsigned long long __umoddi3(unsigned long long n, unsigned long long d)
+{
+    unsigned long long r;
+    (void)udivmod64(n, d, &r);
+    return r;
+}
+
+long long __divdi3(long long n, long long d)
+{
+    unsigned long long un = n < 0 ? 0ull - (unsigned long long)n : (unsigned long long)n;
+    unsigned long long ud = d < 0 ? 0ull - (unsigned long long)d : (unsigned long long)d;
+    unsigned long long q = udivmod64(un, ud, 0);
+    return (n < 0) != (d < 0) ? -(long long)q : (long long)q;
+}
+
+long long __moddi3(long long n, long long d)
+{
+    unsigned long long un = n < 0 ? 0ull - (unsigned long long)n : (unsigned long long)n;
+    unsigned long long ud = d < 0 ? 0ull - (unsigned long long)d : (unsigned long long)d;
+    unsigned long long r;
+    (void)udivmod64(un, ud, &r);
+    return n < 0 ? -(long long)r : (long long)r;
+}
+
+/* No 64-bit multiply anywhere in here: the module is built for ARMv3, which
+ * has no UMULL, so GCC turns a 32x32->64 multiply into a call to this very
+ * function (0.70-0.73's version called itself until the SVC stack overflowed
+ * - "abort on data transfer").  16-bit halves and 32-bit MULs only. */
+long long __muldi3(long long a, long long b)
+{
+    unsigned long long ua = (unsigned long long)a, ub = (unsigned long long)b;
+    unsigned int al = (unsigned int)ua, ah = (unsigned int)(ua >> 32);
+    unsigned int bl = (unsigned int)ub, bh = (unsigned int)(ub >> 32);
+    unsigned int a0 = al & 0xffffu, a1 = al >> 16;
+    unsigned int b0 = bl & 0xffffu, b1 = bl >> 16;
+    unsigned int p00 = a0 * b0, p01 = a0 * b1, p10 = a1 * b0, p11 = a1 * b1;
+    unsigned int mid = p01 + p10;
+    unsigned int mid_carry = mid < p01 ? 0x10000u : 0u;
+    unsigned int low = p00 + (mid << 16);
+    unsigned int high = p11 + (mid >> 16) + mid_carry + (low < p00 ? 1u : 0u);
+    high += al * bh + ah * bl;          /* the cross terms' low halves */
+    return (long long)(((unsigned long long)high << 32) | low);
+}
+
+char *strchr(const char *text, int c)
+{
+    for (;; ++text)
+    {
+        if (*text == (char)c) return (char *)text;
+        if (*text == 0) return 0;
+    }
+}
+
+char *strncpy(char *destination, const char *source, size_t bytes)
+{
+    size_t i = 0;
+    for (; i < bytes && source[i] != 0; ++i) destination[i] = source[i];
+    for (; i < bytes; ++i) destination[i] = 0;
+    return destination;
+}
+
+/* malloc/free from the RMA (OS_Module 6/7). */
+void *malloc(size_t bytes)
+{
+    register unsigned int r0 __asm("r0") = 6;
+    register unsigned int r2 __asm("r2");
+    register unsigned int r3 __asm("r3") = (unsigned int)bytes;
+    register unsigned int ok __asm("r4");
+    __asm volatile("swi 0x2001e\n\t"
+                   "movvc %3, #1\n\t"
+                   "movvs %3, #0"
+                   : "+r" (r0), "=r" (r2), "+r" (r3), "=r" (ok)
+                   : : "cc", "memory", "lr", "r1");
+    return ok ? (void *)r2 : 0;
+}
+
+void free(void *block)
+{
+    register unsigned int r0 __asm("r0") = 7;
+    register unsigned int r2 __asm("r2") = (unsigned int)block;
+    if (block == 0) return;
+    __asm volatile("swi 0x2001e"
+                   : "+r" (r0), "+r" (r2)
+                   : : "cc", "memory", "lr", "r1", "r3");
+}
+
+/* A small vsnprintf: %% %c %s %d %i %u %x %X %p, flags 0 and -, a width,
+ * a precision for %s, and the l / ll / z / h length modifiers. */
+static void put_char(char *out, size_t size, size_t *at, char c)
+{
+    if (*at + 1 < size) out[*at] = c;
+    ++*at;
+}
+
+int vsnprintf(char *out, size_t size, const char *format, va_list args)
+{
+    size_t at = 0;
+    while (*format)
+    {
+        char c = *format++;
+        int left = 0, zero = 0, width = 0, precision = -1, longs = 0;
+        char digits[24];
+        int n = 0, negative = 0, i;
+        unsigned long long value = 0;
+        const char *text;
+        if (c != '%') { put_char(out, size, &at, c); continue; }
+        for (;; ++format)
+        {
+            if (*format == '-') left = 1;
+            else if (*format == '0') zero = 1;
+            else if (*format == ' ' || *format == '+' || *format == '#') ;
+            else break;
+        }
+        if (*format == '*') { width = va_arg(args, int); ++format; }
+        else while (*format >= '0' && *format <= '9') width = width * 10 + (*format++ - '0');
+        if (*format == '.')
+        {
+            ++format; precision = 0;
+            if (*format == '*') { precision = va_arg(args, int); ++format; }
+            else while (*format >= '0' && *format <= '9') precision = precision * 10 + (*format++ - '0');
+        }
+        while (*format == 'l' || *format == 'h' || *format == 'z' || *format == 'j' || *format == 't')
+        {
+            if (*format == 'l') ++longs;
+            ++format;
+        }
+        c = *format ? *format++ : 0;
+        switch (c)
+        {
+        case '%': put_char(out, size, &at, '%'); continue;
+        case 'c': digits[0] = (char)va_arg(args, int); n = 1; text = digits; break;
+        case 's':
+            text = va_arg(args, const char *);
+            if (text == 0) text = "(null)";
+            while ((precision < 0 || n < precision) && text[n]) ++n;
+            break;
+        case 'd': case 'i':
+        {
+            long long v = longs >= 2 ? va_arg(args, long long) : longs ? (long long)va_arg(args, long) : (long long)va_arg(args, int);
+            if (v < 0) { negative = 1; value = 0ull - (unsigned long long)v; } else value = (unsigned long long)v;
+            goto number10;
+        }
+        case 'u':
+            value = longs >= 2 ? va_arg(args, unsigned long long) : longs ? (unsigned long long)va_arg(args, unsigned long) : (unsigned long long)va_arg(args, unsigned int);
+        number10:
+            do { unsigned long long r; value = udivmod64(value, 10, &r); digits[sizeof digits - 1 - n++] = (char)('0' + r); } while (value);
+            text = digits + sizeof digits - n;
+            break;
+        case 'p': value = (unsigned long long)(unsigned long)va_arg(args, void *); goto number16;
+        case 'x': case 'X':
+            value = longs >= 2 ? va_arg(args, unsigned long long) : longs ? (unsigned long long)va_arg(args, unsigned long) : (unsigned long long)va_arg(args, unsigned int);
+        number16:
+            do { unsigned int d = (unsigned int)(value & 15u); value >>= 4; digits[sizeof digits - 1 - n++] = (char)(d < 10 ? '0' + d : (c == 'X' ? 'A' : 'a') + d - 10); } while (value);
+            text = digits + sizeof digits - n;
+            break;
+        default: (void)va_arg(args, int); continue;
+        }
+        width -= n + negative;
+        if (!left && !zero) for (; width > 0; --width) put_char(out, size, &at, ' ');
+        if (negative) put_char(out, size, &at, '-');
+        if (!left && zero) for (; width > 0; --width) put_char(out, size, &at, '0');
+        for (i = 0; i < n; ++i) put_char(out, size, &at, text[i]);
+        for (; width > 0; --width) put_char(out, size, &at, ' ');
+    }
+    if (size) out[at < size ? at : size - 1] = 0;
+    return (int)at;
+}
+
+int snprintf(char *out, size_t size, const char *format, ...)
+{
+    va_list args;
+    int n;
+    va_start(args, format);
+    n = vsnprintf(out, size, format, args);
+    va_end(args);
+    return n;
+}
+
+/* GCCSDK's <stdio.h> maps vsnprintf to this name. */
+int __gcc_vsnprintf(char *out, size_t size, const char *format, va_list args)
+{
+    return vsnprintf(out, size, format, args);
+}

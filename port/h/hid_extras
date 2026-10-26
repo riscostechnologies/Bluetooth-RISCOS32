@@ -1,0 +1,102 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        hid_extras
+ * Purpose:     What hid_report.c leaves out of a HID report descriptor:
+ *              the consumer keys of a keyboard (volume, mute, the media
+ *              keys) and the controls of a game controller (a hat switch,
+ *              up to six axes, buttons).  Read in the same pass over the
+ *              descriptor's octets, in any piece sizes, into a compact
+ *              layout that can be kept with a bond.  Pure: no SWIs, no
+ *              statics, no allocation.
+ * Reference:   USB HID Device Class Definition 1.11, section 6.2.2 (items);
+ *              HID Usage Tables 1.3: Generic Desktop 0x01 (Joystick 0x04,
+ *              Game Pad 0x05, X 0x30 to Rz 0x35, Hat switch 0x39, D-pad
+ *              0x90 to 0x93), Button 0x09, Consumer 0x0C (Consumer Control
+ *              0x01, Mute 0xE2, Volume Increment 0xE9, Decrement 0xEA).
+ * Licence:     BSD-2-Clause (see LICENSE).
+ ******************************************************************/
+#ifndef BTV_HID_EXTRAS_H
+#define BTV_HID_EXTRAS_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#define BTV_XAXES 6                /* X, Y, Z, Rx, Ry, Rz */
+#define BTV_XCONSUMER_BITS 8       /* usages of a bit-per-key consumer report */
+#define BTV_XCONSUMER_MAX 4        /* usages reported at once */
+
+enum btv_x_consumer_kind { BTV_XC_NONE, BTV_XC_ARRAY, BTV_XC_BITS };
+
+/* One consumer-control input: a report ID, then either an array of usage
+ * numbers (`count` of `size` bits) or one bit for each of up to eight
+ * usages. */
+typedef struct btv_x_consumer
+{
+    uint8_t id, kind, size, count;
+    uint16_t offset;               /* first bit after the report ID */
+    uint16_t usage[BTV_XCONSUMER_BITS];
+} btv_x_consumer;
+
+typedef struct btv_x_axis
+{
+    uint16_t offset;
+    uint8_t size, used;            /* 0 bits: not there */
+    int32_t minimum, maximum;
+} btv_x_axis;
+
+/* The result: small, plain data, kept with a bonded device. */
+typedef struct btv_hid_extras
+{
+    uint8_t consumer_used, pad_used, pad_id, pad_buttons;
+    btv_x_consumer consumer[2];
+    uint16_t pad_button_offset;
+    btv_x_axis axis[BTV_XAXES];
+    btv_x_axis hat;                /* logical values outside minimum to
+                                      maximum mean "centred" */
+    uint8_t pad_application;       /* 4 joystick, 5 game pad, 8 multi-axis */
+} btv_hid_extras;
+
+/* Where the parser is between octets (not kept). */
+typedef struct btv_hid_extras_parser
+{
+    uint8_t item_have, item_need, skip, item[5];
+    uint16_t application;
+    uint8_t depth, usage_count, have_range, collection_depth;
+    uint8_t ids, id_slots;
+    uint8_t id_list[8];
+    uint16_t id_bits[8];
+    uint16_t page, size, count;
+    int32_t minimum, maximum;
+    uint8_t report_id;
+    uint32_t usages[8];
+    uint32_t range_min, range_max;
+    struct { uint16_t page, size, count; int32_t minimum, maximum; uint8_t report_id; }
+        stack[2];
+} btv_hid_extras_parser;
+
+void btv_hid_extras_init(btv_hid_extras *x, btv_hid_extras_parser *p);
+void btv_hid_extras_feed(btv_hid_extras *x, btv_hid_extras_parser *p,
+                         const uint8_t *data, size_t bytes);
+/* 1 when the descriptor has consumer keys or a game controller. */
+int btv_hid_extras_finish(btv_hid_extras *x, btv_hid_extras_parser *p);
+/* 1 when input report `id` carries any of it. */
+int btv_hid_extras_wants(const btv_hid_extras *x, uint8_t id);
+
+/* A decoded input report. */
+typedef struct btv_hid_extra_event
+{
+    uint8_t consumer, pad;
+    uint8_t consumer_count;
+    uint16_t consumer_usage[BTV_XCONSUMER_MAX];
+    uint32_t pad_buttons;          /* bit n: button n+1 */
+    int16_t axis[BTV_XAXES];       /* -32768 to 32767 */
+    uint8_t hat;                   /* 0 centred, 1 up, then clockwise: 2 up
+                                      and right, 3 right ... 8 up and left */
+} btv_hid_extra_event;
+
+int btv_hid_extras_decode(const btv_hid_extras *x, uint8_t id,
+                          const uint8_t *report, size_t bytes,
+                          btv_hid_extra_event *e);
+
+#endif

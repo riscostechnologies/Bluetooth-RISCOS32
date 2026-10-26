@@ -1,0 +1,541 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        bt_l2cap
+ * Purpose:     L2CAP for the Bluetooth core: classic signalling (outgoing
+ *              and incoming dynamic channels, basic mode, MTU option
+ *              only), the LE signalling channel, and data routing to the
+ *              profile that owns each channel.
+ ******************************************************************/
+#include "bt_core.h"
+#include "bt_profiles.h"
+#include <string.h>
+
+#define CHANNEL_TIMEOUT_MS 30000u
+#define DEFAULT_MTU 672u
+
+/* Signalling codes. */
+#define SIG_REJECT 0x01
+#define SIG_CONNECT_REQ 0x02
+#define SIG_CONNECT_RSP 0x03
+#define SIG_CONFIG_REQ 0x04
+#define SIG_CONFIG_RSP 0x05
+#define SIG_DISCONNECT_REQ 0x06
+#define SIG_DISCONNECT_RSP 0x07
+#define SIG_ECHO_REQ 0x08
+#define SIG_ECHO_RSP 0x09
+#define SIG_INFO_REQ 0x0a
+#define SIG_INFO_RSP 0x0b
+#define SIG_LE_PARAM_REQ 0x12
+#define SIG_LE_PARAM_RSP 0x13
+
+static uint16_t read16(const uint8_t *p)
+{
+    return (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
+}
+
+static void write16(uint8_t *p, uint16_t value)
+{
+    p[0] = (uint8_t)value;
+    p[1] = (uint8_t)(value >> 8);
+}
+
+static uint8_t next_ident(btc_core *core, uint8_t link)
+{
+    btc_link *l = &core->links[link];
+    uint8_t ident = l->next_ident;
+    l->next_ident = (uint8_t)(ident == 255 ? 1 : ident + 1);
+    return ident;
+}
+
+static void signal(btc_core *core, uint8_t link, uint8_t code,
+                   uint8_t ident, const uint8_t *data, uint16_t bytes)
+{
+    uint8_t pdu[80];
+    if (bytes > sizeof(pdu) - 4) return;
+    pdu[0] = code;
+    pdu[1] = ident;
+    write16(pdu + 2, bytes);
+    if (bytes != 0) memcpy(pdu + 4, data, bytes);
+    (void)btc_send_l2cap(core, link,
+                         core->links[link].le ? 0x0005 : 0x0001,
+                         pdu, (size_t)bytes + 4u);
+}
+
+static int channel_index(const btc_core *core, const btc_channel *channel)
+{
+    return (int)(channel - core->channels);
+}
+
+static btc_channel *by_local(btc_core *core, uint8_t link, uint16_t cid)
+{
+    unsigned int index = (unsigned int)cid - 0x40u;
+    btc_channel *channel;
+    if (cid < 0x40 || index >= BTC_CHANNELS) return 0;
+    channel = &core->channels[index];
+    return channel->state != BTC_CH_FREE && channel->link == link ?
+           channel : 0;
+}
+
+static btc_channel *allocate(btc_core *core, uint8_t link)
+{
+    unsigned int index;
+    for (index = 0; index < BTC_CHANNELS; ++index)
+        if (core->channels[index].state == BTC_CH_FREE)
+        {
+            btc_channel *channel = &core->channels[index];
+            memset(channel, 0, sizeof(*channel));
+            channel->link = link;
+            channel->local_cid = (uint16_t)(0x40u + index);
+            channel->local_mtu = DEFAULT_MTU;
+            channel->remote_mtu = DEFAULT_MTU;
+            channel->started = core->now;
+            return channel;
+        }
+    return 0;
+}
+
+/* The state the channel was in when it went (the field is already cleared
+ * by then: this is read before it is). */
+static uint32_t channel_state_before(const btc_channel *channel)
+{
+    return channel->conf_local_done << 4 | channel->conf_remote_done << 5 |
+           (channel->incoming ? 0x40u : 0u) | channel->state;
+}
+
+static void release(btc_core *core, btc_channel *channel, int notify)
+{
+    int index = channel_index(core, channel);
+    int was_used = channel->state != BTC_CH_FREE;
+    uint8_t owner = channel->owner;
+    uint32_t before = channel_state_before(channel);
+    channel->state = BTC_CH_FREE;
+    if (was_used)
+        btc_note("L2CAP channel closed, psm|state (1 connecting 2 config 3 open)",
+                 (uint32_t)channel->psm << 8 | before);
+    if (notify && was_used && owner != BTC_OWN_NONE)
+    {
+        /* The owner may look at the channel's details while closing. */
+        channel->owner = owner;
+        btp_channel_closed(core, index);
+    }
+    memset(channel, 0, sizeof(*channel));
+}
+
+static void send_config(btc_core *core, btc_channel *channel)
+{
+    uint8_t data[8];
+    channel->ident = next_ident(core, channel->link);
+    write16(data, channel->remote_cid);
+    write16(data + 2, 0);
+    data[4] = 0x01;                  /* MTU option */
+    data[5] = 2;
+    write16(data + 6, channel->local_mtu);
+    signal(core, channel->link, SIG_CONFIG_REQ, channel->ident, data, 8);
+    channel->conf_sent = 1;
+}
+
+static void maybe_open(btc_core *core, btc_channel *channel)
+{
+    if (channel->state == BTC_CH_CONFIG && channel->conf_local_done &&
+        channel->conf_remote_done)
+    {
+        channel->state = BTC_CH_OPEN;
+        btc_note("L2CAP channel open, psm|incoming", (uint32_t)channel->psm << 8 | channel->incoming);
+        btp_channel_open(core, channel_index(core, channel));
+    }
+}
+
+int btc_l2cap_connect(btc_core *core, uint8_t link, uint16_t psm,
+                      uint8_t owner, uint16_t mtu)
+{
+    btc_channel *channel;
+    uint8_t data[4];
+    if (link >= BTC_LINKS || core->links[link].state != BTC_LINK_OPEN ||
+        core->links[link].le)
+        return -1;
+    channel = allocate(core, link);
+    if (channel == 0) return -1;
+    channel->psm = psm;
+    channel->owner = owner;
+    if (mtu != 0) channel->local_mtu = mtu;
+    channel->state = BTC_CH_CONNECTING;
+    channel->ident = next_ident(core, link);
+    write16(data, psm);
+    write16(data + 2, channel->local_cid);
+    signal(core, link, SIG_CONNECT_REQ, channel->ident, data, 4);
+    btc_note("L2CAP connecting, psm|link", (uint32_t)psm << 8 | link);
+    return channel_index(core, channel);
+}
+
+int btc_l2cap_disconnect(btc_core *core, int index)
+{
+    btc_channel *channel;
+    uint8_t data[4];
+    if (index < 0 || index >= BTC_CHANNELS) return 0;
+    channel = &core->channels[index];
+    if (channel->state == BTC_CH_FREE) return 0;
+    if (channel->state == BTC_CH_CONNECTING ||
+        channel->state == BTC_CH_DISCONNECTING)
+    {
+        release(core, channel, 1);
+        return 1;
+    }
+    channel->ident = next_ident(core, channel->link);
+    write16(data, channel->remote_cid);
+    write16(data + 2, channel->local_cid);
+    signal(core, channel->link, SIG_DISCONNECT_REQ, channel->ident, data, 4);
+    channel->state = BTC_CH_DISCONNECTING;
+    channel->started = core->now;
+    return 1;
+}
+
+int btc_l2cap_send(btc_core *core, int index, const uint8_t *data,
+                   size_t bytes)
+{
+    btc_channel *channel;
+    if (index < 0 || index >= BTC_CHANNELS) return -1;
+    channel = &core->channels[index];
+    if (channel->state != BTC_CH_OPEN) return -1;
+    if (bytes > channel->remote_mtu) return -1;
+    return btc_send_l2cap(core, channel->link, channel->remote_cid,
+                          data, bytes);
+}
+
+int btc_l2cap_can_send(const btc_core *core, int index, size_t bytes)
+{
+    const btc_channel *channel;
+    if (index < 0 || index >= BTC_CHANNELS) return 0;
+    channel = &core->channels[index];
+    return channel->state == BTC_CH_OPEN &&
+           btc_can_send(core, channel->link, bytes + 4u);
+}
+
+int btc_l2cap_find(const btc_core *core, uint8_t link, uint8_t owner)
+{
+    unsigned int index;
+    for (index = 0; index < BTC_CHANNELS; ++index)
+        if (core->channels[index].state != BTC_CH_FREE &&
+            core->channels[index].link == link &&
+            core->channels[index].owner == owner)
+            return (int)index;
+    return -1;
+}
+
+int btc_le_send(btc_core *core, uint8_t link, uint16_t cid,
+                const uint8_t *data, size_t bytes)
+{
+    if (link >= BTC_LINKS || !core->links[link].le) return -1;
+    return btc_send_l2cap(core, link, cid, data, bytes);
+}
+
+/* ---- classic signalling --------------------------------------------- */
+
+static void connect_request(btc_core *core, uint8_t link, uint8_t ident,
+                            const uint8_t *p, uint16_t bytes)
+{
+    uint8_t response[8], owner;
+    uint16_t psm, source;
+    btc_channel *channel = 0;
+    if (bytes < 4) return;
+    psm = read16(p);
+    source = read16(p + 2);
+    owner = btp_incoming_channel(core, link, psm);
+    btc_note("L2CAP connection request, psm|accepted",
+             (uint32_t)psm << 8 | (owner != BTC_OWN_NONE));
+    if (owner != BTC_OWN_NONE) channel = allocate(core, link);
+    write16(response, channel != 0 ? channel->local_cid : 0);
+    write16(response + 2, source);
+    write16(response + 4, channel != 0 ? 0 : (owner == BTC_OWN_NONE ? 2 : 4));
+    write16(response + 6, 0);
+    signal(core, link, SIG_CONNECT_RSP, ident, response, 8);
+    if (channel == 0) return;
+    channel->psm = psm;
+    channel->owner = owner;
+    channel->remote_cid = source;
+    channel->incoming = 1;
+    channel->state = BTC_CH_CONFIG;
+    send_config(core, channel);
+}
+
+static void connect_response(btc_core *core, uint8_t link, uint8_t ident,
+                             const uint8_t *p, uint16_t bytes)
+{
+    btc_channel *channel;
+    uint16_t result;
+    if (bytes < 8) return;
+    channel = by_local(core, link, read16(p + 2));
+    if (channel == 0 || channel->state != BTC_CH_CONNECTING ||
+        channel->ident != ident)
+        return;
+    result = read16(p + 4);
+    if (result == 1) return;         /* pending */
+    if (result != 0)
+    {
+        btc_note("L2CAP connection refused, psm|result", (uint32_t)channel->psm << 16 | result);
+        release(core, channel, 1);
+        return;
+    }
+    channel->remote_cid = read16(p);
+    channel->state = BTC_CH_CONFIG;
+    send_config(core, channel);
+}
+
+static void config_request(btc_core *core, uint8_t link, uint8_t ident,
+                           const uint8_t *p, uint16_t bytes)
+{
+    btc_channel *channel;
+    uint8_t response[6];
+    uint16_t offset;
+    if (bytes < 4) return;
+    channel = by_local(core, link, read16(p));
+    if (channel == 0 || (channel->state != BTC_CH_CONFIG &&
+                         channel->state != BTC_CH_OPEN))
+    {
+        uint8_t reject[6];
+        write16(reject, 2);          /* invalid CID */
+        write16(reject + 2, read16(p));
+        write16(reject + 4, 0);
+        signal(core, link, SIG_REJECT, ident, reject, 6);
+        return;
+    }
+    for (offset = 4; offset + 2u <= bytes; )
+    {
+        uint8_t type = p[offset], length = p[offset + 1];
+        if (offset + 2u + length > bytes) break;
+        if ((type & 0x7f) == 0x01 && length == 2)
+            channel->remote_mtu = read16(p + offset + 2);
+        offset = (uint16_t)(offset + 2u + length);
+    }
+    write16(response, channel->remote_cid);
+    write16(response + 2, 0);
+    write16(response + 4, 0);        /* success, accept their values */
+    signal(core, link, SIG_CONFIG_RSP, ident, response, 6);
+    /* Continuation flag: more options follow in another request. */
+    if (read16(p + 2) & 1) return;
+    channel->conf_remote_done = 1;
+    if (!channel->conf_sent) send_config(core, channel);
+    maybe_open(core, channel);
+}
+
+static void config_response(btc_core *core, uint8_t link,
+                            const uint8_t *p, uint16_t bytes)
+{
+    btc_channel *channel;
+    uint16_t result;
+    if (bytes < 6) return;
+    channel = by_local(core, link, read16(p));
+    if (channel == 0 || channel->state != BTC_CH_CONFIG) return;
+    result = read16(p + 4);
+    if (result == 0)
+    {
+        channel->conf_local_done = 1;
+        maybe_open(core, channel);
+    }
+    else if (result == 1 && channel->local_mtu != DEFAULT_MTU)
+    {
+        /* Our MTU was refused: ask for the default instead. */
+        channel->local_mtu = DEFAULT_MTU;
+        send_config(core, channel);
+    }
+    else if (result != 4)            /* 4: pending */
+    {
+        btc_note("L2CAP configuration refused, psm|result", (uint32_t)channel->psm << 16 | result);
+        (void)btc_l2cap_disconnect(core, channel_index(core, channel));
+    }
+}
+
+static void disconnect_request(btc_core *core, uint8_t link, uint8_t ident,
+                               const uint8_t *p, uint16_t bytes)
+{
+    btc_channel *channel;
+    uint8_t response[4];
+    if (bytes < 4) return;
+    memcpy(response, p, 4);
+    signal(core, link, SIG_DISCONNECT_RSP, ident, response, 4);
+    channel = by_local(core, link, read16(p));
+    if (channel != 0) release(core, channel, 1);
+}
+
+static void info_request(btc_core *core, uint8_t link, uint8_t ident,
+                         const uint8_t *p, uint16_t bytes)
+{
+    uint8_t response[12];
+    uint16_t type, length = 4;
+    if (bytes < 2) return;
+    type = read16(p);
+    memset(response, 0, sizeof(response));
+    write16(response, type);
+    write16(response + 2, 1);        /* not supported */
+    if (type == 2)
+    {
+        write16(response + 2, 0);
+        response[4] = 0x80;          /* fixed channels supported */
+        length = 8;
+    }
+    else if (type == 3)
+    {
+        write16(response + 2, 0);
+        response[4] = 0x02;          /* signalling channel only */
+        length = 12;
+    }
+    signal(core, link, SIG_INFO_RSP, ident, response, length);
+}
+
+static void command_reject(btc_core *core, uint8_t link, uint8_t ident)
+{
+    unsigned int index;
+    for (index = 0; index < BTC_CHANNELS; ++index)
+    {
+        btc_channel *channel = &core->channels[index];
+        if (channel->state != BTC_CH_FREE && channel->link == link &&
+            channel->ident == ident &&
+            (channel->state == BTC_CH_CONNECTING ||
+             channel->state == BTC_CH_DISCONNECTING))
+            release(core, channel, 1);
+    }
+}
+
+static void classic_signal(btc_core *core, uint8_t link,
+                           const uint8_t *data, size_t bytes)
+{
+    size_t offset = 0;
+    while (offset + 4 <= bytes)
+    {
+        uint8_t code = data[offset], ident = data[offset + 1];
+        uint16_t length = read16(data + offset + 2);
+        const uint8_t *p = data + offset + 4;
+        if (offset + 4u + length > bytes) break;
+        switch (code)
+        {
+        case SIG_REJECT: command_reject(core, link, ident); break;
+        case SIG_CONNECT_REQ: connect_request(core, link, ident, p, length); break;
+        case SIG_CONNECT_RSP: connect_response(core, link, ident, p, length); break;
+        case SIG_CONFIG_REQ: config_request(core, link, ident, p, length); break;
+        case SIG_CONFIG_RSP: config_response(core, link, p, length); break;
+        case SIG_DISCONNECT_REQ:
+            disconnect_request(core, link, ident, p, length);
+            break;
+        case SIG_DISCONNECT_RSP:
+            if (length >= 4)
+            {
+                btc_channel *channel = by_local(core, link, read16(p + 2));
+                if (channel != 0 && channel->state == BTC_CH_DISCONNECTING)
+                    release(core, channel, 1);
+            }
+            break;
+        case SIG_ECHO_REQ:
+            signal(core, link, SIG_ECHO_RSP, ident, 0, 0);
+            break;
+        case SIG_INFO_REQ: info_request(core, link, ident, p, length); break;
+        case SIG_ECHO_RSP: case SIG_INFO_RSP: break;
+        default:
+        {
+            uint8_t reason[2] = { 0, 0 };  /* command not understood */
+            signal(core, link, SIG_REJECT, ident, reason, 2);
+            break;
+        }
+        }
+        offset += 4u + length;
+    }
+}
+
+/* ---- LE signalling ---------------------------------------------- */
+
+static void le_signal(btc_core *core, uint8_t link,
+                      const uint8_t *data, size_t bytes)
+{
+    uint8_t code, ident;
+    uint16_t length;
+    if (bytes < 4) return;
+    code = data[0];
+    ident = data[1];
+    length = read16(data + 2);
+    if ((size_t)length + 4u > bytes) return;
+    if (code == SIG_LE_PARAM_REQ && length == 8)
+    {
+        uint8_t result[2] = { 0, 0 };
+        uint8_t update[14];
+        /* Accepted when reasonable (Core spec Vol 3 Part A 4.20): an
+         * interval of 7.5 to 50 ms, a supervision timeout that outlasts
+         * several events. A slower one is refused, and ours stands. */
+        uint16_t min = read16(data + 4), max = read16(data + 6),
+                 latency = read16(data + 8), timeout = read16(data + 10);
+        int accept = min >= 6 && max >= min && max <= 0x0028 &&
+                     latency <= 30 && timeout >= 100 && timeout <= 3200 &&
+                     (uint32_t)timeout * 4u >
+                     (uint32_t)(1u + latency) * max * 2u;
+        btc_note("device asks for interval min|max", (uint32_t)min << 16 | max);
+        if (!accept)
+        {
+            result[0] = 1;
+            signal(core, link, SIG_LE_PARAM_RSP, ident, result, 2);
+            return;
+        }
+        write16(update, core->links[link].handle);
+        memcpy(update + 2, data + 4, 8);    /* min, max, latency, timeout */
+        if (core->audio_busy)
+        {
+            /* Accepted, but no faster than 15 ms while A2DP is up. */
+            if (min < 0x000c) min = 0x000c;
+            if (max < min) max = min;
+            write16(update + 2, min);
+            write16(update + 4, max);
+        }
+        write16(update + 10, 0);
+        write16(update + 12, 0);
+        signal(core, link, SIG_LE_PARAM_RSP, ident, result, 2);
+        (void)btc_command_queue(core, 0x2013, update, 14, 0, link);
+    }
+    else if (code != SIG_REJECT && code != SIG_LE_PARAM_RSP)
+    {
+        uint8_t reason[2] = { 0, 0 };
+        signal(core, link, SIG_REJECT, ident, reason, 2);
+    }
+}
+
+void btc_l2cap_receive(btc_core *core, uint8_t link, const uint8_t *pdu,
+                       size_t bytes)
+{
+    uint16_t length, cid;
+    btc_channel *channel;
+    if (bytes < 4) return;
+    length = read16(pdu);
+    cid = read16(pdu + 2);
+    if ((size_t)length + 4u != bytes) return;
+    if (cid == 0x0001 && !core->links[link].le)
+    {
+        classic_signal(core, link, pdu + 4, length);
+        return;
+    }
+    if (cid == 0x0005 && core->links[link].le)
+    {
+        le_signal(core, link, pdu + 4, length);
+        return;
+    }
+    channel = by_local(core, link, cid);
+    if (channel != 0 && channel->state == BTC_CH_OPEN)
+        btp_channel_data(core, channel_index(core, channel), pdu + 4, length);
+}
+
+void btc_l2cap_link_closed(btc_core *core, uint8_t link)
+{
+    unsigned int index;
+    for (index = 0; index < BTC_CHANNELS; ++index)
+        if (core->channels[index].state != BTC_CH_FREE &&
+            core->channels[index].link == link)
+            release(core, &core->channels[index], 1);
+}
+
+void btc_l2cap_tick(btc_core *core)
+{
+    unsigned int index;
+    for (index = 0; index < BTC_CHANNELS; ++index)
+    {
+        btc_channel *channel = &core->channels[index];
+        if (channel->state == BTC_CH_FREE || channel->state == BTC_CH_OPEN)
+            continue;
+        if (core->now - channel->started >= CHANNEL_TIMEOUT_MS)
+            release(core, channel, 1);
+    }
+}

@@ -1,0 +1,75 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#ifndef BTV_HCI_COMMANDS_H
+#define BTV_HCI_COMMANDS_H
+#include <stddef.h>
+#include <stdint.h>
+#define BTV_COMMAND_SLOTS 16
+#define BTV_COMMAND_COMPLETE 0x0e
+#define BTV_COMMAND_STATUS 0x0f
+enum btv_command_result
+{
+    BTV_COMMAND_TICKETS_EXHAUSTED = -4, BTV_COMMAND_FULL = -3,
+    BTV_COMMAND_RECOVER = -2, BTV_COMMAND_INVALID = -1,
+    BTV_COMMAND_WAIT = 0, BTV_COMMAND_OK = 1
+};
+typedef struct btv_command_slot
+{
+    uint32_t ticket;
+    uint16_t opcode, command_bytes, event_bytes;
+    uint8_t expected_event, submitted, usb_done, event_done;
+    uint8_t command[258], event[257];
+} btv_command_slot;
+typedef struct btv_hci_commands
+{
+    btv_command_slot slots[BTV_COMMAND_SLOTS];
+    uint32_t next_ticket;
+    uint8_t credits, recovery;
+} btv_hci_commands;
+typedef struct btv_command_reply
+{
+    uint32_t ticket;
+    uint16_t opcode, bytes;
+    uint8_t event[257];
+} btv_command_reply;
+
+/* Controller-wide, serialized deferred owner. All command producers must use
+ * this scheduler. Initial credits come from power-up/verified initialization,
+ * never from the USB queue size. Init requires drained old transfers/events. */
+void btv_hci_commands_init(btv_hci_commands *commands, uint8_t credits);
+/* Copies one full HCI command, no H4 prefix. expected_event is COMPLETE or
+ * STATUS according to the command's HCI contract. Every queued command has a
+ * unique ticket until controller reinitialization; ticket exhaustion is final.
+ * Input must not alias the scheduler's private storage. Failure leaves the
+ * output ticket unchanged. */
+int btv_hci_commands_queue(btv_hci_commands *commands, const uint8_t *packet, size_t bytes,
+                           unsigned int expected_event, uint32_t *ticket);
+/* Select the oldest eligible command. Same-opcode commands wait until the
+ * predecessor's HCI response is recorded; unrelated opcodes may proceed with
+ * available credits. Copy output (must not overlap scheduler), then submit.
+ * Call sent immediately after USB acceptance, before delivering completions.
+ * A transport-BUSY result leaves the command queued for a later peek. */
+size_t btv_hci_commands_peek(const btv_hci_commands *commands, uint8_t *output, size_t capacity, uint32_t *ticket);
+int btv_hci_commands_sent(btv_hci_commands *commands, uint32_t ticket);
+int btv_hci_commands_usb_done(btv_hci_commands *commands, uint32_t ticket, int success);
+/* Feed complete HCI events. Command credits replace the allowance. An error
+ * Command Status can terminate a command expecting Complete; a successful
+ * Status for such a command is intermediate. Other events return WAIT for the
+ * main dispatcher. Invalid framing/unexpected matching response freezes TX. */
+int btv_hci_commands_event(btv_hci_commands *commands, const uint8_t *packet, size_t bytes);
+/* Returns a copied response once BOTH HCI and USB are complete; then consumes
+ * the ticket. OK means a response is available, not controller success: the
+ * owning protocol must validate its return parameters/status. WAIT/INVALID/
+ * RECOVER leave output untouched. */
+int btv_hci_commands_reply(btv_hci_commands *commands, uint32_t ticket, btv_command_reply *reply);
+/* Only an unsent command can be cancelled locally. Accepted commands require
+ * physical cancellation/drain and controller recovery, via abort. */
+int btv_hci_commands_cancel(btv_hci_commands *commands, uint32_t ticket);
+void btv_hci_commands_abort(btv_hci_commands *commands);
+/* Only tracked USB completions, not proof of controller recovery or of an
+ * empty OS/event queue. The physical transport owner must verify those too. */
+int btv_hci_commands_drained(const btv_hci_commands *commands);
+/* Clients provide deadlines (bootstrap/link timers already do). On an accepted
+ * command timeout, abort and perform real controller recovery; do not retry.
+ * This pure state component owns no OS timer or USB transfer handles. */
+#endif

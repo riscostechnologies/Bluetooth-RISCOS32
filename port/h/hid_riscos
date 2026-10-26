@@ -1,0 +1,112 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        hid_riscos
+ * Purpose:     Delivers hid_input events to RISC OS through KeyV and
+ *              PointerV, as USBDriver's usbkboard and usbmouse do.
+ *              Module-only: every call issues SWIs.
+ *
+ * Pointer policy: a Bluetooth mouse reports as PointerDevice_USB (7), so
+ * it moves the pointer whenever "USB mouse" is the configured type, and
+ * attaching one selects that type, exactly as usbmouse does.  No PointerV
+ * claim is needed: the kernel's own PointerV claimant accepts
+ * PointerReason_Report for the selected type, and USBDriver (when loaded)
+ * already answers Identify for type 7.
+ *
+ * Keyboard LEDs need a KeyV claim.  Its handler is an assembler leaf that
+ * only records KeyV_NotifyLEDState and KeyV_EnableDrivers in the
+ * btv_hid_riscos block; the module collects them with btv_hid_riscos_poll
+ * from its own (SWI) context and sends the output report itself.
+ ******************************************************************/
+#ifndef BTV_HID_RISCOS_H
+#define BTV_HID_RISCOS_H
+
+#include "hid_input.h"
+#include "hid_pad.h"
+
+/* All state lives here; the owner keeps it at a fixed address (a module
+ * static) for as long as any keyboard is attached, because KeyV holds a
+ * pointer to it.  The first three words are written by the KeyV handler
+ * with IRQs disabled; C only reads them. */
+typedef struct btv_hid_riscos
+{
+    uint32_t led_flags;     /* 0: last KeyV_NotifyLEDState R1 */
+    uint32_t led_count;     /* 4: bumped per KeyV_NotifyLEDState */
+    uint32_t enable_count;  /* 8: bumped per KeyV_EnableDrivers */
+    uint32_t led_seen;
+    uint32_t enable_seen;
+    unsigned int keyboards; /* keyboards announced with KeyboardPresent */
+    int pointer_selected;   /* OS_Pointer 0 == 7 at the last mouse report */
+    uint32_t mapped_buttons;     /* extra buttons that start applications */
+    uint8_t launches[16];        /* button numbers waiting for the desktop */
+    uint32_t launch_in, launch_out;
+    uint32_t options_epoch;      /* bumped when the mouse variables change */
+    /* For *BTInfo: motion and presses dropped because the pointer device in
+     * use is not type 7, and that type when it last was not. */
+    uint32_t moves_dropped, presses_dropped;
+    uint32_t pointer_type;
+} btv_hid_riscos;
+
+#define BTV_HID_RISCOS_LEDS   1u /* send btv_hid_keyboard_leds(*flags) */
+#define BTV_HID_RISCOS_RESET  2u /* btv_hid_keyboard_forget every keyboard */
+
+void btv_hid_riscos_init(btv_hid_riscos *r);
+
+/* Keyboard connected: claims KeyV for the first one, then
+ * KeyV_KeyboardPresent (KeyboardID_PC, no kernel debounce).  Returns 0 if
+ * KeyV could not be claimed.  Poll soon after: the kernel answers a new
+ * keyboard with KeyV_EnableDrivers and KeyV_NotifyLEDState. */
+int btv_hid_riscos_keyboard_attach(btv_hid_riscos *r);
+/* Keyboard gone: releases its keys, and after the last one releases KeyV
+ * and issues KeyV_KeyboardRemoved.  Module finalisation must detach every
+ * attached keyboard, or KeyV is left pointing into a dead module. */
+void btv_hid_riscos_keyboard_detach(btv_hid_riscos *r, btv_hid_keyboard *k);
+/* Feeds one boot keyboard report to KeyV. */
+void btv_hid_riscos_keyboard_report(btv_hid_riscos *r, btv_hid_keyboard *k,
+                                    const uint8_t *report, size_t bytes);
+/* Returns BTV_HID_RISCOS_* for KeyV calls seen since the last poll, and
+ * the current RISC OS LED flags. */
+unsigned int btv_hid_riscos_poll(btv_hid_riscos *r, uint32_t *led_flags);
+
+/* Mouse connected: selects PointerDevice_USB (OS_Pointer 1, 7). */
+void btv_hid_riscos_mouse_attach(btv_hid_riscos *r);
+/* Mouse gone: releases its buttons. */
+void btv_hid_riscos_mouse_detach(btv_hid_riscos *r, btv_hid_mouse *m);
+/* Feeds one boot mouse report to PointerV/KeyV.  Motion, button presses
+ * and the wheel are delivered only while type 7 is selected (usbmouse's
+ * `enabled`); button releases are always delivered. */
+void btv_hid_riscos_mouse_report(btv_hid_riscos *r, btv_hid_mouse *m,
+                                 const uint8_t *report, size_t bytes);
+
+/* Extra mouse buttons that start applications: bit n is button n+1 (4 and
+ * up). Set by the desktop (the app reads Choices:Mouse.Buttons). A press
+ * is queued here, from where the desktop takes it and runs the
+ * application: never from the interrupt that delivered the report. */
+void btv_hid_riscos_set_mapped_buttons(btv_hid_riscos *r, uint32_t mask);
+/* The Bluetooth$Mouse* variables have changed (Core reason 25): every mouse
+ * reads them again with its next report, not only a mouse that connects
+ * later. */
+void btv_hid_riscos_options_changed(btv_hid_riscos *r);
+/* The next queued press (a button number), or 0. */
+unsigned int btv_hid_riscos_next_launch(btv_hid_riscos *r);
+
+/* The same for a report decoded with hid_report (report-mode devices):
+ * HID's sense, y down, wheel positive away. */
+void btv_hid_riscos_mouse_event(btv_hid_riscos *r, btv_hid_mouse *m,
+                                uint32_t buttons, int32_t dx, int32_t dy,
+                                int32_t wheel, int32_t pan);
+
+/* A game controller's decoded report, as keys (hid_pad.c).  The first
+ * report announces a keyboard, as a keyboard does, so that KeyV is claimed
+ * and the keys count. */
+void btv_hid_riscos_pad_event(btv_hid_riscos *r, btv_hid_pad *pad,
+                              const btv_hid_extra_event *e);
+/* The controller is gone: its keys are let go, and the keyboard
+ * announcement withdrawn. */
+void btv_hid_riscos_pad_detach(btv_hid_riscos *r, btv_hid_pad *pad);
+/* 1 when Bluetooth$HIDBoot is 1: devices are kept in boot protocol even
+ * when they have a report descriptor (the way back to what was used before
+ * report protocol was). */
+int btv_hid_riscos_prefer_boot(void);
+
+#endif

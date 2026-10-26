@@ -1,0 +1,40 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        hid_pad
+ * Purpose:     A game controller's reports as keys the desktop understands.
+ *              RISC OS has no joystick path into the Wimp, so the way a
+ *              controller reaches it (as a USB one does through
+ *              USBJoystick's emulation) is as keys: the hat switch or the
+ *              left stick as the cursor keys, and the first buttons as
+ *              Return, Escape, Space, Tab, Page Up and Page Down.  Pure:
+ *              the keys go to a btv_hid_sink.
+ * Licence:     BSD-2-Clause (see LICENSE).
+ ******************************************************************/
+#ifndef BTV_HID_PAD_H
+#define BTV_HID_PAD_H
+
+#include "hid_extras.h"
+#include "hid_input.h"
+
+typedef struct btv_hid_pad
+{
+    uint16_t held;            /* bit n: the key of table entry n is down */
+    uint8_t stick;            /* directions the stick is holding (with the hat) */
+} btv_hid_pad;
+
+#define BTV_PAD_UP 1u
+#define BTV_PAD_DOWN 2u
+#define BTV_PAD_LEFT 4u
+#define BTV_PAD_RIGHT 8u
+
+void btv_hid_pad_init(btv_hid_pad *p);
+/* One decoded report: key down and up events for what changed. */
+void btv_hid_pad_event(btv_hid_pad *p, const btv_hid_extra_event *e,
+                       const btv_hid_sink *sink);
+/* Every key up (the device went away). */
+void btv_hid_pad_release_all(btv_hid_pad *p, const btv_hid_sink *sink);
+/* The direction bits for a hat (1 to 8, 0 centred). */
+unsigned int btv_hid_pad_hat_directions(unsigned int hat);
+
+#endif

@@ -1,0 +1,83 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/* See h/sound_ring.h. */
+#include "sound_ring.h"
+
+void btv_sound_ring_reset(btv_sound_ring *ring)
+{
+    ring->in = ring->out = 0;
+    ring->refused = ring->dropped = 0;
+}
+
+uint32_t btv_sound_ring_used(const btv_sound_ring *ring)
+{
+    return ring->in - ring->out;
+}
+
+uint32_t btv_sound_ring_write(btv_sound_ring *ring, const int16_t *frames,
+                              uint32_t count)
+{
+    uint32_t used = ring->in - ring->out, room, n, i;
+    room = BTV_RING_ACCEPT > used ? BTV_RING_ACCEPT - used : 0;
+    n = count < room ? count : room;
+    for (i = 0; i < n; i++)
+    {
+        uint32_t slot = (ring->in + i) & (BTV_RING_FRAMES - 1u);
+        ring->samples[2u * slot] = frames[2u * i];
+        ring->samples[2u * slot + 1u] = frames[2u * i + 1u];
+    }
+    ring->in += n;
+    ring->refused += count - n;
+    return n;
+}
+
+uint32_t btv_sound_ring_read(btv_sound_ring *ring, int16_t *out, uint32_t count)
+{
+    uint32_t used = ring->in - ring->out, copied = 0;
+    if (used > BTV_RING_TRIM_AT)
+    {
+        /* The oldest goes: the radio was away, and this is the present. */
+        ring->dropped += used - BTV_RING_KEEP;
+        ring->out = ring->in - BTV_RING_KEEP;
+    }
+    while (copied < count && ring->out != ring->in)
+    {
+        uint32_t slot = ring->out & (BTV_RING_FRAMES - 1u);
+        out[2u * copied] = ring->samples[2u * slot];
+        out[2u * copied + 1u] = ring->samples[2u * slot + 1u];
+        ++ring->out;
+        ++copied;
+    }
+    return copied;
+}
+
+void btv_sound_ring_flush(btv_sound_ring *ring)
+{
+    ring->dropped += ring->in - ring->out;
+    ring->out = ring->in;
+}
+
+int btv_sound_frames_audible(const int16_t *frames, uint32_t count,
+                             int threshold)
+{
+    uint32_t i;
+    for (i = 0; i < count * 2u; i++)
+    {
+        int v = frames[i];
+        if (v > threshold || v < -threshold) return 1;
+    }
+    return 0;
+}
+
+int btv_sound_ring_audible(const btv_sound_ring *ring, int threshold)
+{
+    uint32_t out = ring->out, in = ring->in, i;
+    for (i = out; (int32_t)(in - i) > 0; i++)
+    {
+        uint32_t slot = i & (BTV_RING_FRAMES - 1u);
+        int l = ring->samples[2u * slot], r = ring->samples[2u * slot + 1u];
+        if (l > threshold || l < -threshold || r > threshold || r < -threshold)
+            return 1;
+    }
+    return 0;
+}

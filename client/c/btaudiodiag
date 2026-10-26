@@ -1,0 +1,52 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/* Diagnostic: A2DP stream rates over one second. */
+#include <kernel.h>
+#include <stdio.h>
+#include <string.h>
+
+#define SWI_AUDIO 0x000D7BCE
+
+static int audio(int out[9])
+{
+    _kernel_swi_regs r;
+    memset(&r, 0, sizeof(r));
+    if (_kernel_swi(SWI_AUDIO, &r, &r) != NULL) return 0;
+    out[1] = r.r[1]; out[2] = r.r[2]; out[3] = r.r[3];
+    out[4] = r.r[4]; out[5] = r.r[5]; out[6] = r.r[6];
+    out[0] = r.r[7]; out[7] = r.r[8]; out[8] = r.r[9];
+    return 1;
+}
+
+static int now_cs(void)
+{
+    _kernel_swi_regs r;
+    memset(&r, 0, sizeof(r));
+    _kernel_swi(0x42 /* OS_ReadMonotonicTime */, &r, &r);
+    return r.r[0];
+}
+
+int main(void)
+{
+    int a[9], b[9], start, span;
+    if (!audio(a)) { puts("no A2DP status (is the core running?)"); return 1; }
+    start = now_cs();
+    while (now_cs() - start < 100) { }
+    if (!audio(b)) return 1;
+    span = now_cs() - start;
+    printf("state &%X sound &%X meter &%X\n", a[1], a[4], b[6]);
+    printf("over %d cs: packets %d (%d/s), underruns %d, late %d\n",
+           span, b[2] - a[2], (b[2] - a[2]) * 100 / (span ? span : 1),
+           b[3] - a[3], b[5] - a[5]);
+    printf("totals: packets %d underruns %d late %d buffers %d\n",
+           b[2], b[3], b[5], (unsigned)b[4] >> 8);
+    printf("acl: sent %d (%d/s) noslot %d nocredit %d busy %d free %d/%d "
+           "role %s\n",
+           b[0] - a[0], (b[0] - a[0]) * 100 / (span ? span : 1),
+           (b[7] & 0xffff) - (a[7] & 0xffff),
+           ((unsigned)b[7] >> 16) - ((unsigned)a[7] >> 16),
+           (b[8] & 0xff) - (a[8] & 0xff),
+           ((unsigned)b[8] >> 16) & 0xff, ((unsigned)b[8] >> 24) & 0xff,
+           (((unsigned)b[8] >> 8) & 0xff) ? "slave" : "master");
+    return 0;
+}

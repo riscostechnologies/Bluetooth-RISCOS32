@@ -1,0 +1,169 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*
+ * BluetoothVoice: the queued debug trace and the poll timing (h/bttrace.h).
+ *
+ * Copyright (c) 2026 RISC OS Technologies. BSD-2-Clause (see LICENSE).
+ */
+
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "bttrace.h"
+
+static uint8_t ring[BTTR_RING];
+static uint32_t head, tail, dropped;
+
+int bttr_put(const char *text)
+{
+	size_t n = strlen(text), i;
+
+	if (BTTR_RING - (head - tail) < n + 2u) {
+		dropped++;
+		return 0;
+	}
+	for (i = 0; i < n; i++)
+		ring[head++ % BTTR_RING] = (uint8_t)text[i];
+	ring[head++ % BTTR_RING] = '\r';
+	ring[head++ % BTTR_RING] = '\n';
+	return 1;
+}
+
+uint32_t bttr_drain(uint32_t budget, void (*tx)(uint8_t byte))
+{
+	uint32_t sent = 0;
+
+	while (sent < budget && tail != head) {
+		tx(ring[tail++ % BTTR_RING]);
+		sent++;
+	}
+	return sent;
+}
+
+uint32_t bttr_pending(void) { return head - tail; }
+uint32_t bttr_dropped(void) { return dropped; }
+
+void bttr_reset(void)
+{
+	head = tail = dropped = 0;
+}
+
+uint32_t bttr_micros(uint32_t cs, uint32_t counter, uint32_t period)
+{
+	uint64_t used;
+
+	if (period == 0 || counter > period)
+		return cs * 10000u;
+	used = (uint64_t)(period - counter) * 10000u / period;
+	return cs * 10000u + (uint32_t)used;
+}
+
+/* ------------------------------------------------------ the timing --- */
+
+static uint32_t started_us, stage_us, stage_total[BTTR_STAGES];
+static unsigned int stage_now;
+static uint32_t polls, slow, worst;
+static struct bttr_slow kept[BTTR_KEEP];
+static unsigned int kept_next;
+
+static void keep(unsigned int who, unsigned int stage, uint32_t total,
+		 uint32_t worst_us, uint32_t at_cs);
+
+void bttr_begin(uint32_t now_us)
+{
+	started_us = stage_us = now_us;
+	stage_now = BTTR_SETTINGS;
+	memset(stage_total, 0, sizeof stage_total);
+}
+
+void bttr_stage(unsigned int stage, uint32_t now_us)
+{
+	if (stage_now < BTTR_STAGES)
+		stage_total[stage_now] += now_us - stage_us;
+	stage_us = now_us;
+	stage_now = stage < BTTR_STAGES ? stage : BTTR_TAIL;
+}
+
+int bttr_end(unsigned int who, uint32_t now_us, uint32_t at_cs)
+{
+	uint32_t total = now_us - started_us;
+	unsigned int i, w = 0;
+
+	bttr_stage(BTTR_TAIL, now_us);
+	polls++;
+	if (total > worst)
+		worst = total;
+	if (total < BTTR_SLOW_US)
+		return 0;
+	for (i = 1; i < BTTR_STAGES; i++)
+		if (stage_total[i] > stage_total[w])
+			w = i;
+	keep(who, w, total, stage_total[w], at_cs);
+	return 1;
+}
+
+static void keep(unsigned int who, unsigned int stage, uint32_t total,
+		 uint32_t worst_us, uint32_t at_cs)
+{
+	struct bttr_slow *s = &kept[kept_next];
+
+	kept_next = (kept_next + 1u) % BTTR_KEEP;
+	s->at_cs = at_cs;
+	s->total_us = total;
+	s->worst_us = worst_us;
+	s->who = (uint8_t)who;
+	s->worst_stage = (uint8_t)stage;
+	slow++;
+}
+
+int bttr_task(unsigned int phase, uint32_t us, uint32_t at_cs)
+{
+	polls++;
+	if (us > worst)
+		worst = us;
+	if (us < BTTR_SLOW_US)
+		return 0;
+	keep(1, phase, us, us, at_cs);
+	return 1;
+}
+
+uint32_t bttr_slow_count(void) { return slow; }
+uint32_t bttr_polls(void) { return polls; }
+uint32_t bttr_worst_us(void) { return worst; }
+
+int bttr_slow_get(unsigned int index, struct bttr_slow *out)
+{
+	unsigned int have = slow < BTTR_KEEP ? (unsigned int)slow : BTTR_KEEP;
+	unsigned int first = slow < BTTR_KEEP ? 0u : kept_next;
+
+	if (index >= have)
+		return 0;
+	*out = kept[(first + index) % BTTR_KEEP];
+	return 1;
+}
+
+static const char *const stage_names[BTTR_STAGES] = {
+	"settings", "controller start-up", "transport", "bring-up",
+	"timeouts", "scan", "L2CAP", "profiles", "reconnect", "submit", "tail"
+};
+
+void bttr_format(const struct bttr_slow *s, char *out, unsigned int size)
+{
+	static const char *const task_names[3] = {
+		"reading the summary", "housekeeping (saves, volume)",
+		"announce"
+	};
+
+	if (s->who != 0) {
+		snprintf(out, size, "slow task null %uus at %u cs: %s",
+			 (unsigned)s->total_us, (unsigned)s->at_cs,
+			 task_names[s->worst_stage % 3u]);
+		return;
+	}
+	snprintf(out, size, "slow callback %uus at %u cs: %s %uus",
+		 (unsigned)s->total_us,
+		 (unsigned)s->at_cs, stage_names[s->worst_stage % BTTR_STAGES],
+		 (unsigned)s->worst_us);
+}

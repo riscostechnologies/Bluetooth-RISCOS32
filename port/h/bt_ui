@@ -1,0 +1,157 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        bt_ui
+ * Purpose:     The pure half of what the desktop sees of Bluetooth: the
+ *              summary the module hands its clients in one SWI (Core
+ *              reason 20) and how it is read, the icon bar icon's sprite
+ *              for each state, the device list's entries, the menu text
+ *              made of them, and the Wimp message that tells every task
+ *              something changed. No SWIs: Sources/Networking/Bluetooth/test/btcore/ui.c runs it.
+ * Licence:     BSD-2-Clause (see LICENSE).
+ ******************************************************************/
+#ifndef BT_UI_H
+#define BT_UI_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+/* Core reason 20 (the summary). R2 packs the fields below; R3 is a number
+ * that changes whenever the device list, the links, the bonds or a
+ * profile's state change; R4 is the last problem (area << 8 | code). */
+#define BTUI_STATE_MASK 0x07u        /* 0 off, 1 starting, 2 configuring,
+                                        3 ready, 4 stopping, 5 failed */
+#define BTUI_SCANNING (1u << 3)
+#define BTUI_PROMPT (1u << 4)        /* a pairing question is waiting */
+#define BTUI_AUDIO_SHIFT 5           /* 3 bits: 0 none 1 setting up 2
+                                        streaming 3 paused 4 failed */
+#define BTUI_RECONNECTING (1u << 8)  /* the module is bringing devices back */
+#define BTUI_CONNECTED (1u << 9)     /* at least one device is connected */
+#define BTUI_POWER_WANTED (1u << 10) /* "Bluetooth on" in the settings */
+#define BTUI_SETTINGS_READ (1u << 11)
+
+typedef struct bt_ui_summary
+{
+    unsigned int state, audio;
+    int scanning, prompt, reconnecting, connected, power_wanted, settings_read;
+    uint32_t generation, problem;
+} bt_ui_summary;
+
+uint32_t btui_pack_summary(const bt_ui_summary *s);
+void btui_unpack_summary(uint32_t packed, uint32_t generation,
+                         uint32_t problem, bt_ui_summary *s);
+
+/* The icon bar icon's sprite: off, on and idle, connected, and busy
+ * (starting, stopping, scanning, a question waiting, a stream being set up,
+ * devices being brought back). */
+const char *btui_sprite(const bt_ui_summary *s);
+
+/* One entry of Bluetooth_Devices (96 bytes): address @0, flags @6 (16 bits),
+ * type @9, link state @13, name @16, appearance @80, battery level @82
+ * (percent; 0xff not known; a Low Energy device's Battery Service). */
+#define BTUI_ENTRY_BYTES 96u
+#define BTUI_NAME_BYTES 64u
+typedef struct bt_ui_device
+{
+    uint8_t address[6], address_type, link_state;
+    uint8_t battery;         /* percent (@82), 0xff when not known */
+    uint16_t flags;
+    char name[BTUI_NAME_BYTES];
+} bt_ui_device;
+void btui_read_entry(const uint8_t *entry, bt_ui_device *d);
+/* What to call a device in a list: its name, or when none was learnt what
+ * kind of device it is (from the flags the class of device gave) and its
+ * address, "Keyboard 66:55:44:33:22:11". */
+void btui_label(const bt_ui_device *d, char *out, size_t room);
+
+/* The module's device flags (BTC_DEV_*) as the entry carries them. */
+#define BTUI_DEV_AUDIO_SINK 0x0001u
+#define BTUI_DEV_HID 0x0004u
+#define BTUI_DEV_KEYBOARD 0x0008u
+#define BTUI_DEV_MOUSE 0x0010u
+#define BTUI_DEV_HANDSFREE 0x0002u
+#define BTUI_DEV_LE 0x0020u
+#define BTUI_DEV_GAMEPAD 0x0400u
+#define BTUI_DEV_PAIRED 0x0080u
+#define BTUI_DEV_CONNECTED 0x0100u
+/* The profile to connect it with: 3 Low Energy input, 1 A2DP, 2 classic HID. */
+unsigned int btui_profile_for(const bt_ui_device *d);
+
+/* A menu description ("title" entries, comma separated, quoted) of the
+ * devices, at most `max` of them; connected ones are listed first in the
+ * order given (the caller ticks them). Commas and quotes in a name are
+ * made harmless. Returns the number of entries; `none` is the text of the
+ * single shaded entry when there are no devices. */
+size_t btui_devices_description(const bt_ui_device *d, size_t count,
+                                size_t max, const char *none, char *out,
+                                size_t room);
+
+/* The sound mixer's gain (SoundCtrl_GetMix: units of 1/16 dB, -768 to 0,
+ * that is -48 dB to 0) and AVRCP's absolute volume (0 to 127), one for the
+ * other.  Linear in decibels, which is how a person hears a volume. */
+#define BTUI_GAIN_MIN (-768)
+int32_t btui_volume_to_gain(unsigned int volume);
+unsigned int btui_gain_to_volume(int32_t gain);
+/* A step of the speaker's own buttons, in the same units: 3 dB. */
+#define BTUI_GAIN_STEP 48
+
+/* The Wimp user message that says "something changed" (a broadcast the
+ * Configure plug-in listens for instead of polling): the block of 24
+ * bytes and the action. PROVISIONAL, not allocated. */
+#define BTUI_MESSAGE_CHANGED 0x5BC40u
+#define BTUI_MESSAGE_BYTES 28u
+void btui_message_changed(uint32_t block[7], uint32_t generation,
+                          uint32_t flags);
+
+
+/* ---- the files the module reads from Choices ---------------------------
+ * Choices:Bluetooth.Config, one "Key=0" or "Key=1" line each. */
+typedef struct bt_ui_config
+{
+    int power, start, discoverable, reconnect, output;
+    int idle;                /* seconds of silence before the speakers' stream
+                                is suspended (0 never); written only when it
+                                is not the default, 8 */
+} bt_ui_config;
+/* 32-bit build: 0, no suspend for silence.  RISC OS 5's SoundDMA only moves
+ * when this module takes its buffers, so a suspended stream cannot hear sound
+ * start again; it streams silence instead, as BluetoothVoice 0.6x did. */
+#define BTUI_IDLE_DEFAULT 0
+void btui_config_defaults(bt_ui_config *c);
+/* One line of it. Returns 1 when it was a key it knows. */
+int btui_config_line(const char *line, bt_ui_config *c);
+/* The whole file as the module writes it; returns its length. */
+size_t btui_config_text(const bt_ui_config *c, char *out, size_t room);
+
+/* A line of Choices:Bluetooth.NoAuto or .Names: "AA:BB:CC:DD:EE:FF", the
+ * address most significant first; raw is least significant first. Returns
+ * the offset just after the address, or 0. */
+size_t btui_parse_address(const char *text, uint8_t raw[6]);
+
+/* A line of Choices:Mouse.Buttons: "<button> <application path>", the
+ * button from 4. Returns the button, or 0 if it is not a mapping (a comment,
+ * a button below 4, "None"); the path is copied to `path`. */
+unsigned int btui_button_line(const char *line, char *path, size_t room);
+
+
+/* ---- where the settings live, and when to read them --------------------
+ * A ROM module initialises before !Boot has set Choices$Path (SetChoices
+ * does: "<Boot$ChoicesRW>.,<old path>", a long string, and Choices$Write),
+ * so the module looks for it from its ticker: once a second (or at once
+ * when forced, by the desktop starting) until it is set. */
+size_t btui_read_path(const char *leaf, char *out, size_t room);
+size_t btui_write_path(const char *leaf, char *out, size_t room);
+size_t btui_write_dir(char *out, size_t room);
+
+typedef struct bt_ui_settings_poll
+{
+    uint32_t last_check;
+    int forced, done, checked;
+} bt_ui_settings_poll;
+#define BTUI_SETTINGS_INTERVAL_MS 1000u
+/* Is it time to look at Choices$Path? */
+int btui_settings_due(bt_ui_settings_poll *p, uint32_t now);
+/* Given whether Choices$Path is set: 1 to read the settings now (once). */
+int btui_settings_decide(bt_ui_settings_poll *p, int path_set);
+
+#endif

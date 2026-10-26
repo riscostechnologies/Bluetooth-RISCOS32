@@ -1,0 +1,102 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/* Copied byte-block sender binding RFCOMM framing, MSC and credit accounting. */
+#include "rfcomm_tx.h"
+#include <string.h>
+
+int btv_rfcomm_tx_init(btv_rfcomm_tx *tx, btv_rfcomm_dlc *dlc, btv_rfcomm_msc *msc,
+                       uint8_t *storage, size_t capacity, uint16_t frame_limit)
+{
+    if (tx == NULL || dlc == NULL || msc == NULL || storage == NULL || capacity == 0 ||
+        capacity > 65535U || frame_limit < 48 || !dlc->credit_mode ||
+        !dlc->credits.active || dlc->credits.failed || !msc->active || msc->failed ||
+        msc->dlci != dlc->dlci || dlc->mtu != dlc->credits.mtu)
+        return 0;
+    memset(tx, 0, sizeof(*tx));
+    tx->dlc = dlc;
+    tx->msc = msc;
+    tx->storage = storage;
+    tx->capacity = capacity;
+    tx->frame_limit = frame_limit;
+    return 1;
+}
+
+int btv_rfcomm_tx_queue(btv_rfcomm_tx *tx, const uint8_t *data, size_t bytes)
+{
+    if (tx == NULL || tx->dlc == NULL || data == NULL || bytes == 0 ||
+        bytes > tx->capacity || tx->length != 0 || tx->prepared ||
+        tx->dlc->control.state != BTV_MUX_OPEN || tx->dlc->credits.failed || tx->msc->failed)
+        return 0;
+    memmove(tx->storage, data, bytes);
+    tx->length = bytes;
+    tx->offset = 0;
+    return 1;
+}
+
+static int ready(const btv_rfcomm_tx *tx)
+{
+    return tx->dlc->control.state == BTV_MUX_OPEN && !tx->dlc->credits.failed &&
+        btv_rfcomm_msc_ready(tx->msc);
+}
+
+size_t btv_rfcomm_tx_output(btv_rfcomm_tx *tx, uint8_t *output, size_t capacity, uint32_t now)
+{
+    size_t bytes, total, encoded;
+    unsigned int grant;
+    if (tx == NULL || tx->dlc == NULL || output == NULL)
+        return 0;
+    btv_rfcomm_dlc_tick(tx->dlc, now);
+    btv_rfcomm_msc_tick(tx->msc, now);
+    if (!ready(tx))
+        return 0;
+    if (tx->prepared)
+    {
+        bytes = tx->prepared_bytes;
+        grant = tx->prepared_grant;
+    }
+    else
+    {
+        bytes = tx->length - tx->offset;
+        if (bytes > tx->dlc->mtu)
+            bytes = tx->dlc->mtu;
+        if (tx->dlc->credits.transmit_available == 0)
+            bytes = 0;
+        grant = btv_rfcomm_credit_grant(&tx->dlc->credits);
+        total = bytes + (bytes < 128 ? 4 : 5) + (grant ? 1 : 0);
+        if (total > tx->frame_limit)
+            bytes = tx->frame_limit - 5 - (grant ? 1 : 0);
+        if (bytes == 0 && grant == 0)
+            return 0;
+    }
+    if (btv_rfcomm_credit_can_send(&tx->dlc->credits, bytes, grant) != 1)
+        return 0;
+    encoded = btv_rfcomm_frame_encode(output, capacity, tx->dlc->dlci, tx->dlc->initiator,
+        0xef, grant != 0, grant ? (int)grant : -1, tx->storage + tx->offset, bytes);
+    if (encoded == 0)
+        return 0;
+    tx->prepared_bytes = bytes;
+    tx->prepared_grant = grant;
+    tx->prepared = 1;
+    return encoded;
+}
+
+int btv_rfcomm_tx_sent(btv_rfcomm_tx *tx)
+{
+    if (tx == NULL || tx->dlc == NULL || !tx->prepared || !ready(tx))
+        return 0;
+    if (btv_rfcomm_credit_sent(&tx->dlc->credits, tx->prepared_bytes, tx->prepared_grant) != 1)
+    {
+        btv_rfcomm_dlc_abort(tx->dlc);
+        return 0;
+    }
+    tx->offset += tx->prepared_bytes;
+    if (tx->offset == tx->length)
+        tx->offset = tx->length = 0;
+    tx->prepared = 0;
+    return 1;
+}
+
+size_t btv_rfcomm_tx_pending(const btv_rfcomm_tx *tx)
+{
+    return tx != NULL && tx->dlc != NULL ? tx->length - tx->offset : 0;
+}

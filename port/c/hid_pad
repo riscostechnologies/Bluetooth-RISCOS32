@@ -1,0 +1,95 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        hid_pad
+ * Purpose:     See hid_pad.h.
+ * Licence:     BSD-2-Clause (see LICENSE).
+ ******************************************************************/
+#include "hid_pad.h"
+#include <string.h>
+
+#define STICK_ON 16384
+#define STICK_OFF 10000
+
+/* Table entries: 0 to 3 the directions, 4 on the buttons. */
+static const uint8_t pad_keys[10] =
+{
+    BTV_KEY_CursorUp, BTV_KEY_CursorDown, BTV_KEY_CursorLeft,
+    BTV_KEY_CursorRight,
+    BTV_KEY_Return, BTV_KEY_Escape, BTV_KEY_Space, BTV_KEY_Tab,
+    BTV_KEY_PageUp, BTV_KEY_PageDown
+};
+
+void btv_hid_pad_init(btv_hid_pad *p)
+{
+    memset(p, 0, sizeof *p);
+}
+
+unsigned int btv_hid_pad_hat_directions(unsigned int hat)
+{
+    switch (hat)
+    {
+    case 1: return BTV_PAD_UP;
+    case 2: return BTV_PAD_UP | BTV_PAD_RIGHT;
+    case 3: return BTV_PAD_RIGHT;
+    case 4: return BTV_PAD_DOWN | BTV_PAD_RIGHT;
+    case 5: return BTV_PAD_DOWN;
+    case 6: return BTV_PAD_DOWN | BTV_PAD_LEFT;
+    case 7: return BTV_PAD_LEFT;
+    case 8: return BTV_PAD_UP | BTV_PAD_LEFT;
+    default: return 0;
+    }
+}
+
+/* One axis of the stick with hysteresis: `on` and `off` are the two
+ * directions' bits, `held` what they were. */
+static unsigned int axis_directions(int16_t v, unsigned int held,
+                                    unsigned int minus, unsigned int plus)
+{
+    unsigned int now = 0;
+    if (v < -STICK_ON || (v < -STICK_OFF && (held & minus))) now |= minus;
+    if (v > STICK_ON || (v > STICK_OFF && (held & plus))) now |= plus;
+    return now;
+}
+
+static void emit(const btv_hid_sink *sink, int down, unsigned int key)
+{
+    if (sink != 0 && sink->key != 0) sink->key(sink->context, down, key);
+}
+
+void btv_hid_pad_event(btv_hid_pad *p, const btv_hid_extra_event *e,
+                       const btv_hid_sink *sink)
+{
+    unsigned int wanted = 0, directions, i;
+    uint16_t want_keys = 0;
+    unsigned int old_stick = p->stick;
+    if (!e->pad) return;
+    p->stick = (uint8_t)(axis_directions(e->axis[1], old_stick, BTV_PAD_UP,
+                                         BTV_PAD_DOWN) |
+                         axis_directions(e->axis[0], old_stick, BTV_PAD_LEFT,
+                                         BTV_PAD_RIGHT));
+    directions = p->stick | btv_hid_pad_hat_directions(e->hat);
+    if (directions & BTV_PAD_UP) want_keys |= 1u << 0;
+    if (directions & BTV_PAD_DOWN) want_keys |= 1u << 1;
+    if (directions & BTV_PAD_LEFT) want_keys |= 1u << 2;
+    if (directions & BTV_PAD_RIGHT) want_keys |= 1u << 3;
+    for (i = 0; i < 6; ++i)
+        if (e->pad_buttons & (1u << i)) want_keys |= (uint16_t)(1u << (4 + i));
+    (void)wanted;
+    for (i = 0; i < 10; ++i)
+    {
+        uint16_t bit = (uint16_t)(1u << i);
+        if ((want_keys & bit) && !(p->held & bit)) emit(sink, 1, pad_keys[i]);
+        else if (!(want_keys & bit) && (p->held & bit)) emit(sink, 0, pad_keys[i]);
+    }
+    p->held = want_keys;
+}
+
+void btv_hid_pad_release_all(btv_hid_pad *p, const btv_hid_sink *sink)
+{
+    unsigned int i;
+    for (i = 0; i < 10; ++i)
+        if (p->held & (1u << i)) emit(sink, 0, pad_keys[i]);
+    p->held = 0;
+    p->stick = 0;
+}

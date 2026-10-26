@@ -1,0 +1,96 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        btwimp
+ * Purpose:     The few Wimp facilities the Bluetooth desktop tasks need,
+ *              built directly on SWIs (no Toolbox resources to author).
+ ******************************************************************/
+#ifndef BT_WIMP_H
+#define BT_WIMP_H
+
+#include <kernel.h>
+
+#define WIMP_NULL 0
+#define WIMP_REDRAW 1
+#define WIMP_OPEN 2
+#define WIMP_CLOSE 3
+#define WIMP_CLICK 6
+#define WIMP_KEY 8
+#define WIMP_MENU 9
+#define WIMP_MESSAGE 17
+#define WIMP_MESSAGE_RECORDED 18
+
+#define MESSAGE_QUIT 0
+#define MESSAGE_PREQUIT 8
+#define MESSAGE_HELP_REQUEST 0x502
+#define MESSAGE_HELP_REPLY 0x503
+#define MESSAGE_MENUS_DELETED 0x400c9
+#define MESSAGE_TASK_INITIALISE 0x400c2
+#define MESSAGE_PLUGIN_QUIT 0x50d80
+#define MESSAGE_OPEN_CONFIG_WINDOW 0x50d83
+
+#define BUTTON_ADJUST 1
+#define BUTTON_MENU 2
+#define BUTTON_SELECT 4
+
+#define ICON_SELECTED (1u << 21)
+#define ICON_SHADED (1u << 22)
+
+typedef struct bt_icon_spec
+{
+    int x0, y0, x1, y1;
+    unsigned int flags;
+    const char *text;       /* copied into a writable buffer */
+    const char *validation; /* NULL for none */
+    int buffer_size;        /* 0: text length + 1 */
+} bt_icon_spec;
+
+/* Common icon flag sets. */
+unsigned int bt_flags_label(void);
+unsigned int bt_flags_writable(void);
+unsigned int bt_flags_option(void);
+unsigned int bt_flags_action(void);
+
+int bt_wimp_initialise(const char *name);
+void bt_wimp_finalise(void);
+int bt_wimp_task(void);
+/* Wimp_PollIdle when idle_cs > 0, Wimp_Poll with nulls when 0,
+ * no null events when negative. */
+int bt_wimp_poll(int idle_cs, int *block);
+int bt_monotonic(void);
+
+int bt_window_create(const char *title, int width, int height,
+                     const bt_icon_spec *icons, int count, int with_close);
+void bt_window_open_at(int window, int x0, int y1);
+void bt_window_open_centred(int window);
+void bt_window_reopen(int *open_block);
+void bt_window_close(int window);
+char *bt_icon_text(int window, int icon);
+void bt_icon_set_text(int window, int icon, const char *text);
+int bt_icon_selected(int window, int icon);
+void bt_icon_set_selected(int window, int icon, int selected);
+void bt_icon_set_shaded(int window, int icon, int shaded);
+void bt_icon_redraw(int window, int icon);
+void bt_caret_to(int window, int icon);
+
+int bt_iconbar_create(const char *sprite);
+void bt_iconbar_set_sprite(int icon, const char *sprite);
+
+typedef struct bt_menu_item
+{
+    const char *text;
+    int ticked, shaded, dotted;
+    int submenu; /* window handle or 0 */
+} bt_menu_item;
+/* Builds (or rebuilds) the single menu; returns its address. */
+int *bt_menu_build(const char *title, const bt_menu_item *items, int count);
+void bt_menu_open(int *menu, int x, int y);
+
+void bt_report(const char *text, int is_error);
+void bt_report_os(const _kernel_oserror *error);
+/* A question with custom buttons ("Load,Not now"): 0 for the first. */
+int bt_ask(const char *text, const char *buttons);
+void bt_send_message(int reason, int *message, int destination);
+void bt_start_task(const char *command);
+
+#endif

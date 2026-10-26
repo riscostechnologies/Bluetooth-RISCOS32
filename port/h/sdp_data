@@ -1,0 +1,19 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#ifndef BTV_SDP_DATA_H
+#define BTV_SDP_DATA_H
+#include <stddef.h>
+#include <stdint.h>
+typedef struct btv_sdp_element
+{
+    uint8_t descriptor;
+    const uint8_t *data;
+    size_t bytes, total;
+} btv_sdp_element;
+/* Decode one element boundary; does not recurse into sequences. Borrowed data,
+ * output unchanged on failure. Returns 1 valid header/body boundary, 0 invalid. */
+int btv_sdp_element_read(const uint8_t *data, size_t bytes, btv_sdp_element *element);
+/* Exactly one complete element, with all sequence/alternative children valid.
+ * Bounded to 16 nested containers and 4096 elements; no allocation. */
+int btv_sdp_data_valid(const uint8_t *data, size_t bytes);
+#endif

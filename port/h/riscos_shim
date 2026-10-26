@@ -1,0 +1,88 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*
+ * riscos_shim: the RISC OS helpers the 64-bit BluetoothVoice sources call
+ * (their riscos headers, deskswi.h, bt_veneers.h), done for the 32-bit module.
+ * Every call goes through rs_swi, one generic X-SWI veneer, so there is a
+ * single piece of hand-written ARM to trust.
+ */
+#ifndef RISCOS_SHIM_H
+#define RISCOS_SHIM_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+struct os_error
+{
+    uint32_t errnum;
+    char errmess[252];
+};
+
+/* XOS_<number> with r[0..7] in and out; NULL or the error block. */
+const struct os_error *rs_swi(uint32_t number, uint32_t r[8]);
+
+/* Vectors and their reason codes. */
+#define KEYV                    0x13u
+#define POINTERV                0x26u
+#define KeyV_KeyboardPresent    0u
+#define KeyV_KeyUp              1u
+#define KeyV_KeyDown            2u
+#define KeyV_KeyboardRemoved    16u
+
+#define OS_File                 0x08u
+#define OS_ReadVarVal           0x23u
+#define OS_CallEvery            0x3Cu
+#define OS_Hardware             0x7Au
+#define OS_VarType_String       0
+#define OS_VarType_Expanded     3
+
+/* IRQ state: the CPSR I bit set, the old CPSR returned. */
+static inline uint32_t os_irqs_off(void)
+{
+    uint32_t old, tmp;
+    __asm volatile("mrs %0, cpsr\n\t"
+                   "orr %1, %0, #0x80\n\t"
+                   "msr cpsr_c, %1"
+                   : "=r" (old), "=r" (tmp) : : "memory", "cc");
+    return old;
+}
+
+static inline void os_irqs_restore(uint32_t old)
+{
+    __asm volatile("msr cpsr_c, %0" : : "r" (old) : "memory", "cc");
+}
+
+const struct os_error *os_call_a_vector_3(uint32_t vector, uint32_t r0,
+                                          uint32_t r1, uint32_t r2);
+const struct os_error *os_claim(uint32_t vector, void *routine, void *pw);
+const struct os_error *os_release(uint32_t vector, void *routine, void *pw);
+const struct os_error *os_pointer_get_type(uint32_t *type);
+const struct os_error *os_pointer_set_type(uint32_t type);
+const struct os_error *pointer_v_report(uint32_t device, int32_t dx,
+                                        int32_t dy, uint32_t flags);
+const struct os_error *pointer_v_wheel_change(int32_t dz, uint32_t extra,
+                                              int32_t dw);
+/* OS_ReadVarVal without expansion: *len in = space, out = bytes. */
+const struct os_error *kernel_read_var_val(const char *name, char *buffer,
+                                           uint32_t *len);
+const struct os_error *os_read_var_val(const char *name, char *buffer,
+                                       int32_t size, int32_t type,
+                                       int32_t *used);
+uint32_t os_read_monotonic_time(void);
+const struct os_error *os_write_n(const char *text, uint32_t bytes);
+const struct os_error *os_newline(void);
+const struct os_error *os_file_size_no_path(const char *name, int32_t *type,
+                                            uint32_t *length);
+const struct os_error *os_file_load_no_path(const char *name, void *data);
+/* Reads at most *length bytes of a file into data; *length = bytes read. */
+const struct os_error *os_file_read_bounded(const char *name, void *data,
+                                            uint32_t *length);
+const struct os_error *os_file_create_directory(const char *name);
+const struct os_error *os_file_save(const char *name, uint32_t type,
+                                    const void *start, const void *end);
+
+/* The 32-bit KeyV claimant: counts NotifyLEDState and EnableDrivers into
+ * the first three words of the btv_hid_riscos block (R12). */
+extern void btm_keyv_entry(void);
+
+#endif

@@ -1,0 +1,73 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#ifndef BTV_ACL_TRANSMIT_H
+#define BTV_ACL_TRANSMIT_H
+#include <stddef.h>
+#include <stdint.h>
+#define BTV_TX_LINKS 8
+#define BTV_TX_RECEIPTS 32
+enum btv_tx_result { BTV_TX_FAILED = -2, BTV_TX_INVALID = -1, BTV_TX_WAIT = 0, BTV_TX_OK = 1 };
+enum btv_tx_error { BTV_TX_NO_ERROR, BTV_TX_USB_ERROR, BTV_TX_CREDIT_ERROR };
+typedef struct btv_tx_link
+{
+    uint8_t *storage;
+    size_t capacity, length, offset;
+    uint16_t handle, pending, controller_pending;
+    uint8_t bound;
+} btv_tx_link;
+typedef struct btv_tx_receipt
+{
+    uint32_t ticket;
+    uint8_t link, usb_done, controller_done;
+} btv_tx_receipt;
+typedef struct btv_acl_transmit
+{
+    btv_tx_link links[BTV_TX_LINKS];
+    btv_tx_receipt receipts[BTV_TX_RECEIPTS];
+    uint16_t mtu, credits, maximum;
+    unsigned int next_link, error;
+    uint32_t next_ticket, prepared_ticket;
+    unsigned int prepared_link, prepared_slot;
+    size_t prepared_bytes;
+} btv_acl_transmit;
+typedef struct btv_acl_completed
+{
+    uint16_t handle, packets;
+} btv_acl_completed;
+
+/* One controller, serialized deferred owner. No allocations or callbacks.
+ * Initialize only with no old USB callbacks/traffic able to reach this state.
+ * transport_bytes includes the four-byte HCI ACL header. Controller and host
+ * limits both apply; this implementation needs room for the L2CAP header. */
+int btv_acl_transmit_init(btv_acl_transmit *tx, uint16_t controller_mtu,
+                         uint16_t controller_packets, size_t transport_bytes);
+int btv_acl_transmit_bind(btv_acl_transmit *tx, uint16_t handle, uint8_t *storage, size_t capacity);
+int btv_acl_transmit_unbind(btv_acl_transmit *tx, uint16_t handle);
+/* Copies exactly one complete L2CAP PDU per link. Input may overlap storage.
+ * A subsequent PDU waits until take acknowledges completion of the last one. */
+int btv_acl_transmit_queue(btv_acl_transmit *tx, uint16_t handle, const uint8_t *pdu, size_t bytes);
+/* Peek reserves a stable ticket but no controller credit. Zero means no packet
+ * or insufficient capacity (output/ticket unchanged). On transport BUSY retry
+ * the same peek. Do not mutate output before submission. After the transport
+ * accepts its copied bytes, call sent before delivering any completions.
+ * Only one packet can be prepared at a time. Output must not overlap bound
+ * PDU storage or this state structure. All calls are owner-serialized. */
+size_t btv_acl_transmit_peek(btv_acl_transmit *tx, uint8_t *output, size_t capacity, uint32_t *ticket);
+int btv_acl_transmit_sent(btv_acl_transmit *tx, uint32_t ticket);
+/* Each accepted ticket needs exactly one USB completion. USB success means
+ * the entire submitted packet completed. A short/failed transfer freezes TX;
+ * never restore a controller credit merely because the USB transfer failed. */
+int btv_acl_transmit_usb_done(btv_acl_transmit *tx, uint32_t ticket, int success);
+/* Owner extracts ONLY ACL entries from validated Number Of Completed Packets
+ * events using its typed link table; SCO accounting is separate. Validate the
+ * entire batch before applying it. Unknown positive counts or over-reporting
+ * freeze TX, without granting any credits from that batch. Duplicate handles
+ * are summed. The wire event can contain at most 63 entries. */
+int btv_acl_transmit_completed(btv_acl_transmit *tx, const btv_acl_completed *entries, size_t count);
+/* PDU completion requires all fragments submitted, acknowledged by the
+ * controller AND completed by USB. It does not prove remote application use. */
+int btv_acl_transmit_take(btv_acl_transmit *tx, uint16_t handle);
+/* A disconnected link with outstanding controller debt needs the owner's
+ * disconnect/reset recovery. Unbind deliberately cannot guess freed credits.
+ * Freeze on error, drain physical I/O, then reinitialize after recovery. */
+#endif

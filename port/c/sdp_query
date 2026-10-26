@@ -1,0 +1,178 @@
+/*-
+ * Copyright (c) 2009 The NetBSD Foundation, Inc.
+ * All rights reserved.
+ *
+ * This code is derived from software contributed to The NetBSD Foundation
+ * by Iain Hibbert.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE NETBSD FOUNDATION, INC. AND CONTRIBUTORS
+ * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE FOUNDATION OR CONTRIBUTORS
+ * BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+/* Nonblocking adaptation of NetBSD sdp_service_search_attribute. Copied caller
+ * storage replaces realloc, with explicit submission, timeout and page limits. */
+#include "sdp_query.h"
+#include <string.h>
+
+static uint16_t read16(const uint8_t *p)
+{
+    return (uint16_t)(((unsigned int)p[0] << 8) | p[1]);
+}
+
+static void write16(uint8_t *p, uint16_t value)
+{
+    p[0] = (uint8_t)(value >> 8);
+    p[1] = (uint8_t)value;
+}
+
+static int fail(btv_sdp_query *query, uint16_t error)
+{
+    query->state = BTV_SDP_FAILED;
+    query->error = error;
+    return -1;
+}
+
+void btv_sdp_query_init(btv_sdp_query *query)
+{
+    if (query != NULL)
+        memset(query, 0, sizeof(*query));
+}
+
+int btv_sdp_query_start(btv_sdp_query *query, uint16_t service,
+                       uint16_t transaction, uint16_t receive_mtu,
+                       uint8_t *storage, size_t capacity, uint32_t now)
+{
+    if (query == NULL || query->state != BTV_SDP_IDLE || service == 0 ||
+        receive_mtu < 48 || storage == NULL || capacity < 2 || capacity > 65535U)
+        return 0;
+    query->service = service;
+    query->transaction = transaction;
+    /* PDU header + count + largest continuation field must fit receive MTU. */
+    query->maximum = (uint16_t)(receive_mtu - 24);
+    query->storage = storage;
+    query->capacity = capacity;
+    query->started = now;
+    query->state = BTV_SDP_READY;
+    return 1;
+}
+
+void btv_sdp_query_tick(btv_sdp_query *query, uint32_t now)
+{
+    if (query != NULL && (query->state == BTV_SDP_READY || query->state == BTV_SDP_WAIT) &&
+        (uint32_t)(now - query->started) >= 60000UL)
+        fail(query, 0xfffe);
+}
+
+void btv_sdp_query_abort(btv_sdp_query *query)
+{
+    if (query != NULL)
+        fail(query, 0xffff);
+}
+
+size_t btv_sdp_query_request(btv_sdp_query *query, uint8_t *output,
+                            size_t capacity, uint32_t now)
+{
+    static const uint8_t attributes[14] = {
+        0x35, 12, 0x09, 0, 1, 0x09, 0, 4, 0x09, 0, 9, 0x09, 3, 0x11
+    };
+    size_t bytes;
+    if (query == NULL || output == NULL)
+        return 0;
+    btv_sdp_query_tick(query, now);
+    bytes = 27 + query->continuation[0];
+    if (query->state != BTV_SDP_READY || capacity < bytes)
+        return 0;
+    output[0] = 6;
+    write16(output + 1, query->transaction);
+    write16(output + 3, (uint16_t)(bytes - 5));
+    output[5] = 0x35;
+    output[6] = 3;
+    output[7] = 0x19;
+    write16(output + 8, query->service);
+    write16(output + 10, query->maximum);
+    memcpy(output + 12, attributes, sizeof(attributes));
+    memcpy(output + 26, query->continuation, (size_t)query->continuation[0] + 1);
+    return bytes;
+}
+
+int btv_sdp_query_sent(btv_sdp_query *query)
+{
+    if (query == NULL || query->state != BTV_SDP_READY)
+        return 0;
+    query->state = BTV_SDP_WAIT;
+    return 1;
+}
+
+int btv_sdp_query_receive(btv_sdp_query *query, const uint8_t *pdu,
+                         size_t bytes, uint32_t now)
+{
+    size_t count, offset, continuation;
+    btv_sdp_element element;
+    if (query == NULL)
+        return -1;
+    btv_sdp_query_tick(query, now);
+    if (query->state == BTV_SDP_FAILED)
+        return -1;
+    if (query->state != BTV_SDP_WAIT)
+        return 0;
+    if (pdu == NULL || bytes < 5)
+        return fail(query, 0xffff);
+    if (read16(pdu + 1) != query->transaction)
+        return 0;
+    if (bytes - 5 > 65535U || read16(pdu + 3) != bytes - 5)
+        return fail(query, 0xffff);
+    if (pdu[0] == 1 && bytes >= 7)
+        return fail(query, read16(pdu + 5));
+    if (pdu[0] != 7 || bytes < 8)
+        return fail(query, 0xffff);
+    count = read16(pdu + 5);
+    if (count == 0 || count > query->maximum || count > bytes - 8 ||
+        count > query->capacity - query->used)
+        return fail(query, 0xffff);
+    offset = 7 + count;
+    continuation = pdu[offset];
+    if (continuation > 16 || continuation != bytes - offset - 1 ||
+        (continuation != 0 && (query->transaction == 65535U || query->pages >= 63)))
+        return fail(query, 0xffff);
+    memcpy(query->storage + query->used, pdu + 7, count);
+    query->used += count;
+    ++query->pages;
+    memcpy(query->continuation, pdu + offset, continuation + 1);
+    if (continuation != 0)
+    {
+        ++query->transaction;
+        query->state = BTV_SDP_READY;
+        return 1;
+    }
+    if (!btv_sdp_data_valid(query->storage, query->used) ||
+        !btv_sdp_element_read(query->storage, query->used, &element) ||
+        (element.descriptor & 0xf8) != 48)
+        return fail(query, 0xffff);
+    query->state = BTV_SDP_DONE;
+    return 1;
+}
+
+const uint8_t *btv_sdp_query_result(const btv_sdp_query *query, size_t *bytes)
+{
+    if (query == NULL || bytes == NULL || query->state != BTV_SDP_DONE)
+        return NULL;
+    *bytes = query->used;
+    return query->storage;
+}

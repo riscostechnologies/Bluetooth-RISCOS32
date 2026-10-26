@@ -1,0 +1,408 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        bt_profiles
+ * Purpose:     Routes Bluetooth core hooks to the A2DP source, the
+ *              classic HID host and the LE input profile.
+ ******************************************************************/
+#include "bt_profiles.h"
+#include "hid_riscos.h"
+#include <string.h>
+
+#define PSM_SDP 0x0001u
+#define PSM_HID_CONTROL 0x0011u
+#define PSM_HID_INTERRUPT 0x0013u
+#define PSM_AVDTP 0x0019u
+#define PSM_AVCTP 0x0017u
+
+/* KeyV holds a pointer to this, so it stays at a fixed address. */
+btv_hid_riscos btp_hid_riscos;
+
+void btp_a2dp_init(btc_core *core);
+void btp_a2dp_link_opened(btc_core *core, uint8_t link);
+void btp_a2dp_link_secured(btc_core *core, uint8_t link);
+void btp_a2dp_link_closed(btc_core *core, uint8_t link);
+uint8_t btp_a2dp_incoming(btc_core *core, uint8_t link);
+void btp_a2dp_channel_open(btc_core *core, int channel);
+void btp_a2dp_channel_data(btc_core *core, int channel, const uint8_t *p,
+                           size_t bytes);
+void btp_a2dp_channel_closed(btc_core *core, int channel);
+void btp_a2dp_pump(btc_core *core);
+
+void btp_hid_init(btc_core *core, uint8_t link);
+void btp_hid_link_opened(btc_core *core, uint8_t link);
+void btp_hid_link_secured(btc_core *core, uint8_t link);
+void btp_hid_link_closed(btc_core *core, uint8_t link);
+uint8_t btp_hid_incoming(btc_core *core, uint8_t link, uint16_t psm);
+void btp_hid_channel_open(btc_core *core, int channel);
+void btp_hid_channel_data(btc_core *core, int channel, const uint8_t *data,
+                          size_t bytes);
+void btp_hid_channel_closed(btc_core *core, int channel);
+void btp_hid_pump(btc_core *core, uint32_t led_flags, unsigned int events);
+void btp_hid_sdp_open(btc_core *core, int channel);
+void btp_hid_sdp_data(btc_core *core, int channel, const uint8_t *data, size_t bytes);
+void btp_hid_sdp_closed(btc_core *core, int channel);
+
+void btp_le_init(btc_core *core, uint8_t link);
+void btp_le_link_opened(btc_core *core, uint8_t link);
+void btp_le_link_closed(btc_core *core, uint8_t link);
+void btp_le_secured(btc_core *core, uint8_t link);
+void btp_le_pump(btc_core *core);
+
+/* ---- AVRCP beside A2DP ------------------------------------------------- */
+
+#define AVRCP_WAIT_MS 1500u    /* for the speaker to open it, before we do */
+
+static btv_avrcp *av(btc_core *core)
+{
+    return &core->profiles->avrcp;
+}
+
+static void avrcp_reset(btc_core *core)
+{
+    btc_profiles *p = core->profiles;
+    btv_avrcp_close(&p->avrcp);
+    p->avrcp_channel = -1;
+    p->avrcp_link = 0xff;
+    p->avrcp_tried = 0;
+    p->avrcp_wait_from = 0;
+}
+
+static uint8_t avrcp_incoming(btc_core *core, uint8_t link)
+{
+    btc_profiles *p = core->profiles;
+    if (p->avrcp_channel >= 0 && p->avrcp_link != link) return BTC_OWN_NONE;
+    if (p->avrcp_channel >= 0) return BTC_OWN_NONE;      /* one at a time */
+    p->avrcp_link = link;
+    return BTC_OWN_AVRCP;
+}
+
+static void avrcp_opened(btc_core *core, int channel)
+{
+    btc_profiles *p = core->profiles;
+    p->avrcp_channel = channel;
+    p->avrcp_link = core->channels[channel].link;
+    btv_avrcp_open(&p->avrcp, core->now);
+    btc_note("AVRCP channel open, link", p->avrcp_link);
+}
+
+static void avrcp_closed(btc_core *core, int channel)
+{
+    btc_profiles *p = core->profiles;
+    if (channel != p->avrcp_channel && p->avrcp_channel >= 0) return;
+    avrcp_reset(core);
+    p->avrcp_tried = 1;          /* not again on this stream */
+}
+
+static void avrcp_data(btc_core *core, int channel, const uint8_t *data,
+                       size_t bytes)
+{
+    uint8_t reply[40];
+    size_t n;
+    (void)channel;
+    n = btv_avrcp_receive(av(core), data, bytes, core->now, reply,
+                          sizeof reply);
+    if (n != 0 && btc_l2cap_can_send(core, core->profiles->avrcp_channel, n))
+        (void)btc_l2cap_send(core, core->profiles->avrcp_channel, reply, n);
+}
+
+/* From the pump: open the channel when A2DP has its media channel and the
+ * speaker has not opened one itself; send the next command. */
+static void avrcp_pump(btc_core *core)
+{
+    btc_profiles *p = core->profiles;
+    const btp_a2dp *a = &p->a2dp;
+    uint8_t out[40];
+    size_t n;
+    if (p->avrcp_channel < 0)
+    {
+        if (!a->active || a->media_channel < 0 || p->avrcp_tried) return;
+        if (p->avrcp_wait_from == 0) p->avrcp_wait_from = core->now | 1u;
+        if (core->now - p->avrcp_wait_from < AVRCP_WAIT_MS) return;
+        p->avrcp_tried = 1;
+        p->avrcp_link = a->link;
+        p->avrcp_channel = btc_l2cap_connect(core, a->link, PSM_AVCTP,
+                                             BTC_OWN_AVRCP, 0);
+        if (p->avrcp_channel < 0) p->avrcp_link = 0xff;
+        return;
+    }
+    if (core->channels[p->avrcp_channel].state != BTC_CH_OPEN) return;
+    n = btv_avrcp_poll(av(core), core->now, out, sizeof out);
+    if (n != 0 && btc_l2cap_send(core, p->avrcp_channel, out, n) != 1)
+        av(core)->outstanding = 0;
+}
+
+void btp_avrcp_host_volume(btc_core *core, unsigned int volume)
+{
+    if (core->profiles != 0) btv_avrcp_set_volume(av(core), volume);
+}
+
+int btp_avrcp_absolute(const btc_core *core)
+{
+    return core->profiles != 0 &&
+           btv_avrcp_absolute(&core->profiles->avrcp);
+}
+
+int btp_avrcp_speaker_volume(const btc_core *core)
+{
+    return core->profiles == 0 ? -1 :
+           btv_avrcp_speaker_volume(&core->profiles->avrcp);
+}
+
+uint32_t btp_avrcp_generation(const btc_core *core)
+{
+    return core->profiles == 0 ? 0 : core->profiles->avrcp.generation;
+}
+
+int btp_avrcp_take_steps(btc_core *core)
+{
+    return core->profiles == 0 ? 0 : btv_avrcp_take_steps(av(core));
+}
+
+unsigned int btp_avrcp_take_mutes(btc_core *core)
+{
+    return core->profiles == 0 ? 0 : btv_avrcp_take_mutes(av(core));
+}
+
+/* ---- consumer keys and game controllers ----------------------------------- */
+
+#define USAGE_MUTE 0xe2u
+#define USAGE_VOLUME_UP 0xe9u
+#define USAGE_VOLUME_DOWN 0xeau
+
+static void key_press(btc_core *core, unsigned int usage)
+{
+    btc_profiles *p = core->profiles;
+    if (usage == USAGE_VOLUME_UP && p->key_steps < 100) ++p->key_steps;
+    else if (usage == USAGE_VOLUME_DOWN && p->key_steps > -100) --p->key_steps;
+    else if (usage == USAGE_MUTE && p->key_mutes < 100) ++p->key_mutes;
+}
+
+int btp_key_take_steps(btc_core *core)
+{
+    int steps;
+    if (core->profiles == 0) return 0;
+    steps = core->profiles->key_steps;
+    core->profiles->key_steps = 0;
+    return steps;
+}
+
+unsigned int btp_key_take_mutes(btc_core *core)
+{
+    unsigned int mutes;
+    if (core->profiles == 0) return 0;
+    mutes = core->profiles->key_mutes;
+    core->profiles->key_mutes = 0;
+    return mutes;
+}
+
+void btp_hid_extras_deliver(btc_core *core, uint8_t link,
+                            const btv_hid_extra_event *e, btv_hid_pad *pad,
+                            uint8_t *pad_attached,
+                            uint16_t last[BTV_XCONSUMER_MAX])
+{
+    unsigned int i, k;
+    if (e->consumer)
+    {
+        /* A usage newly in the report is one press. */
+        for (i = 0; i < e->consumer_count; ++i)
+        {
+            int was = 0;
+            for (k = 0; k < BTV_XCONSUMER_MAX; ++k)
+                if (last[k] == e->consumer_usage[i]) was = 1;
+            if (!was) key_press(core, e->consumer_usage[i]);
+        }
+        for (k = 0; k < BTV_XCONSUMER_MAX; ++k)
+            last[k] = k < e->consumer_count ? e->consumer_usage[k] : 0;
+    }
+    if (e->pad)
+    {
+        core->profiles->pad_last = *e;
+        ++core->profiles->pad_reports;
+        if (!*pad_attached)
+        {
+            if (!btv_hid_riscos_keyboard_attach(&btp_hid_riscos)) return;
+            *pad_attached = 1;
+            core->links[link].flags |= BTC_DEV_HID | BTC_DEV_GAMEPAD;
+        }
+        btv_hid_riscos_pad_event(&btp_hid_riscos, pad, e);
+    }
+}
+
+void btp_hid_extras_detach(btc_core *core, btv_hid_pad *pad,
+                           uint8_t *pad_attached)
+{
+    (void)core;
+    if (!*pad_attached) return;
+    btv_hid_riscos_pad_detach(&btp_hid_riscos, pad);
+    *pad_attached = 0;
+}
+
+void btp_init(btc_core *core)
+{
+    unsigned int index;
+    btp_a2dp_init(core);
+    btv_avrcp_init(&core->profiles->avrcp);
+    core->profiles->avrcp_channel = -1;
+    core->profiles->avrcp_link = 0xff;
+    core->profiles->sdp_link = 0xff;
+    core->profiles->sdp_channel = -1;
+    for (index = 0; index < BTC_LINKS; ++index)
+    {
+        btp_hid_init(core, (uint8_t)index);
+        btp_le_init(core, (uint8_t)index);
+    }
+    /* Keyboards may still be attached from before a core restart. */
+    if (btp_hid_riscos.keyboards == 0) btv_hid_riscos_init(&btp_hid_riscos);
+}
+
+void btp_link_opened(btc_core *core, uint8_t link)
+{
+    btc_link *l = &core->links[link];
+    if (l->le)
+    {
+        btp_le_link_opened(core, link);
+        return;
+    }
+    switch (l->profile)
+    {
+    case BTC_PROFILE_A2DP: btp_a2dp_link_opened(core, link); break;
+    case BTC_PROFILE_HID: btp_hid_link_opened(core, link); break;
+    default: break;
+    }
+}
+
+void btp_link_secured(btc_core *core, uint8_t link)
+{
+    btc_link *l = &core->links[link];
+    if (l->le)
+    {
+        btp_le_secured(core, link);
+        return;
+    }
+    btp_a2dp_link_secured(core, link);
+    btp_hid_link_secured(core, link);
+}
+
+void btp_link_closed(btc_core *core, uint8_t link)
+{
+    if (core->profiles->avrcp_link == link) avrcp_reset(core);
+    btp_a2dp_link_closed(core, link);
+    btp_hid_link_closed(core, link);
+    btp_le_link_closed(core, link);
+}
+
+uint8_t btp_incoming_channel(btc_core *core, uint8_t link, uint16_t psm)
+{
+    (void)core;
+    if (psm == PSM_SDP) return BTC_OWN_SDP;
+    if (psm == PSM_AVDTP) return btp_a2dp_incoming(core, link);
+    /* AVRCP (AVCTP): speakers open it to send their buttons and to tell us
+     * their volume; one channel, on the audio link (avrcp.c). */
+    if (psm == PSM_AVCTP) return avrcp_incoming(core, link);
+    if (psm == PSM_HID_CONTROL || psm == PSM_HID_INTERRUPT)
+        return btp_hid_incoming(core, link, psm);
+    return BTC_OWN_NONE;
+}
+
+void btp_channel_open(btc_core *core, int channel)
+{
+    switch (core->channels[channel].owner)
+    {
+    case BTC_OWN_AVDTP_SIGNAL:
+    case BTC_OWN_AVDTP_MEDIA:
+        btp_a2dp_channel_open(core, channel);
+        break;
+    case BTC_OWN_HID_CONTROL:
+    case BTC_OWN_HID_INTERRUPT:
+        btp_hid_channel_open(core, channel);
+        break;
+    case BTC_OWN_AVRCP:
+        avrcp_opened(core, channel);
+        break;
+    case BTC_OWN_SDP_CLIENT:
+        btp_hid_sdp_open(core, channel);
+        break;
+    default:
+        break;
+    }
+}
+
+void btp_channel_data(btc_core *core, int channel, const uint8_t *data,
+                      size_t bytes)
+{
+    switch (core->channels[channel].owner)
+    {
+    case BTC_OWN_SDP:
+        btc_sdp_server_request(core, channel, data, bytes);
+        break;
+    case BTC_OWN_AVRCP:
+        avrcp_data(core, channel, data, bytes);
+        break;
+    case BTC_OWN_SDP_CLIENT:
+        btp_hid_sdp_data(core, channel, data, bytes);
+        break;
+    case BTC_OWN_AVDTP_SIGNAL:
+    case BTC_OWN_AVDTP_MEDIA:
+        btp_a2dp_channel_data(core, channel, data, bytes);
+        break;
+    case BTC_OWN_HID_CONTROL:
+    case BTC_OWN_HID_INTERRUPT:
+        btp_hid_channel_data(core, channel, data, bytes);
+        break;
+    default:
+        break;
+    }
+}
+
+void btp_channel_closed(btc_core *core, int channel)
+{
+    switch (core->channels[channel].owner)
+    {
+    case BTC_OWN_AVDTP_SIGNAL:
+    case BTC_OWN_AVDTP_MEDIA:
+        btp_a2dp_channel_closed(core, channel);
+        break;
+    case BTC_OWN_HID_CONTROL:
+    case BTC_OWN_HID_INTERRUPT:
+        btp_hid_channel_closed(core, channel);
+        break;
+    case BTC_OWN_AVRCP:
+        avrcp_closed(core, channel);
+        break;
+    case BTC_OWN_SDP_CLIENT:
+        btp_hid_sdp_closed(core, channel);
+        break;
+    default:
+        break;
+    }
+}
+
+void btp_pump(btc_core *core)
+{
+    uint32_t led_flags = 0;
+    unsigned int events = btv_hid_riscos_poll(&btp_hid_riscos, &led_flags);
+    btp_a2dp_pump(core);
+    avrcp_pump(core);
+    btp_hid_pump(core, led_flags, events);
+    btp_le_pump(core);
+    if (events & BTV_HID_RISCOS_RESET)
+    {
+        unsigned int index;
+        for (index = 0; index < BTC_LINKS; ++index)
+            if (core->profiles->le[index].keyboard)
+                btv_hid_keyboard_forget(&core->profiles->le[index].kb);
+    }
+}
+
+/* Release every attached input device (module finalisation). */
+void btp_shutdown(btc_core *core)
+{
+    unsigned int index;
+    for (index = 0; index < BTC_LINKS; ++index)
+    {
+        btp_hid_link_closed(core, (uint8_t)index);
+        btp_le_link_closed(core, (uint8_t)index);
+    }
+    btp_a2dp_link_closed(core, core->profiles->a2dp.link);
+}

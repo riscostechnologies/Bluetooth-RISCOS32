@@ -1,0 +1,29 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#ifndef BTV_RFCOMM_L2CAP_H
+#define BTV_RFCOMM_L2CAP_H
+#include "rfcomm_session.h"
+#include "l2cap_channel.h"
+typedef struct btv_rfcomm_l2cap {
+    const btv_l2cap_channel *channel;
+    btv_rfcomm_session session;
+    uint8_t frame[518];
+    unsigned int prepared;
+} btv_rfcomm_l2cap;
+/* Bind one dedicated OPEN PSM 3 channel, whose lifetime belongs to the parent
+ * dispatcher. Parent verifies PSM, security policy and SDP server channel.
+ * Derives directional MTUs from the channel. No copying/reinitializing bound
+ * channel or binding until old IO is drained. Same serialized owner as dispatch. */
+int btv_rfcomm_l2cap_start(btv_rfcomm_l2cap *binding, const btv_l2cap_channel *channel,
+    int initiator, uint8_t server_channel, uint32_t now);
+/* Parent ticks dispatcher first. Loss of OPEN prevents further RFCOMM traffic
+ * and aborts its session. Parent closes L2CAP once session CLOSED/FAILED. */
+void btv_rfcomm_l2cap_tick(btv_rfcomm_l2cap *binding, uint32_t now);
+/* Complete reassembled L2CAP PDU: 0 other CID, 1 consumed, 2 retry, -1 failed.
+ * Signaling is routed separately to the parent dispatcher. */
+int btv_rfcomm_l2cap_receive(btv_rfcomm_l2cap *binding, const uint8_t *pdu, size_t bytes, uint32_t now);
+/* Complete L2CAP PDU for copied ACL TX. Prioritize parent signaling output.
+ * sent immediately follows accepted copy; never on BUSY/failed output. */
+size_t btv_rfcomm_l2cap_output(btv_rfcomm_l2cap *binding, uint8_t *pdu, size_t capacity, uint32_t now);
+int btv_rfcomm_l2cap_sent(btv_rfcomm_l2cap *binding, uint32_t now);
+#endif

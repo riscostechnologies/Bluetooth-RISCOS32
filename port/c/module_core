@@ -1,0 +1,1391 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        module_core
+ * Purpose:     The module side of the shared Bluetooth core: the ticker
+ *              and callback that drive it without client polling, and
+ *              the SWIs the desktop uses (chunk offsets 8 onwards, which
+ *              CMunge routes to Mod_SWI).
+ ******************************************************************/
+#include "hid_riscos.h"
+#include "modhead.h"
+#include "bt_profiles.h"
+#include "bt_reconnect.h"
+#include "bt_ui.h"
+#include "bt_info.h"
+#include "sound_device.h"
+#include "bttrace.h"
+#include "host_bridge.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "riscos/deskswi.h"
+#include "riscos/kernelops.h"
+
+/* OS_CallEvery rejects an interval of 0 (1 cs), so every 2 cs. */
+#define CORE_TICK_CS 1
+#define DEVICE_ENTRY_BYTES 96u
+#define KEY_ENTRY_BYTES ((unsigned int)sizeof(btc_key))
+
+void btp_shutdown(btc_core *core);
+uint32_t btp_a2dp_status(const btc_core *core);
+extern uint32_t btc_passkey, btc_passkey_generation;
+extern btv_hid_riscos btp_hid_riscos;
+extern uint32_t btc_profile_generation;
+
+static btc_core core;
+static btc_profiles profiles;
+static btv_host_bridge_completion completion;
+static int ticker_on;
+extern void (*btc_stage_hook)(unsigned int stage);
+static int discoverable_wanted;
+/* Set when the core has stopped and the audio device is still ours. */
+static int sound_release_pending;
+
+/* The ticker and callback find the module through this block.
+ * +0 callback pending, +4 private word pointer, +8 callback veneer,
+ * +12 ticks seen, +16 callbacks queued. */
+static struct
+{
+    uint32_t pending;
+    void *pw;
+    void (*veneer)(void);
+    uint32_t ticks, queued;
+} drive;
+static uint32_t callbacks;
+/* The adapter log as it was when the core last failed. */
+static uint8_t failure_trace[48 * 32];
+static uint32_t failure_bytes, failure_error;
+
+/* The ticker and its callback are c/btglue.c's (s/boundaries). */
+
+/* c/btglue32 */
+uint32_t bt_now_ms(void);
+int bt_drive_start(void);
+void bt_drive_stop(void);
+
+static uint32_t now_ms(void)
+{
+    return bt_now_ms();
+}
+
+/* ---- the module's own settings, before the desktop --------------------
+ *
+ * A ROM module initialises before !Boot, so Choices: does not exist yet.
+ * The module therefore keeps a ticker going from its start and, once
+ * Choices$Path is set, reads the same files the desktop writes:
+ * Choices:Bluetooth.Config (Power=, Reconnect=), .NoAuto (one address a
+ * line, devices not to reconnect) and .Keys (the bonds). If Power=1 it
+ * powers the controller on itself and the core reconnects the bonded
+ * devices when it is ready: the keyboard and mouse work at the command line
+ * and in the rest of !Boot. */
+static int boot_start_tried;
+static int settings_pending;
+static bt_ui_settings_poll settings_poll;
+static int config_dirty;            /* changed before the settings were read */
+static int cfg_power, cfg_start = 1, cfg_discoverable, cfg_output;
+static int cfg_idle = BTUI_IDLE_DEFAULT;
+#define KEY_MAGIC_TEXT "BTKEY001"
+
+/* Every read and write of a file goes to the debug channel with its path and
+ * what came of it: the serial log says whether the settings were found. */
+static void file_note(const char *what, const char *path, const char *result,
+                      uint32_t value)
+{
+    char line[160];
+    snprintf(line, sizeof line, "%s %s: %s %u", what, path, result,
+             (unsigned)value);
+    btv_host_bridge_note("settings:", line);
+}
+
+static uint8_t *read_file(const char *name, uint32_t *length)
+{
+    int32_t type = 0;
+    uint8_t *data;
+    const struct os_error *e = os_file_size_no_path(name, &type, length);
+    if (e != NULL)
+    {
+        file_note("read", name, e->errmess, e->errnum);
+        return NULL;
+    }
+    if (type != 1)
+    {
+        file_note("read", name, type == 0 ? "not found, object type" :
+                  "not a file, object type", (uint32_t)type);
+        return NULL;
+    }
+    data = malloc(*length + 1u);
+    if (data != NULL && (e = os_file_read_bounded(name, data, length)) != NULL)
+    {
+        file_note("read", name, e->errmess, e->errnum);
+        free(data);
+        return NULL;
+    }
+    if (data != NULL) data[*length] = 0;
+    file_note("read", name, "ok, bytes", *length);
+    return data;
+}
+
+/* Saves a file under Choices:Bluetooth (the directory made first with
+ * OS_File 8), logged. */
+static void write_file(const char *leaf, uint32_t type, const void *start,
+                       const void *end)
+{
+    char dir[48], path[64];
+    const struct os_error *e;
+    (void)btui_write_dir(dir, sizeof dir);
+    (void)btui_write_path(leaf, path, sizeof path);
+    e = os_file_create_directory(dir);
+    if (e != NULL) file_note("mkdir", dir, e->errmess, e->errnum);
+    e = os_file_save(path, type, start, end);
+    if (e != NULL)
+        file_note("write", path, e->errmess, e->errnum);
+    else
+        file_note("write", path, "ok, bytes",
+                  (uint32_t)((const char *)end - (const char *)start));
+}
+
+static int parse_address(const char *t, uint8_t raw[6])
+{
+    return btui_parse_address(t, raw) != 0;
+}
+
+static _kernel_oserror *core_start(void);
+static int boot_started_core;       /* started by the module, not asked for */
+
+/* ---- what the module keeps for the desktop ------------------------------
+ * The bonds (Choices:Bluetooth.Keys), the names of paired devices (.Names)
+ * and the extra mouse buttons' applications (Choices:Mouse.Buttons, read
+ * only). The writing is done in the foreground, from the SWI the icon task
+ * calls when it sees something to save (Core reason 22). */
+#define NAMES_MAX 32
+#define NAME_ROOM 48
+static struct { uint8_t raw[6]; char name[NAME_ROOM]; } names[NAMES_MAX];
+static unsigned int names_count;
+static int names_dirty;
+static uint32_t keys_saved_generation;
+
+static void names_remember(const uint8_t raw[6], const char *name)
+{
+    unsigned int i;
+    for (i = 0; i < names_count; ++i)
+        if (memcmp(names[i].raw, raw, 6) == 0)
+        {
+            if (strncmp(names[i].name, name, NAME_ROOM - 1) != 0)
+            {
+                strncpy(names[i].name, name, NAME_ROOM - 1);
+                names_dirty = 1;
+            }
+            return;
+        }
+    if (names_count >= NAMES_MAX) return;
+    memcpy(names[names_count].raw, raw, 6);
+    strncpy(names[names_count].name, name, NAME_ROOM - 1);
+    names[names_count].name[NAME_ROOM - 1] = 0;
+    ++names_count;
+    names_dirty = 1;
+}
+
+static const char *names_find(const uint8_t raw[6])
+{
+    unsigned int i;
+    for (i = 0; i < names_count; ++i)
+        if (memcmp(names[i].raw, raw, 6) == 0) return names[i].name;
+    return 0;
+}
+
+/* Battery levels last seen, by address (a Low Energy device's Battery
+ * Service), so the list shows the last one when the device is away. */
+static struct { uint8_t raw[6]; uint8_t level; } batteries[NAMES_MAX];
+static unsigned int batteries_count;
+
+static uint8_t battery_of(const uint8_t address[6])
+{
+    btc_link *link = btc_link_by_address(&core, address);
+    unsigned int i;
+    if (link != 0 && link->le && core.profiles != 0)
+    {
+        uint8_t level = profiles.le[btc_link_index(&core, link)].battery;
+        if (level <= 100)
+        {
+            for (i = 0; i < batteries_count; ++i)
+                if (memcmp(batteries[i].raw, address, 6) == 0)
+                {
+                    batteries[i].level = level;
+                    return level;
+                }
+            if (batteries_count < NAMES_MAX)
+            {
+                memcpy(batteries[batteries_count].raw, address, 6);
+                batteries[batteries_count++].level = level;
+            }
+            return level;
+        }
+    }
+    for (i = 0; i < batteries_count; ++i)
+        if (memcmp(batteries[i].raw, address, 6) == 0) return batteries[i].level;
+    return 0xff;
+}
+
+#define MB_MAX 32
+static char mb_path[MB_MAX][200];
+
+static void mouse_buttons_load(void)
+{
+    uint32_t length = 0, mask = 0;
+    uint8_t *data = read_file("Choices:Mouse.Buttons", &length);
+    char *line;
+    memset(mb_path, 0, sizeof mb_path);
+    if (data != NULL)
+    {
+        for (line = (char *)data; line != NULL && *line;)
+        {
+            char *end = strchr(line, '\n');
+            unsigned int button;
+            if (end != NULL) *end = 0;
+            {
+                char path[sizeof mb_path[0]];
+                button = btui_button_line(line, path, sizeof path);
+                if (button != 0)
+                {
+                    memcpy(mb_path[button - 1], path, sizeof path);
+                    mask |= 1u << (button - 1);
+                }
+            }
+            line = end != NULL ? end + 1 : NULL;
+        }
+        free(data);
+    }
+    btv_hid_riscos_set_mapped_buttons(&btp_hid_riscos, mask);
+}
+
+/* Keys: the same file the desktop wrote before the module did. */
+static void keys_save(void)
+{
+    static uint8_t file[16 + BTC_KEYS * sizeof(btc_key)];
+    uint32_t header[2], count = 0, index;
+    memcpy(file, KEY_MAGIC_TEXT, 8);
+    for (index = 0; index < BTC_KEYS; ++index)
+    {
+        if (!core.keys[index].used) continue;
+        memcpy(file + 16 + count * KEY_ENTRY_BYTES, &core.keys[index],
+               KEY_ENTRY_BYTES);
+        ++count;
+    }
+    header[0] = KEY_ENTRY_BYTES;
+    header[1] = count;
+    memcpy(file + 8, header, 8);
+    write_file("Keys", 0xFFDu, file, file + 16 + count * KEY_ENTRY_BYTES);
+    keys_saved_generation = core.keys_generation;
+}
+
+static void names_save(void)
+{
+    static char text[NAMES_MAX * (NAME_ROOM + 20)];
+    size_t at = 0;
+    unsigned int i;
+    for (i = 0; i < names_count && at < sizeof text - 1; ++i)
+    {
+        int n = snprintf(text + at, sizeof text - at,
+            "%02X:%02X:%02X:%02X:%02X:%02X %s\n", names[i].raw[5],
+            names[i].raw[4], names[i].raw[3], names[i].raw[2],
+            names[i].raw[1], names[i].raw[0], names[i].name);
+        if (n < 0) break;
+        /* A line cut short stops the file there, never runs past it. */
+        if ((size_t)n >= sizeof text - at) { at = sizeof text - 1; break; }
+        at += (size_t)n;
+    }
+    write_file("Names", 0xFFFu, text, text + at);
+    names_dirty = 0;
+}
+
+/* Choices:Bluetooth.Config, written from what the module holds: the same
+ * five lines the desktop wrote (the module is the owner of these now). */
+static void settings_save(void)
+{
+    char text[96];
+    bt_ui_config c;
+    size_t n;
+    c.power = cfg_power; c.start = cfg_start; c.discoverable = cfg_discoverable;
+    c.reconnect = btc_rc_enabled(); c.output = cfg_output;
+    c.idle = cfg_idle;
+    n = btui_config_text(&c, text, sizeof text);
+    if (n == 0) return;
+    if (settings_pending)
+    {
+        /* Choices are not there yet: saved as soon as they are, over what
+         * is read from them. */
+        config_dirty = 1;
+        btv_host_bridge_note("settings:", "config change held until Choices exists");
+        return;
+    }
+    write_file("Config", 0xFFFu, text, text + n);
+}
+
+/* Choices have appeared: read them. Returns when done. */
+static void settings_load(void)
+{
+    uint32_t length = 0;
+    uint8_t *data;
+    char *line;
+    bt_ui_config file_config;
+    btui_config_defaults(&file_config);
+    data = read_file("Choices:Bluetooth.Config", &length);
+    if (data != NULL)
+    {
+        for (line = (char *)data; line != NULL && *line;)
+        {
+            (void)btui_config_line(line, &file_config);
+            line = strchr(line, '\n');
+            if (line != NULL) ++line;
+        }
+        free(data);
+    }
+    else
+    {
+        /* No Config file: the 32-bit Configure keeps its choices in
+         * Bluetooth.Settings and never writes one.  On, and reconnecting,
+         * as the app would have it; not off, which stopped the controller
+         * brought up at boot and left nothing to reconnect until the
+         * window was opened. */
+        file_config.power = 1;
+        file_config.reconnect = 1;
+    }
+    if (!config_dirty)      /* a change made before this keeps its value */
+    {
+        cfg_power = file_config.power;
+        cfg_start = file_config.start;
+        cfg_discoverable = file_config.discoverable;
+        cfg_output = file_config.output;
+        cfg_idle = file_config.idle;
+        btp_a2dp_set_idle(0);   /* 32-bit: never (see BTUI_IDLE_DEFAULT) */
+        btc_rc_set_enabled(file_config.reconnect);
+    }
+    data = read_file("Choices:Bluetooth.NoAuto", &length);
+    if (data != NULL)
+    {
+        for (line = (char *)data; line != NULL && *line;)
+        {
+            uint8_t raw[6];
+            if (parse_address(line, raw)) btc_rc_set_auto(raw, 0);
+            line = strchr(line, '\n');
+            if (line != NULL) ++line;
+        }
+        free(data);
+    }
+    data = read_file("Choices:Bluetooth.Keys", &length);
+    if (data != NULL)
+    {
+        const unsigned int entry = KEY_ENTRY_BYTES;
+        uint32_t header[2];
+        if (length >= 16u && memcmp(data, KEY_MAGIC_TEXT, 8) == 0)
+        {
+            memcpy(header, data + 8, 8);
+            /* An entry of this module's size, or of the first version's (the
+             * same, less what was added at the end). */
+            if ((header[0] == entry || header[0] == BTC_KEY_V1_BYTES) &&
+                header[1] != 0 &&
+                16u + (uint64_t)header[0] * header[1] <= length)
+            {
+                uint32_t i;
+                for (i = 0; i < header[1]; ++i)
+                {
+                    btc_key e, *key;
+                    if (!btc_key_unpack(&e, data + 16u + i * header[0],
+                                        header[0]) || !e.used)
+                        continue;
+                    key = btc_key_store(&core, e.address, e.le);
+                    if (key != 0) *key = e;
+                }
+            }
+            else
+                btv_host_bridge_note("keys file is of another version: ignored",
+                                     NULL);
+        }
+        free(data);
+    }
+    data = read_file("Choices:Bluetooth.Names", &length);
+    if (data != NULL)
+    {
+        for (line = (char *)data; line != NULL && *line;)
+        {
+            uint8_t raw[6];
+            char *end = strchr(line, '\n');
+            if (end != NULL) *end = 0;
+            if (parse_address(line, raw) && strlen(line) > 18 && line[17] == ' ')
+                names_remember(raw, line + 18);
+            line = end != NULL ? end + 1 : NULL;
+        }
+        free(data);
+        names_dirty = 0;
+    }
+    mouse_buttons_load();
+    btv_sound_device_autoselect(cfg_output);
+    btv_host_bridge_note(cfg_power ? "settings read: Bluetooth is on"
+                                   : "settings read: Bluetooth is off", NULL);
+    if (cfg_power && core.state == BTC_OFF)
+    {
+        _kernel_oserror *e = core_start();
+        if (e != NULL)
+            btv_host_bridge_note("pre-desktop start failed", NULL);
+    }
+    else if (!cfg_power && boot_started_core && core.state != BTC_OFF)
+    {
+        /* The controller was brought up at boot before the settings could
+         * be read; they say it is to be off. */
+        btv_host_bridge_note("settings:", "Bluetooth is off in the settings: stopping");
+        btc_stop(&core);
+    }
+    else if (core.state == BTC_READY)
+    {
+        /* Ready before the bonds were read: bring the devices back now. */
+        btc_rc_ready(&core);
+    }
+}
+
+/* Is Choices$Path set? Its value is a long string ("<Boot$ChoicesRW>.,
+ * Boot:RO1000Hook."), so it is measured (OS_ReadVarVal with size -1), not
+ * read into a small buffer, which fails for a value that does not fit. */
+static int choices_path_set(void)
+{
+    int32_t used = 0;
+    const struct os_error *e;
+    int set;
+    int32_t type = 0;
+    uint32_t length = 0;
+    int file;
+    static uint32_t looks;
+    char line[120];
+
+    e = os_read_var_val("Choices$Path", NULL, -1, OS_VarType_Expanded, &used);
+    /* RISC OS 5 answers a size of -1 with an error (buffer overflow) even
+     * when the variable exists; R2 then holds NOT its length (-68 for
+     * Choices$Path here), and 0 when there is no such variable. */
+    (void)e;
+    set = used != 0;
+    /* A second signal that does not depend on that call: the file itself,
+     * found through Choices: (which only resolves once Choices$Path does). */
+    file = os_file_size_no_path("Choices:Bluetooth.Config", &type, &length) == NULL
+           && type == 1;
+    /* Said once a second for the first minute, then every ten seconds: the
+     * serial log shows when Choices appears relative to the boot. */
+    if (looks < 60u || looks % 10u == 0)
+    {
+        snprintf(line, sizeof line,
+                 "waiting for Choices (look %u): Choices$Path %s (%d), Config file %s, ms since module init %u",
+                 (unsigned)looks, set ? "set" : "unset", (int)used,
+                 file ? "found" : "not found",
+                 (unsigned)(now_ms() - btc_origin_ms));
+        btv_host_bridge_note("settings:", line);
+    }
+    ++looks;
+    return set || file;
+}
+
+/* The desktop starting is the fallback: read them then whatever the answer. */
+void btm_settings_force(void)
+{
+    settings_poll.forced = 1;
+}
+
+static void settings_step(uint32_t now)
+{
+    if (!settings_pending || !btui_settings_due(&settings_poll, now)) return;
+    if (!btui_settings_decide(&settings_poll, choices_path_set())) return;
+    btv_host_bridge_note("settings:", settings_poll.forced ?
+                         "reading Choices (the desktop is starting)" :
+                         "Choices$Path is set: reading Choices");
+    settings_pending = 0;
+    settings_load();
+    if (config_dirty)
+    {
+        config_dirty = 0;
+        settings_save();
+    }
+}
+
+static void drive_start(void)
+{
+    if (ticker_on) return;
+    drive.pending = 0;
+    if (bt_drive_start()) ticker_on = 1;
+}
+
+static void drive_stop(void)
+{
+    if (!ticker_on) return;
+    bt_drive_stop();
+    ticker_on = 0;
+    drive.pending = 0;
+    btc_stage_hook = 0;
+    btv_host_bridge_flush(BTTR_DRAIN_BYTES * 2u);
+}
+
+/* Begun from the first tick or the first service call after the modules
+ * start, whichever comes first. */
+void btm_boot_start(void)
+{
+    if (!boot_start_tried)
+    {
+        /* The controller's bring-up (the UART, the patch, the
+         * configuration) needs no settings and takes seconds: begun at
+         * boot, so it is done by the time anything wants a device. If the
+         * settings later say Bluetooth is off, it is stopped then. */
+        boot_start_tried = 1;
+        if (core.state == BTC_OFF)
+        {
+            btv_host_bridge_note("boot:", "starting the controller at module start-up");
+            if (core_start() == NULL) boot_started_core = 1;
+        }
+    }
+}
+
+/* The desktop starting, for the boot timings. */
+void btm_note_desktop(void)
+{
+    btc_note("desktop starting, ms since module init", now_ms() - btc_origin_ms);
+}
+
+static void pump_body(void);
+
+/* The core is not re-entrant: the callback and the status SWIs (R1 = 2, 3)
+ * both pump it, and a SWI issued from inside SoundDMA's in-place fill must
+ * not run it again half way through a packet. */
+static volatile unsigned int pump_busy;
+
+void bt_drive_soon(void);
+void bt_drive_soon_done(void);
+
+static void pump(void)
+{
+    unsigned int index;
+    size_t backlog = 0;
+    if (pump_busy) return;
+    pump_busy = 1;
+    bt_drive_soon_done();
+    pump_body();
+    /* Data still waiting to go to the adapter: pump again soon rather than
+     * at the next 2 cs tick (see bt_drive_soon). */
+    if (core.state == BTC_READY && ticker_on)
+        for (index = 0; index < BTC_LINKS; ++index)
+            if (core.links[index].state != BTC_LINK_FREE)
+                backlog += btc_link_backlog(&core, (uint8_t)index);
+    if (backlog != 0) bt_drive_soon();
+    pump_busy = 0;
+}
+
+static void pump_body(void)
+{
+    btm_boot_start();
+    settings_step(now_ms());
+    btc_pump(&core, now_ms());
+    if (core.state == BTC_READY && discoverable_wanted != core.discoverable)
+        btc_discoverable(&core, discoverable_wanted);
+    if (core.state == BTC_FAILED || (core.state == BTC_STOPPING &&
+                                     core.error != 0 &&
+                                     failure_error != core.error))
+    {
+        if (failure_error != core.error)
+        {
+            failure_error = core.error;
+            failure_bytes = btv_host_bridge_trace(failure_trace,
+                                                  sizeof(failure_trace));
+        }
+    }
+    if (core.state == BTC_OFF)
+    {
+        /* Stopped (or failed and released): tidy up.  The audio device
+         * is NOT handed back here.  pump() runs from a transient
+         * callback, and giving the controller back means calling
+         * Sound_SelectDefaultController and OS_Hardware while SoundDMA
+         * may be filling a buffer underneath us - which took the machine
+         * down when the task was quit mid-stream.  Leave it to the next
+         * SWI, which runs in the caller's own foreground. */
+        if (core.profiles != 0)
+        {
+            btp_shutdown(&core);
+            core.profiles = 0;
+            sound_release_pending = 1;
+        }
+        if (!settings_pending) drive_stop();
+    }
+}
+
+/* Hand the audio device back, from a foreground caller only. */
+static void service_pending_release(void)
+{
+    if (!sound_release_pending) return;
+    sound_release_pending = 0;
+    (void)btv_sound_device_stereo_sync(0, 0, 0);
+}
+
+/* Poll timing, on while Bluetooth$Trace is set to a non-zero number (looked
+ * at once a second): each callback is timed in microseconds from the HAL
+ * counter and one over 2 ms is kept with the stage that took the time,
+ * for *BTInfo and, queued, the debug channel. Off, a callback costs
+ * nothing extra. */
+static int trace_on;
+static uint32_t trace_looked_cs;
+
+static void stage_changed(unsigned int stage)
+{
+    bttr_stage(stage, btv_host_bridge_micros());
+}
+
+static void trace_refresh(uint32_t cs)
+{
+    char value[8];
+    uint32_t length = sizeof value - 1u;
+
+    if (cs - trace_looked_cs < 100u && trace_looked_cs != 0)
+        return;
+    trace_looked_cs = cs | 1u;
+    if (kernel_read_var_val("Bluetooth$Trace", value, &length) != NULL ||
+        length == 0 || value[0] < '1' || value[0] > '9')
+        trace_on = 0;
+    else
+        trace_on = 1;
+    btc_stage_hook = trace_on ? stage_changed : 0;
+}
+
+/* For the icon task: is the poll timing on? */
+int btm_trace_enabled(void)
+{
+    return trace_on;
+}
+
+void btm_callback(void)
+{
+    uint32_t cs = (uint32_t)os_read_monotonic_time();
+
+    if (++callbacks == 1)
+        btv_host_bridge_note("ticker: first callback", NULL);
+    trace_refresh(cs);
+    if (trace_on)
+    {
+        bttr_begin(btv_host_bridge_micros());
+        pump();
+        if (bttr_end(0, btv_host_bridge_micros(), cs))
+        {
+            struct bttr_slow slow;
+            char line[96];
+            uint32_t kept = bttr_slow_count();
+            if (bttr_slow_get(kept < BTTR_KEEP ? (unsigned)kept - 1u :
+                              BTTR_KEEP - 1u, &slow))
+            {
+                bttr_format(&slow, line, sizeof line);
+                (void)bttr_put(line);
+            }
+        }
+    }
+    else
+        pump();
+    btv_host_bridge_flush(BTTR_DRAIN_BYTES);
+}
+
+/* ---- module hooks ------------------------------------------------ */
+
+void bt_glue_init(void *pw);
+
+void btm_init(void *pw)
+{
+    drive.pw = pw;
+    bt_glue_init(pw);
+    btp_a2dp_set_idle(0);   /* see BTUI_IDLE_DEFAULT */
+    memset(&core, 0, sizeof(core));
+    btc_origin_ms = now_ms();
+    /* Look for the settings from the ticker, once Choices exists. */
+    settings_pending = 1;
+    memset(&settings_poll, 0, sizeof settings_poll);
+    drive_start();
+}
+
+int btm_active(void)
+{
+    return core.state != BTC_OFF;
+}
+
+/* Finalisation: refuse while the core runs (the app stops it first). */
+int btm_final(void)
+{
+    if (core.state != BTC_OFF) return 0;
+    drive_stop();
+    /* A core never started has no profiles to shut down. */
+    if (core.profiles != 0) btp_shutdown(&core);
+    sound_release_pending = 0;
+    (void)btv_sound_device_stereo_sync(0, 0, 0);
+    btv_host_bridge_flush(BTTR_RING);
+    return 1;
+}
+
+static _kernel_oserror *core_start(void)
+{
+    if (core.state != BTC_OFF) return NULL;
+            btv_host_bridge_note("core start requested", NULL);
+            {
+                /* The adapter may have re-enumerated since the module
+                 * loaded (the USB drivers are swapped at start-up). */
+                btv_host_bridge_info info;
+                if (!btv_host_bridge_inspect(&info) ||
+                    (int)info.result != BTV_HOST_BRIDGE_OK)
+                {
+                    btv_host_bridge_note("core start: no controller "
+                                         "(inspect failed)", NULL);
+                    return error_BackendUnavailable;
+                }
+            }
+            {
+        /* btc_start clears the core: the bonds are kept through it. */
+        static btc_key keep[BTC_KEYS];
+        int started;
+        memcpy(keep, core.keys, sizeof keep);
+        started = btc_start(&core, &profiles, &completion, now_ms());
+        memcpy(core.keys, keep, sizeof keep);
+        keys_saved_generation = core.keys_generation;
+        if (!started)
+        {
+            btv_host_bridge_note("core start: the controller did not "
+                                 "come up (see above)", NULL);
+            return error_BackendUnavailable;
+        }
+    }
+    btv_host_bridge_note("core start: transport open, bring-up continues "
+                         "in the ticker", NULL);
+    drive_start();
+    return NULL;
+}
+
+/* ---- SWIs --------------------------------------------------------- */
+
+static void put16(uint8_t *p, uint16_t value)
+{
+    p[0] = (uint8_t)value;
+    p[1] = (uint8_t)(value >> 8);
+}
+
+static uint8_t link_state_for(const uint8_t address[6], uint8_t *profile,
+                              uint8_t *security)
+{
+    btc_link *link = btc_link_by_address(&core, address);
+    *profile = 0;
+    *security = 0;
+    if (link == 0) return 0;
+    *security = link->security;
+    if (link->le)
+    {
+        *profile = profiles.le[btc_link_index(&core, link)].state;
+    }
+    else if (link->profile == BTC_PROFILE_HID)
+        *profile = profiles.hid[btc_link_index(&core, link)].state;
+    else if (link->profile == BTC_PROFILE_A2DP &&
+             profiles.a2dp.link == (uint8_t)btc_link_index(&core, link))
+        *profile = profiles.a2dp.state;
+    return link->state;
+}
+
+static int already_listed(const uint8_t *buffer, unsigned int count,
+                          const uint8_t address[6])
+{
+    unsigned int index;
+    for (index = 0; index < count; ++index)
+        if (memcmp(buffer + 8 + index * DEVICE_ENTRY_BYTES, address, 6) == 0)
+            return 1;
+    return 0;
+}
+
+static unsigned int add_entry(uint8_t *buffer, unsigned int count,
+                              unsigned int capacity,
+                              const uint8_t address[6], uint16_t flags,
+                              int8_t rssi, uint8_t address_type,
+                              const uint8_t *device_class,
+                              const char *name, uint16_t appearance)
+{
+    uint8_t *e;
+    uint8_t profile, security;
+    btc_key *key;
+    if (count >= capacity || already_listed(buffer, count, address))
+        return count;
+    e = buffer + 8 + count * DEVICE_ENTRY_BYTES;
+    memset(e, 0, DEVICE_ENTRY_BYTES);
+    memcpy(e, address, 6);
+    key = btc_key_find(&core, address);
+    if (key != 0) flags = (uint16_t)(flags | key->flags | BTC_DEV_PAIRED |
+                                     (key->le ? BTC_DEV_LE : 0));
+    /* A paired device that is not in range is still listed by its name. */
+    if (key != 0)
+    {
+        if (name != 0 && name[0] != 0) names_remember(address, name);
+        else if (names_find(address) != 0) name = names_find(address);
+    }
+    e[13] = link_state_for(address, &profile, &security);
+    if (e[13] != 0) flags |= BTC_DEV_CONNECTED;
+    put16(e + 6, flags);
+    e[8] = (uint8_t)rssi;
+    e[9] = address_type;
+    if (device_class != 0) memcpy(e + 10, device_class, 3);
+    e[14] = profile;
+    e[15] = security;
+    if (name != 0) memcpy(e + 16, name, BTC_NAME_BYTES - 1);
+    put16(e + 80, appearance);
+    e[82] = battery_of(address);
+    return count + 1;
+}
+
+/* R2 = buffer, R3 = size.  Out: word count, word generation, entries. */
+static _kernel_oserror *swi_devices(_kernel_swi_regs *r)
+{
+    uint8_t *buffer = (uint8_t *)r->r[2];
+    unsigned int capacity, count = 0, index;
+    uint32_t generation;
+    if (r->r[3] < 8 || (r->r[2] & 3) != 0) return error_InvalidArgument;
+    /* Whole entries that fit, without a division helper. */
+    for (capacity = 0; 8u + (capacity + 1u) * DEVICE_ENTRY_BYTES <=
+                       (unsigned int)r->r[3]; ++capacity) {}
+    /* The client has room for a few dozen: what a person came for first
+     * (what is connected, then what is paired), then the scan's finds, the
+     * more useful and nearer ones before the rest. */
+    for (index = 0; index < BTC_LINKS; ++index)
+    {
+        btc_link *l = &core.links[index];
+        btc_device *d;
+        if (l->state == BTC_LINK_FREE) continue;
+        d = btc_device_find(&core, l->address);
+        count = add_entry(buffer, count, capacity,
+                          d != 0 && d->has_identity ? d->identity : l->address,
+                          (uint16_t)(l->flags | (l->le ? BTC_DEV_LE : 0)),
+                          d != 0 ? d->rssi : 0,
+                          d != 0 && d->has_identity ? d->identity_type :
+                          l->address_type,
+                          d != 0 ? d->device_class : 0,
+                          d != 0 ? d->name : 0, d != 0 ? d->appearance : 0);
+    }
+    for (index = 0; index < BTC_KEYS; ++index)
+    {
+        btc_key *k = &core.keys[index];
+        btc_device *d;
+        if (!k->used) continue;
+        d = btc_device_find(&core, k->address);
+        count = add_entry(buffer, count, capacity, k->address,
+                          (uint16_t)(k->flags | (d != 0 ? d->flags : 0)),
+                          d != 0 ? d->rssi : 0, k->address_type,
+                          d != 0 ? d->device_class : 0,
+                          d != 0 ? d->name : 0, d != 0 ? d->appearance : 0);
+    }
+    {
+        uint64_t done = 0;
+        unsigned int round;
+        for (round = 0; round < core.device_count; ++round)
+        {
+            unsigned int best = core.device_count;
+            int best_value = -100000;
+            btc_device *d;
+            for (index = 0; index < core.device_count; ++index)
+            {
+                int v;
+                if ((done >> index) & 1u) continue;
+                v = btc_device_value(&core, &core.devices[index]);
+                if (v > best_value) { best_value = v; best = index; }
+            }
+            if (best == core.device_count) break;
+            done |= (uint64_t)1 << best;
+            d = &core.devices[best];
+            /* A bonded LE device is listed under its identity address,
+             * however it was found, so that it is one entry, and a paired
+             * one. */
+            count = add_entry(buffer, count, capacity,
+                              d->has_identity ? d->identity : d->address,
+                              d->flags, d->rssi,
+                              d->has_identity ? d->identity_type :
+                              ((d->flags & BTC_DEV_RANDOM_ADDR) ? 1 : 0),
+                              d->device_class, d->name, d->appearance);
+        }
+    }
+    generation = core.devices_generation + core.links_generation +
+                 core.keys_generation + btc_profile_generation;
+    memcpy(buffer, &count, 4);
+    memcpy(buffer + 4, &generation, 4);
+    r->r[3] = (int)(8u + count * DEVICE_ENTRY_BYTES);
+    return NULL;
+}
+
+uint32_t btv_sound_device_sink(const int16_t *frames, uint32_t count);
+
+static _kernel_oserror *swi_keys(_kernel_swi_regs *r)
+{
+    unsigned int index, count = 0;
+    switch (r->r[1])
+    {
+    case 0: /* read: R2 buffer, R3 size -> R3 used, R4 entry size */
+    {
+        uint8_t *buffer = (uint8_t *)r->r[2];
+        unsigned int capacity = (unsigned int)r->r[3];
+        for (index = 0; index < BTC_KEYS; ++index)
+        {
+            if (!core.keys[index].used) continue;
+            if ((count + 1u) * KEY_ENTRY_BYTES > capacity) break;
+            memcpy(buffer + count * KEY_ENTRY_BYTES, &core.keys[index],
+                   KEY_ENTRY_BYTES);
+            ++count;
+        }
+        r->r[3] = (int)(count * KEY_ENTRY_BYTES);
+        r->r[4] = (int)KEY_ENTRY_BYTES;
+        r->r[5] = (int)core.keys_generation;
+        return NULL;
+    }
+    case 1: /* load: R2 buffer, R3 bytes (whole entries) */
+    {
+        const uint8_t *buffer = (const uint8_t *)r->r[2];
+        unsigned int bytes = (unsigned int)r->r[3];
+        for (index = 0; (index + 1u) * KEY_ENTRY_BYTES <= bytes; ++index)
+        {
+            btc_key entry;
+            btc_key *key;
+            memcpy(&entry, buffer + index * KEY_ENTRY_BYTES,
+                   KEY_ENTRY_BYTES);
+            if (!entry.used) continue;
+            key = btc_key_store(&core, entry.address, entry.le);
+            if (key != 0) *key = entry;
+        }
+        r->r[5] = (int)core.keys_generation;
+        return NULL;
+    }
+    case 2: /* forget: R2 -> address */
+    {
+        const uint8_t *address = (const uint8_t *)r->r[2];
+        btc_rc_user_dropped(&core, address);
+        (void)btc_disconnect(&core, address);
+        (void)btc_key_forget(&core, address);
+        r->r[5] = (int)core.keys_generation;
+        return NULL;
+    }
+    default:
+        return error_InvalidArgument;
+    }
+}
+
+/* Chunk offset 8 onwards. R0 = flags (0) for all. */
+_kernel_oserror *btm_swi(int swi, _kernel_swi_regs *r)
+{
+    if (r->r[0] != 0) return error_InvalidArgument;
+    if (swi == 8 && r->r[1] == 11)
+    {
+        /* The speakers' sound, from SoundDMA's ticker (it is the sink
+         * SoundDMA calls; sound_device.c): R2 -> frames, R3 how many; R3
+         * is how many were taken. Only copies, and nothing else is done
+         * first: it runs in a ticker. */
+        r->r[3] = (int)btv_sound_device_sink(
+            (const int16_t *)(uintptr_t)(uint32_t)r->r[2],
+            (uint32_t)r->r[3]);
+        return NULL;
+    }
+    service_pending_release();
+    /* The foreground is where files are written: anything that changed
+     * (a pairing, a name) is saved at the next SWI at the latest. */
+    if (!settings_pending)
+    {
+        if (core.keys_generation != keys_saved_generation) keys_save();
+        if (names_dirty) names_save();
+    }
+    switch (swi)
+    {
+    case 8: /* Core: R1 = 0 start, 1 stop, 2 read */
+        if (r->r[1] == 0)
+        {
+            boot_started_core = 0;      /* asked for: it stays */
+            return core_start();
+        }
+        if (r->r[1] == 1)
+        {
+            btv_host_bridge_note("core stop requested", NULL);
+            btc_stop(&core);
+            return NULL;
+        }
+        /* The desktop's status polls also pump the core, in case the
+         * ticker or callback is not running. */
+        if (core.state != BTC_OFF && (r->r[1] == 2 || r->r[1] == 3)) pump();
+        if (r->r[1] == 3)
+        {
+            /* Bring-up detail for diagnostics. */
+            r->r[1] = (int)(core.boot.stage | (core.boot.error << 8) |
+                            ((uint32_t)core.config_step << 16) |
+                            ((uint32_t)core.command_count << 24));
+            r->r[2] = (int)(core.command_waiting |
+                            ((uint32_t)core.waiting_opcode << 8) |
+                            ((uint32_t)core.credits << 24));
+            r->r[3] = (int)core.event_count;
+            r->r[4] = (int)core.command_ticket;
+            r->r[5] = (int)core.acl_in_ticket;
+            r->r[6] = (int)core.acl_out_ticket[0];
+            r->r[7] = (int)((unsigned int)ticker_on | (drive.pending << 1) |
+                            ((drive.ticks & 0xffu) << 8) |
+                            ((drive.queued & 0xffu) << 16) |
+                            ((callbacks & 0xffu) << 24));
+            return NULL;
+        }
+        if (r->r[1] == 4)
+        {
+            /* Packet trace: R2 = buffer, R3 = size; R3 = bytes out. */
+            r->r[3] = (int)btv_host_bridge_trace((uint8_t *)r->r[2],
+                                                 (uint32_t)r->r[3]);
+            return NULL;
+        }
+        if (r->r[1] == 5)
+        {
+            /* Log saved at the last failure: R2 = buffer, R3 = size. */
+            uint32_t bytes = failure_bytes;
+            if ((uint32_t)r->r[3] < bytes) bytes = (uint32_t)r->r[3];
+            memcpy((uint8_t *)r->r[2], failure_trace, bytes);
+            r->r[3] = (int)bytes;
+            r->r[4] = (int)failure_error;
+            return NULL;
+        }
+        if (r->r[1] == 6)
+        {
+            /* Hand the audio device back to SoundDMA without stopping
+             * anything else: the recovery for a device left registered,
+             * which otherwise aborts SoundDMA when this module dies. */
+            r->r[1] = (int)btv_sound_device_state();
+            (void)btv_sound_device_stereo_sync(0, 0, 0);
+            btv_sound_device_sync(NULL, 0);
+            r->r[2] = (int)btv_sound_device_state();
+            return NULL;
+        }
+        if (r->r[1] == 7)
+        {
+            /* Answer the pairing question: R2 = 1 accept, 0 refuse;
+             * R3 = the passkey typed, for a passkey question. */
+            (void)btc_prompt_answer(&core, r->r[2] != 0, (uint32_t)r->r[3]);
+            return NULL;
+        }
+        if (r->r[1] == 8)
+        {
+            /* Who the pairing question is about: R2 -> 6 bytes. */
+            memcpy((uint8_t *)r->r[2], core.prompt_address, 6);
+            return NULL;
+        }
+        if (r->r[1] == 15)
+        {
+            /* "Reconnect my devices at start-up": R2 = 1 or 0. The
+             * desktop also keeps it in Choices:Bluetooth.Config, which the
+             * module reads at start-up. */
+            btc_rc_set_enabled(r->r[2] != 0);
+            settings_save();
+            return NULL;
+        }
+        if (r->r[1] == 16)
+        {
+            /* "Reconnect automatically" for one device: R2 -> address, R3
+             * = 1 or 0 (Choices:Bluetooth.NoAuto holds the offs). */
+            btc_rc_set_auto((const uint8_t *)r->r[2], r->r[3] != 0);
+            return NULL;
+        }
+        if (r->r[1] == 18)
+        {
+            /* "Bluetooth on" in the settings, which the module acts on at
+             * the next start-up before the desktop: R2 = 1 or 0. */
+            cfg_power = r->r[2] != 0;
+            settings_save();
+            return NULL;
+        }
+        if (r->r[1] == 20)
+        {
+            /* The summary the desktop's clients read (bt_ui.h): R2 packed
+             * state, R3 generation, R4 last problem. */
+            bt_ui_summary s;
+            unsigned int index;
+            uint32_t a = core.profiles != 0 ? btp_a2dp_status(&core) : 0;
+            unsigned int st = a & 0xffu;
+            memset(&s, 0, sizeof s);
+            s.state = core.state;
+            s.scanning = btc_scanning(&core);
+            s.prompt = core.prompt_kind != 0;
+            s.audio = (st == 0 || st == 11) ? 0 : st == 9 ? 2 : st == 10 ? 3 :
+                      (st == 12 || (a >> 8) != 0) ? 4 : 1;
+            s.reconnecting = core.rc_active != 0;
+            for (index = 0; index < BTC_LINKS; ++index)
+                if (core.links[index].state == BTC_LINK_OPEN) s.connected = 1;
+            s.power_wanted = cfg_power;
+            s.settings_read = !settings_pending;
+            r->r[2] = (int)btui_pack_summary(&s);
+            r->r[3] = (int)(core.devices_generation + core.links_generation +
+                            core.keys_generation + btc_profile_generation);
+            r->r[4] = (int)core.last_problem;
+            return NULL;
+        }
+        if (r->r[1] == 17)
+        {
+            /* How the module started: R2 = Bluetooth was on in the
+             * settings, R3 = 1 when the settings have been read, R4 =
+             * devices the core is still bringing back. */
+            r->r[2] = cfg_power;
+            r->r[3] = !settings_pending;
+            r->r[4] = core.rc_active ? core.rc_count : 0;
+            return NULL;
+        }
+        if (r->r[1] == 21)
+        {
+            /* The next queued press of an extra mouse button that starts
+             * an application: R2 -> a buffer, R3 = its size in; out R3 =
+             * the length of the command put there ("Filer_Run <path>"), 0
+             * for none. */
+            unsigned int button = btv_hid_riscos_next_launch(&btp_hid_riscos);
+            char *out = (char *)(uintptr_t)(uint32_t)r->r[2];
+            unsigned int room = (unsigned int)r->r[3];
+            int n = 0;
+            if (button != 0 && button <= MB_MAX && mb_path[button - 1][0] != 0)
+                n = snprintf(out, room, "Filer_Run %s", mb_path[button - 1]);
+            r->r[3] = n > 0 && (unsigned int)n < room ? n : 0;
+            return NULL;
+        }
+        if (r->r[1] == 22)
+        {
+            /* Save what has changed: the bonds and the names. Called by
+             * the icon task, in the foreground. */
+            if (!settings_pending)
+            {
+                if (core.keys_generation != keys_saved_generation) keys_save();
+                if (names_dirty) names_save();
+            }
+            return NULL;
+        }
+        if (r->r[1] == 26)
+        {
+            /* The speaker's volume and the desktop's, exchanged (AVRCP,
+             * bt_profiles.c). In: R2 = the desktop's volume, 0 to 127, or
+             * -1 to leave it. Out: R2 bit 0 = the speaker's volume is
+             * absolute (it is the master volume: SoundDMA does not apply
+             * the system volume as well), bits 8 to 15 = volume steps from
+             * its buttons since last asked (signed, positive up), bits 16
+             * to 23 = mute presses since last asked; R3 = the speaker's
+             * volume or -1; R4 = a number that changes when the speaker's
+             * buttons moved the volume. Called by
+             * the icon task, in the foreground: it sets the sound
+             * mixer from these. */
+            int absolute;
+            if (core.profiles != 0 && r->r[2] >= 0 && r->r[2] <= 127)
+                btp_avrcp_host_volume(&core, (unsigned int)r->r[2]);
+            absolute = btp_avrcp_absolute(&core);
+            btv_sound_device_external_volume(absolute &&
+                                             btv_sound_device_registered());
+            {
+                int steps = btp_avrcp_take_steps(&core) + btp_key_take_steps(&core);
+                unsigned int mutes = btp_avrcp_take_mutes(&core) +
+                                     btp_key_take_mutes(&core);
+                if (steps > 127) steps = 127;
+                if (steps < -127) steps = -127;
+                r->r[2] = absolute | (int)(((unsigned int)steps & 0xffu) << 8) |
+                          (int)((mutes & 0xffu) << 16);
+            }
+            r->r[3] = btp_avrcp_speaker_volume(&core);
+            r->r[4] = (int)btp_avrcp_generation(&core);
+            return NULL;
+        }
+        if (r->r[1] == 30)
+        {
+            /* The core's notes, oldest first: R2 = buffer, R3 = size;
+             * R3 = bytes written (32-bit build). */
+            r->r[3] = (int)btv_host_bridge_notes((char *)r->r[2],
+                                                 (uint32_t)r->r[3]);
+            return NULL;
+        }
+        if (r->r[1] == 27)
+        {
+            /* The last game controller report, raw, for software that wants
+             * the axes rather than the keys (nothing reads Joystick_Read
+             * from here: USBJoystick has no way in for a Bluetooth device).
+             * Out: R2 = buttons (bit n is button n+1), R3 = X | Y << 16,
+             * R4 = Z | Rx << 16, R5 = Ry | Rz << 16 (signed 16 bits, -32768
+             * to 32767, y down), R6 = hat (0 centred, 1 up, then clockwise
+             * to 8), R7 = reports seen so far (changes with each). */
+            if (core.profiles == 0)
+            {
+                r->r[2] = r->r[3] = r->r[4] = r->r[5] = r->r[6] = r->r[7] = 0;
+                return NULL;
+            }
+            else
+            {
+                const btv_hid_extra_event *e = &profiles.pad_last;
+                r->r[2] = (int)e->pad_buttons;
+                r->r[3] = (int)(((uint32_t)(uint16_t)e->axis[0]) |
+                                ((uint32_t)(uint16_t)e->axis[1] << 16));
+                r->r[4] = (int)(((uint32_t)(uint16_t)e->axis[2]) |
+                                ((uint32_t)(uint16_t)e->axis[3] << 16));
+                r->r[5] = (int)(((uint32_t)(uint16_t)e->axis[4]) |
+                                ((uint32_t)(uint16_t)e->axis[5] << 16));
+                r->r[6] = e->hat;
+                r->r[7] = (int)profiles.pad_reports;
+                return NULL;
+            }
+        }
+        if (r->r[1] == 25)
+        {
+            /* The desktop has changed the mouse settings (Configure >
+             * Mouse): read Choices:Mouse.Buttons again, and have every mouse
+             * read the Bluetooth$Mouse* variables again with its next
+             * report. */
+            mouse_buttons_load();
+            btv_hid_riscos_options_changed(&btp_hid_riscos);
+            return NULL;
+        }
+        if (r->r[1] == 23)
+        {
+            /* The sound output the user has chosen (1 the speakers, 0 not):
+             * remembered, and the speakers are selected again when they
+             * connect next time. R2. */
+            cfg_output = r->r[2] != 0;
+            btv_sound_device_autoselect(cfg_output);
+            settings_save();
+            return NULL;
+        }
+        if (r->r[1] == 24)
+        {
+            /* Is the speakers' sound the output as remembered: R2. */
+            r->r[2] = cfg_output;
+            return NULL;
+        }
+        if (r->r[1] == 12)
+        {
+            /* Select the speakers as the output when they connect: R2. */
+            btv_sound_device_autoselect(r->r[2] != 0);
+            return NULL;
+        }
+        if (r->r[1] == 10)
+        {
+            /* The sound output without a speaker: R2 = 1 registers the
+             * sink with SoundDMA and selects it, 0 hands sound back; R3 =
+             * 1 if it is registered. For trying the sound system's end. */
+            r->r[3] = btv_sound_device_stereo_sync(r->r[2] != 0, 44100u,
+                                                   now_ms());
+            return NULL;
+        }
+        if (r->r[1] == 9)
+        {
+            /* Discoverable: R2 = 1 on, 0 off (still connectable). */
+            /* Remembered, and applied when the controller is ready: the
+             * desktop asks as soon as it has started the core. */
+            discoverable_wanted = r->r[2] != 0;
+            if (core.state == BTC_READY) btc_discoverable(&core, discoverable_wanted);
+            return NULL;
+        }
+        if (r->r[1] != 2) return error_InvalidArgument;
+        r->r[1] = core.state;
+        r->r[2] = (int)core.error;
+        r->r[3] = (int)(core.devices_generation + core.links_generation +
+                        core.keys_generation + btc_profile_generation);
+        r->r[4] = (int)btc_passkey_generation;
+        r->r[5] = (int)btc_passkey;
+        r->r[6] = (int)core.last_problem;
+        r->r[7] = btc_scanning(&core);
+        /* The pairing question: kind | generation << 8, then its value
+         * (the six digits to compare, for a confirmation). */
+        r->r[8] = (int)(core.prompt_kind | (core.prompt_generation << 8) |
+                        (core.discoverable ? 0x80000000u : 0));
+        r->r[9] = (int)core.prompt_value;
+        return NULL;
+    case 9: /* Scan: R1 = seconds, 0 to stop */
+        if (core.state != BTC_READY) return error_NotReady;
+        if (r->r[1] == 0) btc_scan_stop(&core);
+        else if (!btc_scan(&core, (unsigned int)r->r[1])) return error_Busy;
+        return NULL;
+    case 10: /* Devices */
+        return swi_devices(r);
+    case 11: /* Connect: R1 -> address, R2 = profile, R3 = LE | type << 8 */
+        if (core.state != BTC_READY) return error_NotReady;
+        if (!btc_connect(&core, (const uint8_t *)r->r[1], r->r[3] & 1,
+                         (uint8_t)((unsigned int)r->r[3] >> 8),
+                         (uint8_t)r->r[2]))
+            return error_Busy;
+        return NULL;
+    case 12: /* Disconnect: R1 -> address */
+        btc_rc_user_dropped(&core, (const uint8_t *)r->r[1]);
+        (void)btc_disconnect(&core, (const uint8_t *)r->r[1]);
+        return NULL;
+    case 13: /* Keys */
+        return swi_keys(r);
+    case 14: /* Audio: R1 = A2DP state | error, R2 = sound meter */
+        if (core.profiles == 0)
+        {
+            memset(r->r + 1, 0, 9 * sizeof(int));
+            r->r[4] = (int)btv_sound_device_state();
+            return NULL;
+        }
+        r->r[1] = (int)btp_a2dp_status(&core);
+        r->r[2] = (int)profiles.a2dp.packets;
+        r->r[3] = (int)profiles.a2dp.underruns;
+        r->r[4] = (int)btv_sound_device_state();
+        r->r[5] = (int)profiles.a2dp.late;
+        r->r[6] = (int)btv_sound_device_meter();
+        r->r[7] = (int)core.acl_sent;
+        r->r[8] = (int)((core.acl_no_slot & 0xffffu) |
+                        (core.acl_no_credit << 16));
+        r->r[9] = (int)((core.acl_busy & 0xffu) |
+                        ((uint32_t)core.last_role << 8) |
+                        ((uint32_t)core.acl_free << 16) |
+                        ((uint32_t)core.acl_max << 24));
+        return NULL;
+    case 16: /* Diagnostics: a test tone of R1 ms (at most five seconds)
+              * mixed into the A2DP stream; R1 = 1 started, 0 not
+              * streaming.  The 32-bit build's BTToneTest uses it. */
+        r->r[1] = btv_sound_device_test_tone((uint32_t)r->r[1]);
+        return NULL;
+    case 15: /* Adapter: is one plugged in, and does the stack suit it?
+              * R1 = 0 none, 1 present; R2 = 1 when the loaded USBDriver
+              * offers asynchronous control (the swap is unnecessary);
+              * R3 = vendor | product << 16.  The desktop asks before it
+              * replaces the USB stack, so a machine with no adapter never
+              * has its keyboard and mouse restarted at start-up. */
+    {
+        btv_host_bridge_info info;
+        int present = btv_host_bridge_inspect(&info) != 0;
+        r->r[1] = present;
+        r->r[2] = present && (int)info.result == BTV_HOST_BRIDGE_OK;
+        r->r[3] = present ? (int)(info.vendor | (info.product << 16)) : 0;
+        return NULL;
+    }
+    default:
+        return error_BAD_SWI;
+    }
+}
+
+/* *BTInfo: the stack's state, printed (c/bt_info.c). */
+void bt_task_print_poll_log(void);
+void btm_print_slow_log(void);
+
+void btm_print_slow_log(void)
+{
+    char line[96];
+    struct bttr_slow slow;
+    unsigned int i;
+
+    snprintf(line, sizeof line, "Module polls (Bluetooth$Trace %s): %u timed, "
+             "%u over 2 ms, worst %u us, trace queue %u bytes, %u lines lost",
+             trace_on ? "on" : "off", (unsigned)bttr_polls(),
+             (unsigned)bttr_slow_count(), (unsigned)bttr_worst_us(),
+             (unsigned)bttr_pending(), (unsigned)bttr_dropped());
+    (void)os_write_n(line, (uint32_t)strlen(line));
+    (void)os_newline();
+    for (i = 0; bttr_slow_get(i, &slow); i++)
+    {
+        bttr_format(&slow, line, sizeof line);
+        (void)os_write_n(line, (uint32_t)strlen(line));
+        (void)os_newline();
+    }
+}
+
+void btm_print_info(void)
+{
+    static char text[5120];
+    size_t at = 0, line;
+    (void)btinfo_text(&core, text, sizeof text);
+    while (text[at] != 0)
+    {
+        line = at;
+        while (text[line] != 0 && text[line] != '\n') ++line;
+        (void)os_write_n(text + at, (uint32_t)(line - at));
+        (void)os_newline();
+        at = text[line] == '\n' ? line + 1 : line;
+    }
+    bt_task_print_poll_log();
+    btm_print_slow_log();
+    btv_host_bridge_flush(512);
+}

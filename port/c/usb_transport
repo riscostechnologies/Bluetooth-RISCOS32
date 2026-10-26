@@ -1,0 +1,149 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        usb_transport
+ * Purpose:     Bounds-checked USB Bluetooth endpoint discovery.
+ * Reference:   NetBSD ubt_attach endpoint roles; pinned in upstream manifest.
+ ******************************************************************/
+#include "usb_transport.h"
+#include <string.h>
+
+#define USB_CONFIG 2
+#define USB_INTERFACE 4
+#define USB_ENDPOINT 5
+#define USB_BULK 2
+#define USB_INTERRUPT 3
+#define USB_ISOCHRONOUS 1
+#define USB_DIRECTION_IN 0x80
+#define USB_CLASS_WIRELESS 0xe0
+
+/* Read little-endian fields without unaligned ARM halfword accesses. */
+static uint16_t read16(const uint8_t *data)
+{
+    return (uint16_t)((unsigned int)data[0] | ((unsigned int)data[1] << 8));
+}
+
+/* Select only a complete, unambiguous layout; never partially publish it. */
+int btv_usb_select(const uint8_t *configuration, size_t bytes,
+                    uint8_t alternate, btv_usb_endpoints *output)
+{
+    btv_usb_endpoints found;
+    size_t total, offset, length;
+    unsigned int interface_kind, expected, seen, address, type, packet, endpoint_mask;
+    unsigned int have_interface, have_hci, have_voice, hci_roles, voice_roles, bit;
+    const uint8_t *descriptor;
+    if (configuration == NULL || output == NULL || bytes < 9 ||
+        configuration[0] < 9 || configuration[1] != USB_CONFIG)
+        return BTV_USB_INVALID;
+    total = read16(configuration + 2);
+    if (total > bytes || total < configuration[0] || configuration[5] == 0)
+        return BTV_USB_INVALID;
+    memset(&found, 0, sizeof(found));
+    found.configuration = configuration[5];
+    found.voice_alternate = alternate;
+    interface_kind = expected = seen = endpoint_mask = have_interface = 0;
+    have_hci = have_voice = hci_roles = voice_roles = 0;
+    offset = configuration[0];
+    while (offset < total)
+    {
+        if (total - offset < 2)
+            return BTV_USB_INVALID;
+        descriptor = configuration + offset;
+        length = descriptor[0];
+        if (length < 2 || length > total - offset)
+            return BTV_USB_INVALID;
+        if (descriptor[1] == USB_INTERFACE)
+        {
+            if (length < 9 || (have_interface && seen != expected))
+                return BTV_USB_INVALID;
+            have_interface = 1;
+            expected = descriptor[4];
+            seen = endpoint_mask = interface_kind = 0;
+            if (descriptor[2] == 0 && descriptor[3] == 0)
+            {
+                if (have_hci++)
+                    return BTV_USB_INVALID;
+                interface_kind = 1;
+            }
+            else if (descriptor[2] == 1 && descriptor[3] == alternate)
+            {
+                if (have_voice++)
+                    return BTV_USB_INVALID;
+                interface_kind = 2;
+            }
+            if (interface_kind && (descriptor[5] != USB_CLASS_WIRELESS ||
+                                   descriptor[6] != 1 || descriptor[7] != 1))
+                return BTV_USB_UNSUPPORTED;
+        }
+        else if (descriptor[1] == USB_ENDPOINT)
+        {
+            if (length < 7 || !have_interface || ++seen > expected)
+                return BTV_USB_INVALID;
+            address = descriptor[2];
+            type = descriptor[3] & 3;
+            packet = read16(descriptor + 4);
+            if ((address & 15) == 0 || (address & 0x70) != 0 || (packet & 0xe000) != 0)
+                return BTV_USB_INVALID;
+            bit = 1u << ((address & 15) + ((address & USB_DIRECTION_IN) ? 16 : 0));
+            if (endpoint_mask & bit)
+                return BTV_USB_INVALID;
+            endpoint_mask |= bit;
+            /* This first backend supports full-speed, one transaction/frame.
+             * High-bandwidth multipliers need a speed-aware scheduler. */
+            if (interface_kind && (packet & 0x1800) != 0)
+                return BTV_USB_UNSUPPORTED;
+            if (interface_kind == 1)
+            {
+                if (packet == 0)
+                    return BTV_USB_INVALID;
+                if (type == USB_INTERRUPT && (address & USB_DIRECTION_IN))
+                {
+                    if (hci_roles & 1) return BTV_USB_INVALID;
+                    hci_roles |= 1;
+                    found.event_in = (uint8_t)address;
+                    found.event_packet = (uint16_t)packet;
+                }
+                else if (type == USB_BULK && (address & USB_DIRECTION_IN))
+                {
+                    if (hci_roles & 2) return BTV_USB_INVALID;
+                    hci_roles |= 2;
+                    found.acl_in = (uint8_t)address;
+                    found.acl_in_packet = (uint16_t)packet;
+                }
+                else if (type == USB_BULK)
+                {
+                    if (hci_roles & 4) return BTV_USB_INVALID;
+                    hci_roles |= 4;
+                    found.acl_out = (uint8_t)address;
+                    found.acl_out_packet = (uint16_t)packet;
+                }
+            }
+            else if (interface_kind == 2 && type == USB_ISOCHRONOUS)
+            {
+                if (alternate != 0 && packet == 0)
+                    return BTV_USB_INVALID;
+                if (address & USB_DIRECTION_IN)
+                {
+                    if (voice_roles & 1) return BTV_USB_INVALID;
+                    voice_roles |= 1;
+                    found.sco_in = (uint8_t)address;
+                    found.sco_in_packet = (uint16_t)packet;
+                }
+                else
+                {
+                    if (voice_roles & 2) return BTV_USB_INVALID;
+                    voice_roles |= 2;
+                    found.sco_out = (uint8_t)address;
+                    found.sco_out_packet = (uint16_t)packet;
+                }
+            }
+        }
+        offset += length;
+    }
+    if (have_interface && seen != expected)
+        return BTV_USB_INVALID;
+    if (!have_hci || !have_voice || hci_roles != 7 || voice_roles != 3)
+        return BTV_USB_UNSUPPORTED;
+    *output = found;
+    return BTV_USB_READY;
+}

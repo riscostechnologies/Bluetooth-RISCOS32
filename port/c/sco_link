@@ -1,0 +1,151 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#include "sco_link.h"
+#include <string.h>
+static void recover(btv_sco_link *link)
+{
+    link->state = BTV_SL_RECOVER;
+    btv_hci_commands_abort(link->commands);
+}
+void btv_sco_link_init(btv_sco_link *link)
+{
+    if (link != NULL) memset(link, 0, sizeof(*link));
+}
+int btv_sco_link_start(btv_sco_link *link, btv_hci_commands *commands,
+    const uint8_t address[6], const btv_sco_parameters *parameters, uint32_t now)
+{
+    uint8_t packet[20];
+    uint32_t ticket;
+    size_t bytes;
+    if (link == NULL || commands == NULL || address == NULL || link->state != BTV_SL_IDLE) return 0;
+    bytes = btv_sco_setup_command(packet, sizeof(packet), parameters);
+    if (!bytes || btv_hci_commands_queue(commands, packet, bytes, BTV_COMMAND_STATUS, &ticket) != BTV_COMMAND_OK) return 0;
+    link->commands = commands;
+    link->ticket = ticket;
+    link->started = now;
+    memcpy(link->address, address, 6);
+    link->state = BTV_SL_WAIT;
+    return 1;
+}
+int btv_sco_link_submitted(btv_sco_link *link, uint32_t ticket)
+{
+    unsigned int i;
+    if (link == NULL || (link->state != BTV_SL_WAIT && link->state != BTV_SL_CLOSING) || link->submitted || ticket != link->ticket) return 0;
+    for (i = 0; i < BTV_COMMAND_SLOTS; ++i)
+        if (link->commands->slots[i].ticket == ticket && link->commands->slots[i].submitted)
+        { link->submitted = 1; return 1; }
+    return 0;
+}
+int btv_sco_link_disconnect(btv_sco_link *link, uint32_t now)
+{
+    uint8_t packet[6], parameters[3];
+    uint32_t ticket;
+    if (link == NULL || link->state != BTV_SL_OPEN || link->commands->recovery) return 0;
+    parameters[0] = (uint8_t)link->result.handle;
+    parameters[1] = (uint8_t)(link->result.handle >> 8);
+    parameters[2] = 0x13;
+    btv_hci_command(packet, sizeof(packet), 0x0406, parameters, 3);
+    if (btv_hci_commands_queue(link->commands, packet, sizeof(packet), BTV_COMMAND_STATUS, &ticket) != BTV_COMMAND_OK) return 0;
+    link->ticket = ticket;
+    link->started = now;
+    link->submitted = link->command_done = link->command_status = 0;
+    link->disconnect_seen = link->timed_out = 0;
+    link->closing = 1;
+    link->state = BTV_SL_CLOSING;
+    return 1;
+}
+void btv_sco_link_tick(btv_sco_link *link, uint32_t now)
+{
+    btv_command_reply reply;
+    int result;
+    if (link == NULL || link->commands == NULL) return;
+    if (link->commands->recovery) { recover(link); return; }
+    if (link->state != BTV_SL_WAIT && link->state != BTV_SL_CLOSING) return;
+    if (!link->command_done)
+    {
+        result = btv_hci_commands_reply(link->commands, link->ticket, &reply);
+        if (result < 0) { recover(link); return; }
+        if (result == BTV_COMMAND_OK)
+        {
+            if (!link->submitted || reply.opcode != (link->closing ? 0x0406 : 0x0428) || reply.bytes != 6 || reply.event[0] != BTV_COMMAND_STATUS)
+            { recover(link); return; }
+            link->command_done = 1;
+            link->command_status = reply.event[2];
+        }
+    }
+    if (link->closing && link->command_done && (link->disconnect_seen || link->command_status))
+    {
+        link->state = link->disconnect_seen ? BTV_SL_CLOSED : BTV_SL_OPEN;
+        return;
+    }
+    if (!link->closing && link->command_done && link->command_status)
+    {
+        if (link->event_seen && !link->result.status) recover(link);
+        else link->state = BTV_SL_REJECTED;
+        return;
+    }
+    if (!link->closing && link->command_done && link->event_seen)
+    {
+        link->state = link->result.status ? BTV_SL_REJECTED : BTV_SL_OPEN;
+        return;
+    }
+    if ((uint32_t)(now - link->started) >= 30000UL)
+    {
+        link->timed_out = 1;
+        if (!link->submitted && btv_hci_commands_cancel(link->commands, link->ticket) == BTV_COMMAND_OK)
+            link->state = link->closing ? BTV_SL_OPEN : BTV_SL_REJECTED;
+        else recover(link);
+    }
+}
+int btv_sco_link_event(btv_sco_link *link, const uint8_t *event, size_t bytes, uint32_t now)
+{
+    btv_sco_complete result;
+    int decoded;
+    size_t expected;
+    uint16_t handle;
+    if (link == NULL || link->commands == NULL) return 0;
+    btv_sco_link_tick(link, now);
+    if (link->state == BTV_SL_RECOVER) return -1;
+    if (btv_hci_frame_size(BTV_HCI_EVENT, event, bytes, 255, &expected) != BTV_HCI_COMPLETE || expected != bytes)
+    { recover(link); return -1; }
+    if (event[0] == 5 && link->event_seen && !link->result.status)
+    {
+        if (bytes != 6) { recover(link); return -1; }
+        handle = (uint16_t)((event[3] | ((unsigned int)event[4] << 8)) & 0x0fff);
+        if (handle != link->result.handle) return 0;
+        if (event[2]) { recover(link); return -1; }
+        if (link->state == BTV_SL_WAIT) { recover(link); return -1; }
+        if (link->state == BTV_SL_CLOSING)
+        {
+            link->disconnect_seen = 1;
+            if (!link->submitted && btv_hci_commands_cancel(link->commands, link->ticket) == BTV_COMMAND_OK)
+                link->state = BTV_SL_CLOSED;
+            else btv_sco_link_tick(link, now);
+            return link->state == BTV_SL_RECOVER ? -1 : 1;
+        }
+        link->state = BTV_SL_CLOSED;
+        return 1;
+    }
+    decoded = btv_sco_setup_complete(event, bytes, &result);
+    if (decoded < 0) { recover(link); return -1; }
+    if (!decoded || memcmp(result.address, link->address, 6)) return 0;
+    if (link->event_seen || link->state != BTV_SL_WAIT)
+    {
+        if (link->event_seen && (result.status != link->result.status || (!result.status &&
+            (result.handle != link->result.handle || result.link_type != link->result.link_type ||
+             result.interval != link->result.interval || result.window != link->result.window ||
+             result.receive_length != link->result.receive_length || result.transmit_length != link->result.transmit_length ||
+             result.air_mode != link->result.air_mode)))) { recover(link); return -1; }
+        if (!link->event_seen && !result.status) { recover(link); return -1; }
+        return 0;
+    }
+    if (!link->submitted) { recover(link); return -1; }
+    link->result = result;
+    link->event_seen = 1;
+    btv_sco_link_tick(link, now);
+    return link->state == BTV_SL_RECOVER ? -1 : 1;
+}
+const btv_sco_complete *btv_sco_link_result(const btv_sco_link *link)
+{
+    return link != NULL && link->state == BTV_SL_OPEN && !link->commands->recovery ? &link->result : NULL;
+}

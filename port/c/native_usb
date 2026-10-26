@@ -1,0 +1,1190 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        native_usb
+ * Purpose:     Native RISC OS USBDriver discovery and stream ownership.
+ ******************************************************************/
+#include <native_usb.h>
+#include <usb_stream_path.h>
+#include <string.h>
+
+#define OS_MODULE_FREE 7u
+#define SERVICE_USB 0xd2u
+#define SERVICE_USB_CONNECTED 1u
+#define OS_FIND_INPUT 0x4fu
+#define OS_FIND_OUTPUT 0x8fu
+#define STREAM_BUFFER_BYTES 4096u
+/* LE scanning floods the event pipe with advertising reports. */
+#define EVENT_BUFFER_BYTES 16384u
+#define DEVICEFS_USB_REQUEST 0x80000000u
+#define DEVICEFS_BUFFER_SPACE 0x80000002u
+#define DEVICEFS_CLEAR_STALL 0x80000005u
+/* USBDriver XferFailed + USBD_STALLED. Other errors may mean the
+ * transfer completed partially, so do not retry those blindly. */
+#define USB_STALLED_ERROR 0x819031u
+#define DEVICEFS_TRANSFER_INFO 0x80000006u
+#define DEVICEFS_GET_HANDLES2 0x80000007u
+#define DEVICECALL_WAKEUP_RX 3u
+#define DEVICECALL_WAKEUP_TX 2u
+#define DEVICECALL_MONITOR_TX 12u
+#define ACL_READ_REQUEST 1024u
+#define CLOSE_CONTROL_CS 100u
+#define CLOSE_DISCONNECT_CS 300u
+#define CLOSE_START 0u
+#define CLOSE_CONTROL 1u
+#define CLOSE_EVENT 2u
+#define CLOSE_STREAMS 3u
+#define DEVICEFS_CAPABILITIES 0x80000009u
+#define DEVICEFS_RELEASE_REQUEST 0x8000000au
+#define DEVICEFS_CAP_ASYNC_CONTROL 1u
+#define DEVICEFS_CAP_RELEASE 2u
+#define USB_REQUEST_POLL 1u
+#define OS_GBPB_WRITE_CURRENT 2u
+#define OS_GBPB_READ_CURRENT 4u
+
+#define USB_STATUS_PENDING 0u
+#define USB_STATUS_COMPLETE 1u
+#define USB_STATUS_NAK 2u
+#define USB_STATUS_STALL 3u
+#define USB_STATUS_RETRY 4u
+#define USB_STATUS_TIMEOUT 5u
+#define USB_STATUS_INACTIVE 6u
+
+static int service_connected(uint8_t **answer)
+{
+    register uint32_t r0 __asm("r0") = SERVICE_USB_CONNECTED;
+    register uint32_t r1 __asm("r1") = SERVICE_USB;
+    register uint32_t r2 __asm("r2") = 0;
+    register uint32_t success __asm("r3");
+    __asm volatile(
+        "swi 0x20030\n\t"
+        "movvc %3, #1\n\t"
+        "movvs %3, #0"
+        : "+r" (r0), "+r" (r1), "+r" (r2), "=r" (success)
+        :
+        : "cc", "memory", "lr");
+    *answer = (uint8_t *)r2;
+    return success != 0;
+}
+
+static int free_service_record(void *record)
+{
+    register uint32_t r0 __asm("r0") = OS_MODULE_FREE;
+    register uint32_t r2 __asm("r2") = (uint32_t)record;
+    register uint32_t r3 __asm("r3");
+    register uint32_t success __asm("r1");
+    __asm volatile(
+        "swi 0x2001e\n\t"
+        "movvc %3, #1\n\t"
+        "movvs %3, #0"
+        : "+r" (r0), "+r" (r2), "=r" (r3), "=r" (success)
+        :
+        : "cc", "memory", "lr");
+    (void)r3;
+    return success != 0;
+}
+
+static int open_handle(const char *path, int output)
+{
+    register uint32_t r0 __asm("r0") = output ? OS_FIND_OUTPUT : OS_FIND_INPUT;
+    register uint32_t r1 __asm("r1") = (uint32_t)path;
+    register uint32_t success __asm("r2");
+    __asm volatile(
+        "swi 0x2000d\n\t"
+        "movvc %2, #1\n\t"
+        "movvs %2, #0"
+        : "+r" (r0), "+r" (r1), "=r" (success)
+        :
+        : "cc", "memory", "lr");
+    return success != 0 ? (int)r0 : 0;
+}
+
+static void close_handle(int handle)
+{
+    register uint32_t r0 __asm("r0") = 0;
+    register uint32_t r1 __asm("r1") = (uint32_t)handle;
+    if (handle == 0) return;
+    __asm volatile("swi 0x2000d" : "+r" (r0), "+r" (r1) : : "cc", "memory", "lr");
+}
+
+static int buffer_space(const char *device, int handle,
+                        uint32_t *available, uint32_t *free_bytes)
+{
+    register uint32_t r0 __asm("r0") = DEVICEFS_BUFFER_SPACE;
+    register uint32_t r1 __asm("r1") = (uint32_t)device;
+    register uint32_t r2 __asm("r2") = (uint32_t)handle;
+    register uint32_t r3 __asm("r3") = 0;
+    register uint32_t r4 __asm("r4") = 0;
+    register uint32_t success __asm("r5");
+    __asm volatile(
+        "swi 0x62744\n\t"
+        "movvc %5, #1\n\t"
+        "movvs %5, #0"
+        : "+r" (r0), "+r" (r1), "+r" (r2), "+r" (r3),
+          "+r" (r4), "=r" (success)
+        :
+        : "cc", "memory", "lr");
+    if (!success || r4 > r3) return 0;
+    /* USBDriver returns R3 = buffer size and R4 = free bytes. Reading more
+     * than size - free blocks inside DeviceFS until the bytes arrive. */
+    *available = r3 - r4;
+    *free_bytes = r4;
+    return 1;
+}
+
+/* Read-only USBDriver state for diagnosing a bulk OUT pipe that has stopped
+ * draining. R0/R1/R3/R4 become count/total/status/padded bytes. */
+static int transfer_info(const char *device, int handle,
+                         uint32_t *count, uint32_t *total,
+                         int32_t *status, uint32_t *padded)
+{
+    register uint32_t r0 __asm("r0") = DEVICEFS_TRANSFER_INFO;
+    register uint32_t r1 __asm("r1") = (uint32_t)device;
+    register uint32_t r2 __asm("r2") = (uint32_t)handle;
+    register uint32_t r3 __asm("r3") = 0;
+    register uint32_t r4 __asm("r4") = 0;
+    register uint32_t success __asm("r5");
+    __asm volatile("swi 0x62744\n\t"
+                   "movvc %5, #1\n\t"
+                   "movvs %5, #0"
+                   : "+r" (r0), "+r" (r1), "+r" (r2), "+r" (r3),
+                     "+r" (r4), "=r" (success)
+                   : : "cc", "memory", "lr");
+    if (!success) return 0;
+    *count = r0; *total = r1; *status = (int32_t)r3; *padded = r4;
+    return 1;
+}
+
+void btv_native_usb_output_diag(btv_native_usb *transport, uint32_t values[6])
+{
+    unsigned int i, pending = 0;
+    uint32_t available = 0, free_bytes = 0, count = 0, total = 0, padded = 0;
+    int32_t status = -2;
+    if (transport->opened && transport->acl_out_handle != 0)
+    {
+        (void)buffer_space(transport->device.name, transport->acl_out_handle,
+                           &available, &free_bytes);
+        (void)transfer_info(transport->device.name, (int)transport->acl_out_stream,
+                            &count, &total, &status, &padded);
+    }
+    for (i = 0; i < BTV_NATIVE_USB_TICKETS; ++i)
+        if (transport->tickets[i].id != 0 &&
+            transport->tickets[i].kind == BTV_HOST_BRIDGE_ACL_OUT)
+            ++pending;
+    values[0] = available; values[1] = free_bytes;
+    values[2] = count; values[3] = (uint32_t)status;
+    values[4] = total; values[5] = (pending & 0xffu) | (padded << 8);
+}
+
+/* USBDriver's MonitorTX reports the actual transfer error and purges its
+ * output buffer. Only invoke this after the read-only diagnosis reports a
+ * failed transfer; it is deliberately separate from normal polling. */
+uint32_t btv_native_usb_monitor_output(btv_native_usb *transport)
+{
+    register uint32_t r0 __asm("r0") = DEVICECALL_MONITOR_TX;
+    register uint32_t r1 __asm("r1") = (uint32_t)transport->device.name;
+    register uint32_t r2 __asm("r2") = transport->acl_out_stream;
+    register uint32_t error_ptr __asm("r3");
+    if (!transport->opened || r2 == 0) return 0;
+    __asm volatile("swi 0x62744\n\t"
+                   "movvs %3, r0\n\t"
+                   "movvc %3, #0"
+                   : "+r" (r0), "+r" (r1), "+r" (r2), "=r" (error_ptr)
+                   : : "cc", "memory", "lr");
+    return error_ptr ? *(const uint32_t *)error_ptr : 0;
+}
+
+static int clear_output_stall(btv_native_usb *transport)
+{
+    register uint32_t r0 __asm("r0") = DEVICEFS_CLEAR_STALL;
+    register uint32_t r1 __asm("r1") = (uint32_t)transport->device.name;
+    register uint32_t r2 __asm("r2") = (uint32_t)transport->acl_out_handle;
+    register uint32_t success __asm("r3");
+    __asm volatile("swi 0x62744\n\t"
+                   "movvc %3, #1\n\t"
+                   "movvs %3, #0"
+                   : "+r" (r0), "+r" (r1), "+r" (r2), "=r" (success)
+                   : : "cc", "memory", "lr");
+    return success != 0;
+}
+
+static int devicefs_handle(const char *device, int stream,
+                           uint32_t *handle, uint32_t *driver_stream)
+{
+    /* USBDriver's GetHandles2 writes R3 (buffer), R4 (DeviceFS handle),
+     * R5 (stream) and R6 (device). Every one must be declared: an
+     * undeclared R4 once replaced the caller's transport pointer with a
+     * DeviceFS handle, and the ticket clear that followed zeroed ~49K of
+     * live RMA - a hard lockup that even Ctrl-Reset could not break. */
+    register uint32_t r0 __asm("r0") = DEVICEFS_GET_HANDLES2;
+    register uint32_t r1 __asm("r1") = (uint32_t)device;
+    register uint32_t r2 __asm("r2") = (uint32_t)stream;
+    register uint32_t r3 __asm("r3");
+    register uint32_t r4 __asm("r4");
+    register uint32_t r5 __asm("r5");
+    register uint32_t r6 __asm("r6") = 0;
+    register uint32_t success __asm("r7");
+    __asm volatile(
+        "swi 0x62744\n\t"
+        "movvc %7, #1\n\t"
+        "movvs %7, #0"
+        : "+r" (r0), "+r" (r1), "+r" (r2), "=r" (r3), "=r" (r4),
+          "=r" (r5), "+r" (r6), "=r" (success)
+        :
+        : "cc", "memory", "lr");
+    (void)r3;
+    (void)r4;
+    if (!success || r6 == 0 || r5 == 0) return 0;
+    *handle = r6;
+    *driver_stream = r5;
+    return 1;
+}
+
+/* Ask USBDriver to start a bulk IN transfer, as DeviceFS itself does when a
+ * reader blocks. The driver ignores it while a transfer is already running
+ * and restarts one on completion, so repeating it while data is awaited is
+ * safe. It never blocks: data lands in the DeviceFS buffer for poll_input. */
+static void wake_rx(const char *device, uint32_t driver_stream, uint32_t bytes)
+{
+    register uint32_t r0 __asm("r0") = DEVICECALL_WAKEUP_RX;
+    register uint32_t r1 __asm("r1") = (uint32_t)device;
+    register uint32_t r2 __asm("r2") = driver_stream;
+    register uint32_t r3 __asm("r3") = bytes;
+    if (driver_stream == 0) return;
+    __asm volatile(
+        "swi 0x62744"
+        : "+r" (r0), "+r" (r1), "+r" (r2), "+r" (r3)
+        :
+        : "cc", "memory", "lr");
+    (void)r0;
+    (void)r1;
+    (void)r2;
+    (void)r3;
+}
+
+/* The bulk OUT DeviceFS buffer can retain a short final packet until the
+ * driver is explicitly kicked.  A transfer already in progress is left
+ * alone by USBDriver, so this is safe after every complete HCI packet. */
+static void wake_tx(const char *device, uint32_t driver_stream)
+{
+    register uint32_t r0 __asm("r0") = DEVICECALL_WAKEUP_TX;
+    register uint32_t r1 __asm("r1") = (uint32_t)device;
+    register uint32_t r2 __asm("r2") = driver_stream;
+    if (driver_stream == 0) return;
+    __asm volatile("swi 0x62744"
+                   : "+r" (r0), "+r" (r1), "+r" (r2)
+                   : : "cc", "memory", "lr");
+}
+
+static int supports_async_control(const char *device)
+{
+    register uint32_t r0 __asm("r0") = DEVICEFS_CAPABILITIES;
+    register uint32_t r1 __asm("r1") = (uint32_t)device;
+    register uint32_t r3 __asm("r3") = 0;
+    register uint32_t success __asm("r2");
+    __asm volatile(
+        "swi 0x62744\n\t"
+        "movvc %3, #1\n\t"
+        "movvs %3, #0"
+        : "+r" (r0), "+r" (r1), "+r" (r3), "=r" (success)
+        :
+        : "cc", "memory", "lr");
+    return success != 0 &&
+           (r3 & (DEVICEFS_CAP_ASYNC_CONTROL | DEVICEFS_CAP_RELEASE)) ==
+           (DEVICEFS_CAP_ASYNC_CONTROL | DEVICEFS_CAP_RELEASE);
+}
+
+static int release_control(const char *device, volatile uint8_t *status)
+{
+    register uint32_t r0 __asm("r0") = DEVICEFS_RELEASE_REQUEST;
+    register uint32_t r1 __asm("r1") = (uint32_t)device;
+    register uint32_t r3 __asm("r3") = (uint32_t)status;
+    register uint32_t success __asm("r2");
+    __asm volatile(
+        "swi 0x62744\n\t"
+        "movvc %3, #1\n\t"
+        "movvs %3, #0"
+        : "+r" (r0), "+r" (r1), "+r" (r3), "=r" (success)
+        :
+        : "cc", "memory", "lr");
+    return success != 0;
+}
+
+static int gbpb(int handle, uint8_t *data, uint32_t bytes, int output,
+                uint32_t *transferred)
+{
+    register uint32_t r0 __asm("r0") = output ? OS_GBPB_WRITE_CURRENT :
+                                                  OS_GBPB_READ_CURRENT;
+    register uint32_t r1 __asm("r1") = (uint32_t)handle;
+    register uint32_t r2 __asm("r2") = (uint32_t)data;
+    register uint32_t r3 __asm("r3") = bytes;
+    register uint32_t success __asm("r4");
+    __asm volatile(
+        "swi 0x2000c\n\t"
+        "movvc %4, #1\n\t"
+        "movvs %4, #0"
+        : "+r" (r0), "+r" (r1), "+r" (r2), "+r" (r3),
+          "=r" (success)
+        :
+        : "cc", "memory", "lr");
+    if (!success || r3 > bytes) return 0;
+    *transferred = bytes - r3;
+    return 1;
+}
+
+static int control_submit(const char *device, uint8_t *data, uint32_t bytes,
+                          volatile uint8_t **status)
+{
+    register uint32_t r0 __asm("r0") = DEVICEFS_USB_REQUEST;
+    register uint32_t r1 __asm("r1") = (uint32_t)device;
+    register uint32_t r2 __asm("r2") = 0;
+    register uint32_t r3 __asm("r3") = 0x20;
+    register uint32_t r4 __asm("r4") = bytes << 16;
+    register uint32_t r5 __asm("r5") = (uint32_t)data;
+    register uint32_t r6 __asm("r6") = USB_REQUEST_POLL;
+    register uint32_t r7 __asm("r7") = 0;
+    register uint32_t success __asm("r8");
+    __asm volatile(
+        "swi 0x62744\n\t"
+        "movvc %8, #1\n\t"
+        "movvs %8, #0"
+        : "+r" (r0), "+r" (r1), "+r" (r2), "+r" (r3),
+          "+r" (r4), "+r" (r5), "+r" (r6), "+r" (r7),
+          "=r" (success)
+        :
+        : "cc", "memory", "lr");
+    *status = (volatile uint8_t *)r7;
+    return success != 0 && r7 != 0;
+}
+
+static uint32_t centiseconds(void)
+{
+    register uint32_t value __asm("r0");
+    __asm volatile("swi 0x42" : "=r" (value) : : "cc", "lr");
+    return value;
+}
+
+static void trace_add(btv_native_usb *transport, uint8_t kind,
+                      const uint8_t *data, uint32_t length)
+{
+    btv_native_usb_trace *entry;
+    uint32_t copy;
+    ++transport->trace_sequence;
+    if (transport->trace_sequence == 0) transport->trace_sequence = 1;
+    entry = &transport->trace[transport->trace_sequence % BTV_NATIVE_USB_TRACE];
+    entry->sequence = transport->trace_sequence;
+    entry->length = (uint16_t)length;
+    entry->kind = kind;
+    entry->reserved = 0;
+    copy = length < BTV_NATIVE_USB_TRACE_BYTES ? length :
+                                                 BTV_NATIVE_USB_TRACE_BYTES;
+    memset(entry->data, 0, sizeof(entry->data));
+    memcpy(entry->data, data, copy);
+}
+
+/* A diagnostic note in the log: code, then two little-endian words. */
+static void trace_note(btv_native_usb *transport, uint8_t code,
+                       uint32_t a, uint32_t b)
+{
+    uint8_t note[9];
+    unsigned int index;
+    note[0] = code;
+    for (index = 0; index < 4; ++index)
+    {
+        note[1 + index] = (uint8_t)(a >> (8 * index));
+        note[5 + index] = (uint8_t)(b >> (8 * index));
+    }
+    trace_add(transport, 5, note, sizeof(note));
+}
+
+/* Record link lifetimes from complete HCI events the owner receives. */
+static void note_event(btv_native_usb *transport, const uint8_t *event,
+                       uint32_t bytes)
+{
+    unsigned int index;
+    uint16_t handle;
+    if (bytes < 2 || bytes != (uint32_t)event[1] + 2u) return;
+    if (event[0] == 0x03 && bytes >= 13 && event[2] == 0)
+    {
+        handle = (uint16_t)((event[3] | (event[4] << 8)) & 0x0fff);
+        for (index = 0; index < BTV_NATIVE_USB_LINKS; ++index)
+            if (transport->link_open[index] && transport->links[index] == handle)
+                return;
+        for (index = 0; index < BTV_NATIVE_USB_LINKS; ++index)
+            if (!transport->link_open[index])
+            {
+                transport->links[index] = handle;
+                transport->link_open[index] = 1;
+                return;
+            }
+    }
+    else if (event[0] == 0x05 && bytes >= 6)
+    {
+        handle = (uint16_t)((event[3] | (event[4] << 8)) & 0x0fff);
+        for (index = 0; index < BTV_NATIVE_USB_LINKS; ++index)
+            if (transport->link_open[index] && transport->links[index] == handle)
+                transport->link_open[index] = 0;
+    }
+}
+
+static btv_native_usb_ticket *find_ticket(btv_native_usb *transport,
+                                          uint32_t id)
+{
+    unsigned int index;
+    if (transport == NULL || id == 0) return NULL;
+    for (index = 0; index < BTV_NATIVE_USB_TICKETS; ++index)
+        if (transport->tickets[index].id == id)
+            return &transport->tickets[index];
+    return NULL;
+}
+
+static btv_native_usb_ticket *new_ticket(btv_native_usb *transport,
+                                         unsigned int kind, uint32_t limit,
+                                         uint32_t packets, uint32_t *id)
+{
+    btv_native_usb_ticket *ticket;
+    unsigned int index;
+    for (index = 0; index < BTV_NATIVE_USB_TICKETS; ++index)
+        if (transport->tickets[index].id == 0) break;
+    if (index == BTV_NATIVE_USB_TICKETS) return NULL;
+    ticket = &transport->tickets[index];
+    memset(ticket, 0, sizeof(*ticket));
+    do
+    {
+        ++transport->next_ticket;
+    }
+    while (transport->next_ticket == 0 ||
+           find_ticket(transport, transport->next_ticket) != NULL);
+    ticket->id = transport->next_ticket;
+    ticket->kind = kind;
+    ticket->limit = limit;
+    ticket->packets = packets;
+    *id = ticket->id;
+    if (kind == BTV_HOST_BRIDGE_EVENT_IN)
+        trace_note(transport, 0xB6, ticket->id, index);
+    return ticket;
+}
+
+static int find_alternate(const btv_native_usb *transport, uint8_t alternate,
+                          btv_usb_device *selected)
+{
+    btv_usb_device device;
+    uint8_t *answer, *next, *record;
+    unsigned int size;
+    int found, valid;
+    if (!service_connected(&answer)) return 0;
+    found = 0;
+    valid = 1;
+    while (answer != NULL)
+    {
+        memcpy(&next, answer, sizeof(next));
+        record = answer + sizeof(next);
+        size = (unsigned int)record[0] | ((unsigned int)record[1] << 8);
+        if (!found &&
+            btv_usb_service_decode(record, size, alternate, &device) ==
+                BTV_USB_READY &&
+            strcmp(device.name, transport->device.name) == 0 &&
+            device.vendor == transport->device.vendor &&
+            device.product == transport->device.product)
+        {
+            *selected = device;
+            found = 1;
+        }
+        if (!free_service_record(answer)) valid = 0;
+        answer = next;
+    }
+    return found && valid;
+}
+
+int btv_native_usb_inspect(btv_native_usb *transport)
+{
+    /* btv_native_usb holds every ticket's copied payload and is far larger
+     * than the 8K SVC stack, so only the discovered fields live here. */
+    btv_usb_device device, selected;
+    uint8_t *answer, *next, *record;
+    uint8_t async_control;
+    unsigned int size;
+    int found, valid;
+    if (transport == NULL || transport->opened) return 0;
+    async_control = 0;
+    if (!service_connected(&answer)) return 0;
+    found = 0;
+    valid = 1;
+    while (answer != NULL)
+    {
+        memcpy(&next, answer, sizeof(next));
+        record = answer + sizeof(next);
+        size = (unsigned int)record[0] | ((unsigned int)record[1] << 8);
+        if (!found &&
+            btv_usb_service_decode(record, size, 0, &device) == BTV_USB_READY)
+        {
+            selected = device;
+            async_control = (uint8_t)supports_async_control(device.name);
+            found = 1;
+        }
+        if (!free_service_record(answer)) valid = 0;
+        answer = next;
+    }
+    if (!found || !valid) return 0;
+    memset(transport, 0, sizeof(*transport));
+    transport->device = selected;
+    transport->detected = 1;
+    transport->async_control = async_control;
+    return 1;
+}
+
+int btv_native_usb_open(btv_native_usb *transport)
+{
+    char event_path[128], acl_in_path[128], acl_out_path[128];
+    int event_handle, acl_in_handle, acl_out_handle;
+    uint32_t owner, event_stream, acl_stream, acl_out_stream;
+    if (transport == NULL || !transport->detected || transport->opened ||
+        transport->removed)
+        return 0;
+    if (!btv_usb_stream_path(event_path, sizeof(event_path),
+            transport->device.name, 0, 0,
+            (uint8_t)(transport->device.endpoints.event_in & 15u),
+            BTV_USB_STREAM_INTERRUPT, EVENT_BUFFER_BYTES, 1) ||
+        !btv_usb_stream_path(acl_in_path, sizeof(acl_in_path),
+            transport->device.name, 0, 0,
+            (uint8_t)(transport->device.endpoints.acl_in & 15u),
+            BTV_USB_STREAM_BULK, STREAM_BUFFER_BYTES, 1) ||
+        !btv_usb_stream_path(acl_out_path, sizeof(acl_out_path),
+            transport->device.name, 0, 0,
+            (uint8_t)(transport->device.endpoints.acl_out & 15u),
+            BTV_USB_STREAM_BULK, STREAM_BUFFER_BYTES, 1))
+        return 0;
+    event_handle = open_handle(event_path, 0);
+    if (event_handle == 0) return 0;
+    acl_in_handle = open_handle(acl_in_path, 0);
+    if (acl_in_handle == 0)
+    {
+        close_handle(event_handle);
+        return 0;
+    }
+    acl_out_handle = open_handle(acl_out_path, 1);
+    if (acl_out_handle == 0)
+    {
+        close_handle(acl_in_handle);
+        close_handle(event_handle);
+        return 0;
+    }
+    if (!devicefs_handle(transport->device.name, event_handle, &owner,
+                         &event_stream) ||
+        !devicefs_handle(transport->device.name, acl_in_handle, &owner,
+                         &acl_stream) ||
+        !devicefs_handle(transport->device.name, acl_out_handle, &owner,
+                         &acl_out_stream))
+    {
+        close_handle(acl_out_handle);
+        close_handle(acl_in_handle);
+        close_handle(event_handle);
+        return 0;
+    }
+    transport->event_handle = event_handle;
+    transport->acl_in_handle = acl_in_handle;
+    transport->acl_out_handle = acl_out_handle;
+    transport->devicefs_handle = owner;
+    transport->acl_in_stream = acl_stream;
+    transport->acl_out_stream = acl_out_stream;
+    memset(transport->link_open, 0, sizeof(transport->link_open));
+    transport->close_phase = CLOSE_START;
+    transport->close_status = NULL;
+    transport->close_event_used = 0;
+    (void)event_stream;
+    transport->next_ticket = 0;
+    memset(transport->tickets, 0, sizeof(transport->tickets));
+    transport->opened = 1;
+    transport->close_polls = 0;
+    return 1;
+}
+
+int btv_native_usb_voice(btv_native_usb *transport, uint8_t alternate)
+{
+    btv_usb_device selected;
+    char input_path[128], output_path[128];
+    int input_handle, output_handle;
+    if (transport == NULL || !transport->opened || transport->removed)
+        return BTV_HOST_BRIDGE_INVALID;
+    if (alternate == 0)
+    {
+        unsigned int index;
+        for (index = 0; index < BTV_NATIVE_USB_TICKETS; ++index)
+            if (transport->tickets[index].id != 0 &&
+                (transport->tickets[index].kind == BTV_HOST_BRIDGE_SCO_IN ||
+                 transport->tickets[index].kind == BTV_HOST_BRIDGE_SCO_OUT))
+                return BTV_HOST_BRIDGE_BUSY;
+        /* One isochronous stream per call, so a hang inside USBDriver's
+         * pipe abort is attributable from the caller's breadcrumbs. */
+        if (transport->sco_out_handle != 0)
+        {
+            close_handle(transport->sco_out_handle);
+            transport->sco_out_handle = 0;
+            return transport->sco_in_handle != 0 ? BTV_HOST_BRIDGE_BUSY :
+                                                   BTV_HOST_BRIDGE_OK;
+        }
+        close_handle(transport->sco_in_handle);
+        transport->sco_in_handle = 0;
+        transport->sco_in_stream = 0;
+        return BTV_HOST_BRIDGE_OK;
+    }
+    if (transport->sco_in_handle != 0 || transport->sco_out_handle != 0)
+        return BTV_HOST_BRIDGE_BUSY;
+    if (!find_alternate(transport, alternate, &selected) ||
+        selected.endpoints.sco_in == 0 || selected.endpoints.sco_out == 0 ||
+        !btv_usb_isoc_stream_path(input_path, sizeof(input_path),
+            selected.name, 1, alternate,
+            (uint8_t)(selected.endpoints.sco_in & 15u),
+            STREAM_BUFFER_BYTES, selected.endpoints.sco_in_packet) ||
+        !btv_usb_isoc_stream_path(output_path, sizeof(output_path),
+            selected.name, 1, alternate,
+            (uint8_t)(selected.endpoints.sco_out & 15u),
+            STREAM_BUFFER_BYTES, selected.endpoints.sco_out_packet))
+        return BTV_HOST_BRIDGE_UNSUPPORTED;
+    input_handle = open_handle(input_path, 0);
+    if (input_handle == 0) return BTV_HOST_BRIDGE_IO_ERROR;
+    output_handle = open_handle(output_path, 1);
+    if (output_handle == 0)
+    {
+        close_handle(input_handle);
+        return BTV_HOST_BRIDGE_IO_ERROR;
+    }
+    {
+        uint32_t owner, stream;
+        if (!devicefs_handle(selected.name, input_handle, &owner, &stream))
+            stream = 0;   /* reads then depend on USBDriver's own restarts */
+        transport->sco_in_stream = stream;
+    }
+    transport->device.endpoints = selected.endpoints;
+    transport->sco_in_handle = input_handle;
+    transport->sco_out_handle = output_handle;
+    return BTV_HOST_BRIDGE_OK;
+}
+
+int btv_native_usb_submit(btv_native_usb *transport, unsigned int kind,
+                          const uint8_t *data, uint32_t bytes,
+                          uint32_t packets, uint32_t *ticket_id)
+{
+    btv_native_usb_ticket *ticket;
+    uint32_t id;
+    if (transport == NULL || !transport->opened || transport->removed ||
+        ticket_id == NULL ||
+        bytes == 0 || bytes > BTV_HOST_BRIDGE_IO_BYTES)
+        return BTV_HOST_BRIDGE_INVALID;
+    if (kind == BTV_HOST_BRIDGE_COMMAND && !transport->async_control)
+        return BTV_HOST_BRIDGE_UNSUPPORTED;
+    if (kind != BTV_HOST_BRIDGE_COMMAND && kind != BTV_HOST_BRIDGE_EVENT_IN &&
+        kind != BTV_HOST_BRIDGE_ACL_IN && kind != BTV_HOST_BRIDGE_ACL_OUT &&
+        kind != BTV_HOST_BRIDGE_SCO_IN && kind != BTV_HOST_BRIDGE_SCO_OUT)
+        return BTV_HOST_BRIDGE_UNSUPPORTED;
+    if ((kind == BTV_HOST_BRIDGE_COMMAND || kind == BTV_HOST_BRIDGE_ACL_OUT ||
+         kind == BTV_HOST_BRIDGE_SCO_OUT) &&
+        data == NULL) return BTV_HOST_BRIDGE_INVALID;
+    if ((kind == BTV_HOST_BRIDGE_EVENT_IN || kind == BTV_HOST_BRIDGE_ACL_IN ||
+         kind == BTV_HOST_BRIDGE_SCO_IN) &&
+        data != NULL) return BTV_HOST_BRIDGE_INVALID;
+    if ((kind == BTV_HOST_BRIDGE_SCO_IN ||
+         kind == BTV_HOST_BRIDGE_SCO_OUT) &&
+        (packets == 0 || packets > BTV_HOST_BRIDGE_ISO_PACKETS ||
+         bytes % packets != 0 || transport->sco_in_handle == 0 ||
+         transport->sco_out_handle == 0))
+        return BTV_HOST_BRIDGE_INVALID;
+    if (kind != BTV_HOST_BRIDGE_SCO_IN &&
+        kind != BTV_HOST_BRIDGE_SCO_OUT && packets != 0)
+        return BTV_HOST_BRIDGE_INVALID;
+    ticket = new_ticket(transport, kind, bytes, packets, &id);
+    if (ticket == NULL) return BTV_HOST_BRIDGE_BUSY;
+    if (data != NULL) memcpy(ticket->data, data, bytes);
+    if (kind == BTV_HOST_BRIDGE_COMMAND &&
+        !control_submit(transport->device.name, ticket->data, bytes,
+                        &ticket->control_status))
+    {
+        memset(ticket, 0, sizeof(*ticket));
+        return BTV_HOST_BRIDGE_IO_ERROR;
+    }
+    if (kind == BTV_HOST_BRIDGE_COMMAND)
+        trace_add(transport, 4, ticket->data, bytes);
+    *ticket_id = id;
+    return BTV_HOST_BRIDGE_OK;
+}
+
+static int finish_ticket(btv_native_usb_ticket *ticket,
+                         btv_host_bridge_completion *completion,
+                         uint32_t error, uint32_t bytes)
+{
+    uint32_t kind;
+    kind = ticket->kind;
+    completion->kind = kind;
+    completion->error = error;
+    completion->bytes = bytes;
+    completion->packet_count = 0;
+    if (bytes != 0) memcpy(completion->data, ticket->data, bytes);
+    memset(ticket, 0, sizeof(*ticket));
+    return BTV_HOST_BRIDGE_OK;
+}
+
+static int finish_control_ticket(btv_native_usb *transport,
+                                 btv_native_usb_ticket *ticket,
+                                 btv_host_bridge_completion *completion,
+                                 uint32_t error, uint32_t bytes)
+{
+    if (error != 0)
+        trace_note(transport, 0xC0, error,
+                   (uint32_t)ticket->data[0] |
+                   ((uint32_t)ticket->data[1] << 8));
+    if (ticket->control_status == NULL ||
+        !release_control(transport->device.name, ticket->control_status))
+    {
+        trace_note(transport, 0xC1, error,
+                   (uint32_t)ticket->data[0] |
+                   ((uint32_t)ticket->data[1] << 8));
+        return BTV_HOST_BRIDGE_IO_ERROR;
+    }
+    ticket->control_status = NULL;
+    return finish_ticket(ticket, completion, error, bytes);
+}
+
+static int poll_input(btv_native_usb *transport, btv_native_usb_ticket *ticket,
+                      btv_host_bridge_completion *completion)
+{
+    uint32_t available, free_bytes, wanted, transferred;
+    int handle;
+    if (ticket->cancelled)
+        return finish_ticket(ticket, completion, 1, 0);
+    handle = ticket->kind == BTV_HOST_BRIDGE_EVENT_IN ?
+             transport->event_handle :
+             (ticket->kind == BTV_HOST_BRIDGE_ACL_IN ?
+              transport->acl_in_handle : transport->sco_in_handle);
+    if (!buffer_space(transport->device.name, handle,
+                      &available, &free_bytes))
+    {
+        trace_note(transport, 0xB1, ticket->kind, (uint32_t)handle);
+        return finish_ticket(ticket, completion, 1, 0);
+    }
+    (void)free_bytes;
+    /* Keep a bulk read posted on every poll, not only when the buffer is
+     * empty: USBDriver starts the next transfer only on a WakeUpRX that
+     * arrives after the previous one completed, and a packet left waiting
+     * otherwise surfaced only in the next session. */
+    if (ticket->kind == BTV_HOST_BRIDGE_ACL_IN)
+        wake_rx(transport->device.name, transport->acl_in_stream,
+                ACL_READ_REQUEST);
+    else if (ticket->kind == BTV_HOST_BRIDGE_SCO_IN)
+        wake_rx(transport->device.name, transport->sco_in_stream,
+                ACL_READ_REQUEST);
+    if (available == 0) return BTV_HOST_BRIDGE_PENDING;
+    wanted = ticket->limit - ticket->used;
+    if (ticket->kind == BTV_HOST_BRIDGE_EVENT_IN && ticket->used >= 2)
+    {
+        uint32_t event_bytes;
+        event_bytes = (uint32_t)ticket->data[1] + 2u;
+        if (event_bytes > ticket->limit)
+        {
+            trace_note(transport, 0xB2, event_bytes, ticket->used);
+            return finish_ticket(ticket, completion, 2, 0);
+        }
+        wanted = event_bytes - ticket->used;
+    }
+    else if (ticket->kind == BTV_HOST_BRIDGE_EVENT_IN && wanted > 2)
+        wanted = 2 - ticket->used;
+    if (wanted > available) wanted = available;
+    if (!gbpb(handle, ticket->data + ticket->used, wanted, 0, &transferred) ||
+        transferred == 0)
+    {
+        trace_note(transport, 0xB3, ticket->kind, wanted);
+        return finish_ticket(ticket, completion, 3, 0);
+    }
+    ticket->used += transferred;
+    if (ticket->kind == BTV_HOST_BRIDGE_ACL_IN)
+    {
+        ++transport->acl_in_count;
+        transport->acl_in_bytes += ticket->used;
+        trace_add(transport, 2, ticket->data, ticket->used);
+        return finish_ticket(ticket, completion, 0, ticket->used);
+    }
+    if (ticket->kind == BTV_HOST_BRIDGE_SCO_IN)
+    {
+        uint32_t index, packet_bytes, packet_count;
+        if (ticket->used < ticket->limit) return BTV_HOST_BRIDGE_PENDING;
+        packet_count = ticket->packets;
+        packet_bytes = ticket->limit / packet_count;
+        completion->kind = ticket->kind;
+        completion->error = 0;
+        completion->bytes = ticket->used;
+        completion->packet_count = packet_count;
+        memcpy(completion->data, ticket->data, ticket->used);
+        for (index = 0; index < packet_count; ++index)
+        {
+            completion->packets[index].offset = index * packet_bytes;
+            completion->packets[index].bytes = packet_bytes;
+            completion->packets[index].status = 0;
+        }
+        memset(ticket, 0, sizeof(*ticket));
+        return BTV_HOST_BRIDGE_OK;
+    }
+    if (ticket->used < 2 ||
+        ticket->used < (uint32_t)ticket->data[1] + 2u)
+        return BTV_HOST_BRIDGE_PENDING;
+    note_event(transport, ticket->data, ticket->used);
+    trace_add(transport, 1, ticket->data, ticket->used);
+    return finish_ticket(ticket, completion, 0, ticket->used);
+}
+
+static int poll_output(btv_native_usb *transport,
+                       btv_native_usb_ticket *ticket,
+                       btv_host_bridge_completion *completion)
+{
+    uint32_t available, free_bytes, transferred;
+    transferred = 0;
+    if (ticket->cancelled)
+        return finish_ticket(ticket, completion, 1, 0);
+    if (!buffer_space(transport->device.name,
+                      ticket->kind == BTV_HOST_BRIDGE_SCO_OUT ?
+                      transport->sco_out_handle : transport->acl_out_handle,
+                      &available, &free_bytes))
+        return finish_ticket(ticket, completion, 1, 0);
+    if (ticket->kind == BTV_HOST_BRIDGE_ACL_OUT)
+    {
+        unsigned int i;
+        uint32_t count, total, padded;
+        int32_t status;
+        /* Keep ownership until USBDriver reports completion. */
+        for (i = 0; i < BTV_NATIVE_USB_TICKETS; ++i)
+            if (&transport->tickets[i] != ticket &&
+                transport->tickets[i].id != 0 &&
+                transport->tickets[i].kind == BTV_HOST_BRIDGE_ACL_OUT &&
+                transport->tickets[i].used != 0)
+                return BTV_HOST_BRIDGE_PENDING;
+        if (ticket->used != 0)
+        {
+            if (!transfer_info(transport->device.name, (int)transport->acl_out_stream,
+                               &count, &total, &status, &padded))
+            {
+                trace_note(transport, 0xB9, ticket->id, 0);
+                return finish_ticket(ticket, completion, 1, 0);
+            }
+            if (status < 0)
+            {
+                /* Retry the same packet after clearing the stalled pipe. */
+                uint32_t error = btv_native_usb_monitor_output(transport);
+                ++ticket->packets;
+                trace_note(transport, 0xBA, error, ticket->packets);
+                if (ticket->packets > 3 || error != USB_STALLED_ERROR ||
+                    !clear_output_stall(transport))
+                {
+                    trace_note(transport, 0xBB, ticket->id, error);
+                    return finish_ticket(ticket, completion, 1, 0);
+                }
+                ticket->used = 0;
+                available = 0;
+            }
+            else if (status == 0 || available != 0)
+                return BTV_HOST_BRIDGE_PENDING;
+            else
+                return finish_ticket(ticket, completion, 0, ticket->limit);
+        }
+    }
+    if (available != 0 || free_bytes < ticket->limit)
+        return BTV_HOST_BRIDGE_PENDING;
+    if (!gbpb(ticket->kind == BTV_HOST_BRIDGE_SCO_OUT ?
+              transport->sco_out_handle : transport->acl_out_handle,
+              ticket->data, ticket->limit, 1,
+              &transferred) || transferred != ticket->limit)
+        return finish_ticket(ticket, completion, 1, transferred);
+    if (ticket->kind == BTV_HOST_BRIDGE_ACL_OUT)
+        wake_tx(transport->device.name, transport->acl_out_stream);
+    if (ticket->kind == BTV_HOST_BRIDGE_ACL_OUT)
+    {
+        ++transport->acl_out_count;
+        transport->acl_out_bytes += transferred;
+        trace_add(transport, 3, ticket->data, transferred);
+    }
+    if (ticket->kind == BTV_HOST_BRIDGE_ACL_OUT)
+    {
+        ticket->used = transferred;
+        return BTV_HOST_BRIDGE_PENDING;
+    }
+    return finish_ticket(ticket, completion, 0, transferred);
+}
+
+int btv_native_usb_poll(btv_native_usb *transport, uint32_t ticket_id,
+                        btv_host_bridge_completion *completion)
+{
+    btv_native_usb_ticket *ticket;
+    uint8_t status;
+    if (transport == NULL || completion == NULL)
+        return BTV_HOST_BRIDGE_INVALID;
+    if (!transport->opened)
+    {
+        trace_note(transport, 0xB4, ticket_id, transport->removed);
+        return BTV_HOST_BRIDGE_INVALID;
+    }
+    ticket = find_ticket(transport, ticket_id);
+    if (ticket == NULL)
+    {
+        unsigned int n;
+        trace_note(transport, 0xB5, ticket_id, transport->next_ticket);
+        for (n = 0; n < BTV_NATIVE_USB_TICKETS; ++n)
+            trace_note(transport, 0xB8, transport->tickets[n].id,
+                       (n << 16) | transport->tickets[n].kind);
+        return BTV_HOST_BRIDGE_INVALID;
+    }
+    if (transport->removed)
+        return finish_ticket(ticket, completion, USB_STATUS_INACTIVE, 0);
+    if (ticket->kind == BTV_HOST_BRIDGE_EVENT_IN)
+    {
+        int result = poll_input(transport, ticket, completion);
+        if (result != BTV_HOST_BRIDGE_PENDING)
+            trace_note(transport, 0xB7, ticket_id, (uint32_t)result);
+        return result;
+    }
+    if (ticket->kind == BTV_HOST_BRIDGE_EVENT_IN ||
+        ticket->kind == BTV_HOST_BRIDGE_ACL_IN ||
+        ticket->kind == BTV_HOST_BRIDGE_SCO_IN)
+        return poll_input(transport, ticket, completion);
+    if (ticket->kind == BTV_HOST_BRIDGE_ACL_OUT ||
+        ticket->kind == BTV_HOST_BRIDGE_SCO_OUT)
+        return poll_output(transport, ticket, completion);
+    if (ticket->control_status == NULL)
+        return BTV_HOST_BRIDGE_IO_ERROR;
+    status = *ticket->control_status;
+    if (status == USB_STATUS_PENDING || status == USB_STATUS_NAK ||
+        status == USB_STATUS_RETRY)
+        return BTV_HOST_BRIDGE_PENDING;
+    if (status == USB_STATUS_COMPLETE && !ticket->cancelled)
+        return finish_control_ticket(transport, ticket, completion, 0,
+                                     ticket->limit);
+    if (status == USB_STATUS_STALL || status == USB_STATUS_TIMEOUT ||
+        status == USB_STATUS_INACTIVE || ticket->cancelled)
+        return finish_control_ticket(transport, ticket, completion, status, 0);
+    return finish_control_ticket(transport, ticket, completion, status, 0);
+}
+
+int btv_native_usb_cancel(btv_native_usb *transport, uint32_t ticket_id)
+{
+    btv_native_usb_ticket *ticket;
+    if (transport == NULL || !transport->opened)
+        return BTV_HOST_BRIDGE_INVALID;
+    ticket = find_ticket(transport, ticket_id);
+    if (ticket == NULL) return BTV_HOST_BRIDGE_INVALID;
+    ticket->cancelled = 1;
+    return BTV_HOST_BRIDGE_OK;
+}
+
+/* One nonblocking step of disconnecting every open link. Called repeatedly
+ * by close; never waits inside the SWI, because USBDriver completes the
+ * control request from a callback that cannot run until this returns. */
+static int close_links(btv_native_usb *transport)
+{
+    uint32_t available, free_bytes, transferred, wanted;
+    uint16_t handle;
+    for (;;)
+    {
+        if (transport->close_phase == CLOSE_START)
+        {
+            unsigned int index;
+            for (index = 0; index < BTV_NATIVE_USB_LINKS; ++index)
+                if (transport->link_open[index]) break;
+            if (index == BTV_NATIVE_USB_LINKS)
+            {
+                transport->close_phase = CLOSE_STREAMS;
+                return BTV_HOST_BRIDGE_OK;
+            }
+            handle = transport->links[index];
+            transport->close_link = (uint8_t)index;
+            transport->close_command[0] = 0x06;   /* HCI_Disconnect */
+            transport->close_command[1] = 0x04;
+            transport->close_command[2] = 3;
+            transport->close_command[3] = (uint8_t)handle;
+            transport->close_command[4] = (uint8_t)(handle >> 8);
+            transport->close_command[5] = 0x13;   /* Remote user terminated */
+            if (!transport->async_control ||
+                !control_submit(transport->device.name,
+                                transport->close_command, 6,
+                                &transport->close_status))
+            {
+                transport->link_open[index] = 0;
+                continue;
+            }
+            transport->close_started = centiseconds();
+            transport->close_phase = CLOSE_CONTROL;
+            return BTV_HOST_BRIDGE_PENDING;
+        }
+        if (transport->close_phase == CLOSE_CONTROL)
+        {
+            uint8_t status = *transport->close_status;
+            if (status == USB_STATUS_PENDING || status == USB_STATUS_NAK ||
+                status == USB_STATUS_RETRY)
+            {
+                if (centiseconds() - transport->close_started < CLOSE_CONTROL_CS)
+                    return BTV_HOST_BRIDGE_PENDING;
+                /* Never release an active request; abandon this link. */
+                transport->link_open[transport->close_link] = 0;
+                transport->close_phase = CLOSE_START;
+                continue;
+            }
+            (void)release_control(transport->device.name,
+                                  transport->close_status);
+            transport->close_status = NULL;
+            transport->close_started = centiseconds();
+            transport->close_phase = status == USB_STATUS_COMPLETE ?
+                                     CLOSE_EVENT : CLOSE_START;
+            if (status != USB_STATUS_COMPLETE)
+                transport->link_open[transport->close_link] = 0;
+            continue;
+        }
+        /* CLOSE_EVENT: read events until Disconnection Complete or timeout. */
+        if (!transport->link_open[transport->close_link] ||
+            centiseconds() - transport->close_started >= CLOSE_DISCONNECT_CS)
+        {
+            transport->link_open[transport->close_link] = 0;
+            transport->close_phase = CLOSE_START;
+            continue;
+        }
+        if (!buffer_space(transport->device.name, transport->event_handle,
+                          &available, &free_bytes) || available == 0)
+            return BTV_HOST_BRIDGE_PENDING;
+        (void)free_bytes;
+        wanted = transport->close_event_used < 2 ?
+                 2u - transport->close_event_used :
+                 (uint32_t)transport->close_event[1] + 2u -
+                     transport->close_event_used;
+        if (wanted > available) wanted = available;
+        if (!gbpb(transport->event_handle,
+                  transport->close_event + transport->close_event_used,
+                  wanted, 0, &transferred) || transferred == 0)
+        {
+            transport->link_open[transport->close_link] = 0;
+            transport->close_phase = CLOSE_START;
+            continue;
+        }
+        transport->close_event_used += transferred;
+        if (transport->close_event_used >= 2 &&
+            transport->close_event_used ==
+                (uint32_t)transport->close_event[1] + 2u)
+        {
+            const uint8_t *event = transport->close_event;
+            note_event(transport, event, transport->close_event_used);
+            /* Command Status with an error means no Disconnection Complete
+             * will follow for this handle. */
+            if (event[0] == 0x0f && transport->close_event_used >= 6 &&
+                event[2] != 0 && event[4] == 0x06 && event[5] == 0x04)
+                transport->link_open[transport->close_link] = 0;
+            transport->close_event_used = 0;
+        }
+    }
+}
+
+/* Polls of close (one a pump, a pump every 10-20 ms) before it gives up
+ * waiting for the adapter. */
+#define CLOSE_POLL_LIMIT 400u
+
+int btv_native_usb_close(btv_native_usb *transport)
+{
+    unsigned int index;
+    int active, close_error = BTV_HOST_BRIDGE_OK;
+    if (transport == NULL || !transport->opened)
+        return BTV_HOST_BRIDGE_INVALID;
+    /* A failed owner stops polling, so close reclaims its tickets. Stream
+     * tickets have no request inside USBDriver - their bytes stay in the
+     * DeviceFS buffer that closing the handle discards. A control request
+     * is released only once USBDriver has published a terminal status. */
+    active = 0;
+    for (index = 0; index < BTV_NATIVE_USB_TICKETS; ++index)
+    {
+        btv_native_usb_ticket *ticket = &transport->tickets[index];
+        uint8_t status;
+        if (ticket->id == 0) continue;
+        if (ticket->control_status == NULL)
+        {
+            /* Keep a half-read event so the stream stays aligned for the
+             * disconnect wait below. */
+            if (ticket->kind == BTV_HOST_BRIDGE_EVENT_IN &&
+                ticket->used != 0 && ticket->used <= sizeof(transport->close_event))
+            {
+                memcpy(transport->close_event, ticket->data, ticket->used);
+                transport->close_event_used = ticket->used;
+            }
+            memset(ticket, 0, sizeof(*ticket));
+            continue;
+        }
+        status = *ticket->control_status;
+        if (status == USB_STATUS_PENDING || status == USB_STATUS_NAK ||
+            status == USB_STATUS_RETRY ||
+            !release_control(transport->device.name, ticket->control_status))
+        {
+            ticket->cancelled = 1;
+            active = 1;
+            continue;
+        }
+        memset(ticket, 0, sizeof(*ticket));
+    }
+    /* Never wait for ever, and never leave the streams open: after a few
+     * seconds of polls a control request that has not finished is
+     * abandoned (its status word is USBDriver's, so it is only forgotten),
+     * and any failure below still closes the DeviceFS handles. Leaving
+     * them open stranded the adapter until the machine was restarted. */
+    ++transport->close_polls;
+    if (active)
+    {
+        if (transport->close_polls < CLOSE_POLL_LIMIT)
+            return BTV_HOST_BRIDGE_PENDING;
+        memset(transport->tickets, 0, sizeof(transport->tickets));
+    }
+    if (!transport->removed && transport->close_phase != CLOSE_STREAMS)
+    {
+        int result = close_links(transport);
+        if (result == BTV_HOST_BRIDGE_PENDING &&
+            transport->close_polls < CLOSE_POLL_LIMIT)
+            return result;
+        if (result != BTV_HOST_BRIDGE_OK) close_error = result;
+    }
+    if (!transport->removed &&
+        btv_native_usb_voice(transport, 0) != BTV_HOST_BRIDGE_OK &&
+        close_error == BTV_HOST_BRIDGE_OK)
+        close_error = BTV_HOST_BRIDGE_IO_ERROR;
+    if (!transport->removed)
+    {
+        close_handle(transport->acl_out_handle);
+        close_handle(transport->acl_in_handle);
+        close_handle(transport->event_handle);
+    }
+    transport->event_handle = 0;
+    transport->acl_in_handle = 0;
+    transport->acl_out_handle = 0;
+    transport->devicefs_handle = 0;
+    transport->acl_in_stream = 0;
+    transport->opened = 0;
+    transport->close_polls = 0;
+    if (close_error != BTV_HOST_BRIDGE_OK)
+        trace_note(transport, 0xBC, (uint32_t)-close_error, 0);
+    return BTV_HOST_BRIDGE_OK;
+}
+
+void btv_native_usb_device_dead(btv_native_usb *transport,
+                                uint32_t service, uint32_t handle,
+                                const char *name)
+{
+    unsigned int index;
+    if (transport == NULL || !transport->detected) return;
+    trace_note(transport, 0xDD, service, handle);
+    /* Service_DeviceDead names the device that went (R3), or gives 0 when
+     * a whole DeviceFS registration went; USBDriver issues the named form
+     * for each device it drops. Anything else is somebody else's. */
+    if (service == 0x79 &&
+        (name == NULL || strncmp(name, transport->device.name,
+                                 sizeof(transport->device.name)) != 0))
+        return;
+    trace_note(transport, 0xDE, service, handle);
+    transport->removed = 1;
+    transport->detected = 0;
+    transport->acl_in_stream = 0;
+    transport->sco_in_stream = 0;
+    transport->event_handle = 0;
+    transport->acl_in_handle = 0;
+    transport->acl_out_handle = 0;
+    transport->sco_in_handle = 0;
+    transport->sco_out_handle = 0;
+    for (index = 0; index < BTV_NATIVE_USB_TICKETS; ++index)
+        transport->tickets[index].control_status = NULL;
+}

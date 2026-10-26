@@ -1,0 +1,34 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#ifndef BTV_RFCOMM_DLC_H
+#define BTV_RFCOMM_DLC_H
+#include "rfcomm_mux.h"
+#include "rfcomm_pn.h"
+#include "rfcomm_credit.h"
+typedef struct btv_rfcomm_dlc
+{
+    btv_rfcomm_mux control;
+    btv_rfcomm_credit credits;
+    uint16_t mtu;
+    uint8_t dlci, initiator, credit_mode;
+} btv_rfcomm_dlc;
+/* Outgoing DLC only. PN must be DONE on the same OPEN multiplexer; caller must
+ * satisfy authentication/encryption policy before start. initiator is the
+ * multiplexer role, not who requested this DLC. The DLCI direction is checked.
+ * receive_slots are real caller-owned MTU-sized buffers backing PN grants. */
+void btv_rfcomm_dlc_init(btv_rfcomm_dlc *dlc);
+int btv_rfcomm_dlc_start(btv_rfcomm_dlc *dlc, const btv_rfcomm_pn *pn,
+                         int initiator, uint16_t receive_slots, uint32_t now);
+int btv_rfcomm_dlc_close(btv_rfcomm_dlc *dlc, uint32_t now);
+size_t btv_rfcomm_dlc_output(btv_rfcomm_dlc *dlc, uint8_t *output,
+                             size_t capacity, unsigned int *token, uint32_t now);
+int btv_rfcomm_dlc_sent(btv_rfcomm_dlc *dlc, unsigned int token);
+/* Decoded frame with negotiated credit mode. 1 consumed control, 0 unrelated
+ * DLC or UIH for the OPEN DLC data owner, 2 response busy, -1 failure.
+ * OPEN is SABM/UA completion, not completed modem-status exchange or HFP. */
+int btv_rfcomm_dlc_receive(btv_rfcomm_dlc *dlc, const btv_rfcomm_frame *frame, uint32_t now);
+void btv_rfcomm_dlc_tick(btv_rfcomm_dlc *dlc, uint32_t now);
+void btv_rfcomm_dlc_abort(btv_rfcomm_dlc *dlc);
+/* Same copied-output acceptance and transport-drain rules as rfcomm_mux.
+ * Parent owns PN namespace, MSC exchange, physical buffers and L2CAP recovery. */
+#endif

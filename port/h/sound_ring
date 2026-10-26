@@ -1,0 +1,53 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        sound_ring
+ * Purpose:     The queue between SoundDMA's ticker (which makes the
+ *              speakers' audio in real time) and the A2DP media clock
+ *              (which sends it when the radio takes it). Pure, so that
+ *              it can be checked on the build machine.
+ *
+ * One producer (the ticker) and one consumer (a callback), each owning
+ * one free-running index. When the radio is slow or has stalled the
+ * ring fills and the producer is refused; when the radio is back the
+ * consumer drops the oldest audio, keeping only a short backlog, rather
+ * than playing a stale second behind the picture, and a stream that
+ * starts again starts from the present.
+ ******************************************************************/
+#ifndef BTV_SOUND_RING_H
+#define BTV_SOUND_RING_H
+
+#include <stdint.h>
+
+#define BTV_RING_FRAMES  8192u   /* a power of two */
+#define BTV_RING_ACCEPT  6144u   /* the producer is refused above this */
+#define BTV_RING_TRIM_AT 4096u   /* the consumer trims when above this ... */
+#define BTV_RING_KEEP    1536u   /* ... to this: about 35 ms at 44.1 kHz */
+
+typedef struct btv_sound_ring
+{
+    int16_t samples[BTV_RING_FRAMES * 2u];
+    volatile uint32_t in, out;      /* free-running, in frames */
+    uint32_t refused, dropped;      /* frames, for the log */
+} btv_sound_ring;
+
+void btv_sound_ring_reset(btv_sound_ring *ring);
+/* Producer: frames (left, right) to queue; returns how many were taken. */
+uint32_t btv_sound_ring_write(btv_sound_ring *ring, const int16_t *frames,
+                              uint32_t count);
+/* Consumer: up to `count` frames out; returns how many. Drops the oldest
+ * audio first if too much has built up. */
+uint32_t btv_sound_ring_read(btv_sound_ring *ring, int16_t *out,
+                             uint32_t count);
+/* Consumer: forget everything queued (a stream starting). */
+void btv_sound_ring_flush(btv_sound_ring *ring);
+uint32_t btv_sound_ring_used(const btv_sound_ring *ring);
+/* Consumer: is any queued frame louder than `threshold` (a sample's size,
+ * 0 to 32767)?  Looks only; nothing is taken.  Sound that is all silence
+ * is what an idle desktop sends. */
+int btv_sound_ring_audible(const btv_sound_ring *ring, int threshold);
+/* The same for `frames` frames of interleaved stereo. */
+int btv_sound_frames_audible(const int16_t *frames, uint32_t count,
+                             int threshold);
+
+#endif

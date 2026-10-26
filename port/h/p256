@@ -1,0 +1,41 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        p256
+ * Purpose:     NIST P-256 (secp256r1) key generation and ECDH for LE
+ *              Secure Connections pairing, so the host does not depend
+ *              on the controller's HCI_LE_Read_Local_P-256_Public_Key
+ *              and HCI_LE_Generate_DHKey.
+ * Reference:   FIPS 186-4 D.1.2.3 (curve), SEC 1 (point arithmetic),
+ *              Bluetooth Core Spec Vol 3 Part H 2.3.5.6.
+ * Licence:     BSD-2-Clause (see LICENSE).
+ *
+ * Every 32-octet number is LSB-first, which is how SMP's Pairing Public
+ * Key PDU and the HCI DHKey carry them: public keys are X (32) then Y (32).
+ * Plain 32-bit limbs, no allocation, no division. The scalar multiply is
+ * not constant time: it is run a few times per pairing with a fresh
+ * random key, on a machine the attacker is not sharing.
+ ******************************************************************/
+#ifndef BTV_P256_H
+#define BTV_P256_H
+
+#include <stdint.h>
+
+/* 1 when 0 < key < n (the group order), so a random 32 octets may be used
+ * as a private key; 0 otherwise (draw again). */
+int btv_p256_private_ok(const uint8_t key[32]);
+
+/* Public key of a private key. Returns 0 when the private key is out of
+ * range. */
+int btv_p256_public(const uint8_t key[32], uint8_t pub[64]);
+
+/* 1 when pub is a valid point on the curve (coordinates below p, and
+ * y^2 = x^3 - 3x + b). A remote public key MUST pass this before use. */
+int btv_p256_valid(const uint8_t pub[64]);
+
+/* ECDH: the X coordinate of key * peer, the DHKey. Returns 0 (and writes
+ * nothing) when key is out of range or peer is not a valid point. */
+int btv_p256_shared(const uint8_t key[32], const uint8_t peer[64],
+                    uint8_t secret[32]);
+
+#endif

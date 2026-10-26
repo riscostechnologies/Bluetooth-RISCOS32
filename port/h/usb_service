@@ -1,0 +1,27 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        usb_service
+ * Purpose:     Decode RISC OS Service_USB descriptor records.
+ ******************************************************************/
+#ifndef BTV_USB_SERVICE_H
+#define BTV_USB_SERVICE_H
+#include "usb_transport.h"
+
+typedef struct btv_usb_device
+{
+    char name[20];
+    uint16_t vendor;
+    uint16_t product;
+    uint16_t revision;
+    uint8_t bus;
+    uint8_t address;
+    btv_usb_endpoints endpoints;
+} btv_usb_device;
+
+/* Input starts at USBServiceCall, excluding the Answer list link word.
+ * Copies all required data; the caller can then free the RMA service record.
+ * Only full-speed standard Bluetooth devices are currently supported. */
+int btv_usb_service_decode(const uint8_t *record, size_t bytes,
+                            uint8_t alternate, btv_usb_device *output);
+#endif

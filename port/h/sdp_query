@@ -1,0 +1,37 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#ifndef BTV_SDP_QUERY_H
+#define BTV_SDP_QUERY_H
+#include "sdp_data.h"
+enum btv_sdp_state { BTV_SDP_IDLE, BTV_SDP_READY, BTV_SDP_WAIT, BTV_SDP_DONE, BTV_SDP_FAILED };
+typedef struct btv_sdp_query
+{
+    unsigned int state, pages;
+    uint16_t transaction, service, maximum, error;
+    uint32_t started;
+    uint8_t continuation[17];
+    uint8_t *storage;
+    size_t capacity, used;
+} btv_sdp_query;
+/* One serialized transaction stream on an established SDP L2CAP channel.
+ * Owner reserves the starting transaction ID and all its successors on that
+ * channel. No wrap/reuse; drain old traffic before fresh initialization. */
+void btv_sdp_query_init(btv_sdp_query *query);
+int btv_sdp_query_start(btv_sdp_query *query, uint16_t service,
+                       uint16_t transaction, uint16_t receive_mtu,
+                       uint8_t *storage, size_t capacity, uint32_t now);
+/* ServiceSearchAttribute Request for service class, protocol descriptor list,
+ * profile descriptor list and supported features. SDP bytes, no L2CAP header.
+ * Request stays pending until sent immediately after L2CAP/ACL accepts a copy. */
+size_t btv_sdp_query_request(btv_sdp_query *query, uint8_t *output,
+                            size_t capacity, uint32_t now);
+int btv_sdp_query_sent(btv_sdp_query *query);
+/* One complete L2CAP payload. 1 consumed, 0 wrong transaction/not waiting,
+ * -1 malformed, remote error, timeout or capacity failure. Completed result
+ * is exposed only after validating the full reassembled SDP element tree. */
+int btv_sdp_query_receive(btv_sdp_query *query, const uint8_t *pdu,
+                         size_t bytes, uint32_t now);
+void btv_sdp_query_tick(btv_sdp_query *query, uint32_t now);
+void btv_sdp_query_abort(btv_sdp_query *query);
+const uint8_t *btv_sdp_query_result(const btv_sdp_query *query, size_t *bytes);
+#endif

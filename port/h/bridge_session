@@ -1,0 +1,46 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#ifndef BTV_BRIDGE_SESSION_H
+#define BTV_BRIDGE_SESSION_H
+#include "bridge_voice.h"
+#include "bridge_pcm.h"
+
+enum btv_bridge_session_state
+{
+    BTV_BX_IDLE, BTV_BX_BOOTING, BTV_BX_INQUIRING, BTV_BX_CONNECTING,
+    BTV_BX_SECURING, BTV_BX_NEGOTIATING, BTV_BX_AUDIO_SETUP,
+    BTV_BX_READY, BTV_BX_CLOSING, BTV_BX_DISCONNECTED, BTV_BX_FAILED,
+    /* Scan-only session: inquiry finished, results readable. */
+    BTV_BX_SCANNED
+};
+typedef struct btv_bridge_session_options
+{
+    uint8_t capture, address_valid, address[6], pin[16], pin_bytes;
+    uint8_t scan_only;
+} btv_bridge_session_options;
+typedef struct btv_bridge_session
+{
+    btv_bridge_controller controller;
+    btv_bridge_voice voice;
+    btv_bridge_pcm pcm;
+    unsigned int state, error, selected;
+    uint8_t capture, address_valid, address[6], pin[16], pin_bytes;
+    uint8_t scan_only, naming;
+    /* Set when an orderly close is impossible: skip protocol teardown and
+     * release the transport so the session handle and streams are freed. */
+    uint8_t abandon;
+} btv_bridge_session;
+
+int btv_bridge_session_start(btv_bridge_session *session, int capture,
+                             uint32_t now);
+int btv_bridge_session_start_with_options(btv_bridge_session *session,
+                             const btv_bridge_session_options *options,
+                             uint32_t now);
+int btv_bridge_session_pump(btv_bridge_session *session, uint32_t now);
+int btv_bridge_session_close(btv_bridge_session *session, uint32_t now);
+int btv_bridge_session_write(btv_bridge_session *session,
+                             const uint8_t *audio, size_t bytes);
+int btv_bridge_session_read(btv_bridge_session *session, uint8_t *audio,
+                            size_t capacity, btv_sco_packet_info *info);
+
+#endif

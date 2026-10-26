@@ -1,0 +1,150 @@
+/*	$NetBSD: rfcomm.h,v 1.19 2022/05/28 21:14:57 andvar Exp $	*/
+
+/*-
+ * Copyright (c) 2006 Itronix Inc.
+ * All rights reserved.
+ *
+ * Written by Iain Hibbert for Itronix Inc.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. The name of Itronix Inc. may not be used to endorse
+ *    or promote products derived from this software without specific
+ *    prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY ITRONIX INC. ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL ITRONIX INC. BE LIABLE FOR ANY
+ * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+/*-
+ * Copyright (c) 2001-2003 Maksim Yevmenkin <m_evmenkin@yahoo.com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ *
+ * $Id: rfcomm.h,v 1.19 2022/05/28 21:14:57 andvar Exp $
+ * $FreeBSD: src/sys/netgraph/bluetooth/include/ng_btsocket_rfcomm.h,v 1.4 2005/01/11 01:39:53 emax Exp $
+ */
+
+/* Credit accounting adapted from NetBSD rfcomm_dlc_start and recv_uih.
+ * Fixed packet slots replace its byte-oriented mbuf receive-space tracking. */
+#include "rfcomm_credit.h"
+#include <string.h>
+
+int btv_rfcomm_credit_init(btv_rfcomm_credit *credit, uint16_t mtu,
+                           uint16_t slots, uint8_t initial_receive, uint8_t initial_transmit)
+{
+    if (credit == NULL || mtu < 23 || mtu > 32767 || slots == 0 ||
+        initial_receive > 7 || initial_transmit > 7 || initial_receive > slots)
+        return 0;
+    memset(credit, 0, sizeof(*credit));
+    credit->active = 1;
+    credit->mtu = mtu;
+    credit->slots = slots;
+    credit->receive_outstanding = initial_receive;
+    credit->transmit_available = initial_transmit;
+    return 1;
+}
+
+void btv_rfcomm_credit_abort(btv_rfcomm_credit *credit)
+{
+    if (credit != NULL)
+        credit->failed = 1;
+}
+
+unsigned int btv_rfcomm_credit_grant(const btv_rfcomm_credit *credit)
+{
+    unsigned int available;
+    if (credit == NULL || !credit->active || credit->failed)
+        return 0;
+    available = credit->slots - credit->occupied - credit->receive_outstanding;
+    return available > 255 ? 255 : available;
+}
+
+int btv_rfcomm_credit_can_send(const btv_rfcomm_credit *credit, size_t bytes, unsigned int grant)
+{
+    if (credit == NULL || !credit->active || credit->failed)
+        return -1;
+    if (bytes > credit->mtu || grant > btv_rfcomm_credit_grant(credit) ||
+        (bytes != 0 && credit->transmit_available == 0))
+        return 0;
+    return 1;
+}
+
+int btv_rfcomm_credit_sent(btv_rfcomm_credit *credit, size_t bytes, unsigned int grant)
+{
+    if (btv_rfcomm_credit_can_send(credit, bytes, grant) != 1)
+    {
+        btv_rfcomm_credit_abort(credit);
+        return -1;
+    }
+    if (bytes != 0)
+        --credit->transmit_available;
+    credit->receive_outstanding = (uint16_t)(credit->receive_outstanding + grant);
+    return 1;
+}
+
+int btv_rfcomm_credit_received(btv_rfcomm_credit *credit, size_t bytes, unsigned int grant)
+{
+    if (credit == NULL || !credit->active || credit->failed)
+        return -1;
+    if (grant > 255 || grant > 65535U - credit->transmit_available || bytes > credit->mtu ||
+        (bytes != 0 && (credit->receive_outstanding == 0 || credit->occupied >= credit->slots)))
+    {
+        btv_rfcomm_credit_abort(credit);
+        return -1;
+    }
+    credit->transmit_available = (uint16_t)(credit->transmit_available + grant);
+    if (bytes != 0)
+    {
+        --credit->receive_outstanding;
+        ++credit->occupied;
+    }
+    return 1;
+}
+
+int btv_rfcomm_credit_release(btv_rfcomm_credit *credit, unsigned int packets)
+{
+    if (credit == NULL || !credit->active || credit->failed)
+        return -1;
+    if (packets > credit->occupied)
+    {
+        btv_rfcomm_credit_abort(credit);
+        return -1;
+    }
+    credit->occupied = (uint16_t)(credit->occupied - packets);
+    return 1;
+}

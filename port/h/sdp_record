@@ -1,0 +1,19 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#ifndef BTV_SDP_RECORD_H
+#define BTV_SDP_RECORD_H
+#include "sdp_data.h"
+typedef struct btv_sdp_service
+{
+    uint16_t service, profile_version, features;
+    uint8_t rfcomm_channel, has_profile_version, has_features;
+} btv_sdp_service;
+/* Interpret a complete ServiceSearchAttribute result. Select only a record
+ * whose ServiceClassIDList contains service and whose protocol stack is L2CAP
+ * followed by RFCOMM with a valid server channel. UUID16/32/base-UUID128 match.
+ * 1 unique record, 0 no candidate, -1 malformed, -2 multiple candidates.
+ * Output unchanged except on 1. No connection, authentication or capability
+ * negotiation occurs here; version/features remain peer-advertised metadata. */
+int btv_sdp_record_find(const uint8_t *data, size_t bytes, uint16_t service,
+                        btv_sdp_service *result);
+#endif

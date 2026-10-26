@@ -1,0 +1,70 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/* L2CAP ownership and directional framing for a composed RFCOMM session. */
+#include "rfcomm_l2cap.h"
+#include <string.h>
+
+int btv_rfcomm_l2cap_start(btv_rfcomm_l2cap *b, const btv_l2cap_channel *channel,
+    int initiator, uint8_t server_channel, uint32_t now)
+{
+    if (b == NULL || channel == NULL || channel->state != BTV_CHANNEL_OPEN ||
+        channel->local_cid < 0x40 || channel->remote_cid < 0x40) return 0;
+    memset(b, 0, sizeof(*b));
+    if (!btv_rfcomm_session_start(&b->session, initiator, server_channel,
+        channel->receive_mtu, channel->transmit_mtu, now)) return 0;
+    b->channel = channel;
+    return 1;
+}
+
+void btv_rfcomm_l2cap_tick(btv_rfcomm_l2cap *b, uint32_t now)
+{
+    if (b == NULL || b->channel == NULL) return;
+    if (b->channel->state != BTV_CHANNEL_OPEN ||
+        b->channel->receive_mtu != b->session.receive_limit ||
+        b->channel->transmit_mtu != b->session.transmit_limit)
+    {
+        b->prepared = 0;
+        if (b->session.state != BTV_RS_CLOSED) btv_rfcomm_session_abort(&b->session);
+        return;
+    }
+    btv_rfcomm_session_tick(&b->session, now);
+}
+
+int btv_rfcomm_l2cap_receive(btv_rfcomm_l2cap *b, const uint8_t *pdu, size_t bytes, uint32_t now)
+{
+    const uint8_t *data;
+    size_t length;
+    int result;
+    if (b == NULL || b->channel == NULL) return -1;
+    result = btv_l2cap_channel_read(b->channel, pdu, bytes, &data, &length);
+    if (result == 0) return 0;
+    btv_rfcomm_l2cap_tick(b, now);
+    if (result < 0)
+    {
+        btv_rfcomm_session_abort(&b->session);
+        b->prepared = 0;
+        return -1;
+    }
+    return btv_rfcomm_session_receive(&b->session, data, length, now);
+}
+
+size_t btv_rfcomm_l2cap_output(btv_rfcomm_l2cap *b, uint8_t *pdu, size_t capacity, uint32_t now)
+{
+    size_t bytes, encoded;
+    if (b == NULL || b->channel == NULL) return 0;
+    b->prepared = 0;
+    btv_rfcomm_l2cap_tick(b, now);
+    if (b->channel->state != BTV_CHANNEL_OPEN || pdu == NULL || capacity < 4) return 0;
+    bytes = btv_rfcomm_session_output(&b->session, b->frame, sizeof(b->frame), now);
+    if (bytes == 0) return 0;
+    encoded = btv_l2cap_channel_write(b->channel, pdu, capacity, b->frame, bytes);
+    if (encoded != 0) b->prepared = 1;
+    return encoded;
+}
+
+int btv_rfcomm_l2cap_sent(btv_rfcomm_l2cap *b, uint32_t now)
+{
+    if (b == NULL || !b->prepared) return 0;
+    b->prepared = 0;
+    return btv_rfcomm_session_sent(&b->session, now);
+}

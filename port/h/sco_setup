@@ -1,0 +1,26 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#ifndef BTV_SCO_SETUP_H
+#define BTV_SCO_SETUP_H
+#include "hci_frame.h"
+typedef struct btv_sco_parameters {
+    uint16_t handle, latency, voice, packet_types;
+    uint32_t transmit_bandwidth, receive_bandwidth;
+    uint8_t retransmission;
+} btv_sco_parameters;
+typedef struct btv_sco_complete {
+    uint8_t status, address[6], link_type, interval, window, air_mode;
+    uint16_t handle, receive_length, transmit_length;
+} btv_sco_complete;
+/* Legacy Setup Synchronous Connection (0x0428), USB command bytes, not H4.
+ * Parent chooses negotiated profile/controller parameters and validates that
+ * handle belongs to the established ACL. This encoder does not execute IO.
+ * Invalid input leaves output unchanged; objects/buffers must not overlap. */
+size_t btv_sco_setup_command(uint8_t *output, size_t capacity, const btv_sco_parameters *parameters);
+/* Exact HCI event: 1 matching decoded event, 0 another valid event, -1 invalid.
+ * Status failure preserves raw address for owner correlation but clears all
+ * connection parameters. Success still needs Command Status/USB receipts and
+ * parent peer/lifetime checks before declaring the audio link usable.
+ * Air mode is preserved for caller codec validation, including enhanced setup. */
+int btv_sco_setup_complete(const uint8_t *event, size_t bytes, btv_sco_complete *result);
+#endif

@@ -1,0 +1,240 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        bt_reconnect
+ * Purpose:     Automatic reconnection of bonded devices. See the header.
+ * Licence:     BSD-2-Clause (see LICENSE).
+ ******************************************************************/
+#include "bt_reconnect.h"
+#include <string.h>
+
+#define NOAUTO_MAX 32
+static uint8_t enabled = 1;
+static uint8_t noauto[NOAUTO_MAX][6];
+static unsigned int noauto_count;
+
+void btc_rc_set_enabled(int on) { enabled = on != 0; }
+int btc_rc_enabled(void) { return enabled; }
+
+static int noauto_find(const uint8_t address[6])
+{
+    unsigned int i;
+    for (i = 0; i < noauto_count; ++i)
+        if (memcmp(noauto[i], address, 6) == 0) return (int)i;
+    return -1;
+}
+
+int btc_rc_auto(const uint8_t address[6]) { return noauto_find(address) < 0; }
+
+void btc_rc_set_auto(const uint8_t address[6], int on)
+{
+    int at = noauto_find(address);
+    if (on && at >= 0)
+    {
+        memmove(noauto[at], noauto[at + 1],
+                (noauto_count - (unsigned int)at - 1u) * 6u);
+        --noauto_count;
+    }
+    else if (!on && at < 0 && noauto_count < NOAUTO_MAX)
+        memcpy(noauto[noauto_count++], address, 6);
+}
+
+/* 0 a Low Energy input device, 1 a classic one, 2 speakers; 3 not one to
+ * bring back. */
+static uint8_t rank_of(const btc_key *key)
+{
+    if (key->le) return (key->flags & BTC_DEV_HID) ? 0 : 3;
+    if (key->flags & BTC_DEV_HID) return 1;
+    if (key->flags & BTC_DEV_AUDIO_SINK) return 2;
+    return 3;
+}
+
+void btc_rc_ready(btc_core *core)
+{
+    unsigned int index, rank, n = 0;
+    core->rc_count = 0;
+    core->rc_active = 0;
+    core->rc_current[0] = core->rc_current[1] = 0xff;
+    if (!enabled) return;
+    for (rank = 0; rank < 3; ++rank)
+        for (index = 0; index < BTC_KEYS && n < BTC_KEYS; ++index)
+        {
+            const btc_key *key = &core->keys[index];
+            btc_rc_entry *e;
+            if (!key->used || rank_of(key) != rank || !btc_rc_auto(key->address))
+                continue;
+            if (btc_link_by_address(core, key->address) != 0) continue;
+            e = &core->rc[n++];
+            memcpy(e->address, key->address, 6);
+            e->le = key->le;
+            e->address_type = key->address_type;
+            e->profile = key->le ? BTC_PROFILE_LE_HID :
+                         (rank == 1 ? BTC_PROFILE_HID : BTC_PROFILE_A2DP);
+            e->rank = (uint8_t)rank;
+            e->state = BTC_RC_WAITING;
+            e->tries = 0;
+            e->next_at = core->now;      /* at once: nothing to settle */
+        }
+    core->rc_count = (uint8_t)n;
+    core->rc_began = core->now;
+    core->rc_slow = 0;
+    core->rc_active = n != 0;
+    btc_note("auto-reconnect: devices to bring back", n);
+}
+
+/* One lane: Low Energy (0) or classic (1). The controller can page and
+ * initiate a Low Energy connection at the same time, so the two run side by
+ * side; within a lane it is one device at a time, in priority order. */
+static void lane_pump(btc_core *core, unsigned int lane)
+{
+    unsigned int i;
+    int started;
+    if (core->rc_current[lane] != 0xff)
+    {
+        btc_rc_entry *e = &core->rc[core->rc_current[lane]];
+        btc_link *link = btc_link_by_address(core, e->address);
+        uint32_t limit = lane == 0 ? BTC_RC_LE_ATTEMPT_MS : BTC_RC_ATTEMPT_MS;
+        if (link != 0 && link->state == BTC_LINK_OPEN)
+        {
+            e->state = BTC_RC_DONE;
+            core->rc_current[lane] = 0xff;
+            btc_note("auto-reconnect: connected, ms since module init",
+                     core->now - btc_origin_ms);
+        }
+        else if (core->now - core->rc_attempt_at[lane] >= limit ||
+                 (link == 0 && !core->deferred &&
+                  core->now - core->rc_attempt_at[lane] >= 300u))
+        {
+            /* Timed out, or the attempt is gone (refused by the controller,
+             * or the page failed): another try soon, not after the timeout. */
+            int gone = link == 0;
+            if (link != 0 && link->state == BTC_LINK_CONNECTING)
+                (void)btc_disconnect(core, e->address);
+            if (++e->tries >= BTC_RC_TRIES)
+            {
+                e->tries = BTC_RC_TRIES;
+                if (e->le)
+                    e->state = BTC_RC_GAVE_UP;  /* the LE scan finds it */
+                else
+                {
+                    e->state = BTC_RC_WAITING;
+                    e->next_at = core->now + BTC_RC_SLOW_MS;
+                }
+            }
+            else
+            {
+                e->state = BTC_RC_WAITING;
+                uint32_t gap = (gone ? 1000u : 2000u) * e->tries;
+                /* A classic keyboard or mouse normally calls the computer
+                 * itself, and cannot while this one is paging: leave the
+                 * radio to page scan between the attempts. */
+                if (!e->le && e->rank == 1) gap = 5000u * e->tries;
+                e->next_at = core->now + gap;
+                btc_note("auto-reconnect: attempt failed, entry|gone",
+                         (uint32_t)(e - core->rc) << 8 | (uint32_t)gone);
+            }
+            core->rc_current[lane] = 0xff;
+        }
+        else
+            return;                 /* an attempt is under way */
+    }
+    for (i = 0; i < core->rc_count; ++i)
+    {
+        btc_rc_entry *e = &core->rc[i];
+        if (e->state != BTC_RC_WAITING || (e->le ? 0u : 1u) != lane) continue;
+        if ((int32_t)(core->now - e->next_at) < 0) continue;
+        /* A slow retry pages for 5 s: never while audio is playing. */
+        if (e->tries >= BTC_RC_TRIES && core->audio_busy)
+        {
+            e->next_at = core->now + BTC_RC_SLOW_MS;
+            continue;
+        }
+        if (btc_link_by_address(core, e->address) != 0)
+        {
+            e->state = BTC_RC_DONE;          /* connected by other means */
+            continue;
+        }
+        e->state = BTC_RC_TRYING;
+        core->rc_attempt_at[lane] = core->now;
+        core->rc_current[lane] = (uint8_t)i;
+        core->engine_call = 1;
+        started = btc_connect(core, e->address, e->le, e->address_type,
+                              e->profile);
+        core->engine_call = 0;
+        if (!started)
+        {
+            e->state = BTC_RC_WAITING;
+            e->next_at = core->now + 500u;
+            core->rc_current[lane] = 0xff;
+        }
+        else
+            btc_note("auto-reconnect: trying, entry|profile",
+                     (uint32_t)i << 8 | e->profile);
+        btc_note("auto-reconnect: attempt began, ms since module init",
+                 core->now - btc_origin_ms);
+        return;
+    }
+}
+
+void btc_rc_pump(btc_core *core)
+{
+    unsigned int i, waiting = 0;
+    if (!core->rc_active) return;
+    if (core->now - core->rc_began >= BTC_RC_WINDOW_MS && !core->rc_slow)
+    {
+        /* The start-up window is over: Low Energy devices are left to the
+         * background scan; classic ones go on, once a minute. */
+        core->rc_slow = 1;
+        for (i = 0; i < core->rc_count; ++i)
+            if (core->rc[i].le && core->rc[i].state == BTC_RC_WAITING)
+                core->rc[i].state = BTC_RC_GAVE_UP;
+            else if (!core->rc[i].le && core->rc[i].state == BTC_RC_WAITING)
+            {
+                core->rc[i].tries = BTC_RC_TRIES;
+                if ((int32_t)(core->rc[i].next_at - core->now) < 0)
+                    core->rc[i].next_at = core->now + BTC_RC_SLOW_MS;
+            }
+        btc_note("auto-reconnect: window over, slow retries", 0);
+    }
+    /* A link that opened and then went (a speaker that hung up while the
+     * audio channel was being set up, as the DM-40BT does when it is still
+     * tearing down its last connection) is not back: try it again. */
+    for (i = 0; i < core->rc_count; ++i)
+    {
+        btc_rc_entry *e = &core->rc[i];
+        if (e->state != BTC_RC_DONE ||
+            btc_link_by_address(core, e->address) != 0)
+            continue;
+        if (++e->tries >= BTC_RC_TRIES)
+        {
+            e->tries = BTC_RC_TRIES;
+            e->state = e->le ? BTC_RC_GAVE_UP : BTC_RC_WAITING;
+            e->next_at = core->now + BTC_RC_SLOW_MS;
+        }
+        else
+        {
+            e->state = BTC_RC_WAITING;
+            e->next_at = core->now + 3000u;
+            btc_note("auto-reconnect: link dropped, again, entry",
+                     (uint32_t)i);
+        }
+    }
+    lane_pump(core, 0);
+    lane_pump(core, 1);
+    for (i = 0; i < core->rc_count; ++i)
+        if (core->rc[i].state == BTC_RC_WAITING) waiting = 1;
+    if (!waiting && core->rc_current[0] == 0xff && core->rc_current[1] == 0xff)
+    {
+        core->rc_active = 0;
+        btc_note("auto-reconnect: finished, ms since module init",
+                 core->now - btc_origin_ms);
+    }
+}
+
+void btc_rc_user_dropped(btc_core *core, const uint8_t address[6])
+{
+    unsigned int i;
+    for (i = 0; i < core->rc_count; ++i)
+        if (memcmp(core->rc[i].address, address, 6) == 0)
+            core->rc[i].state = BTC_RC_DROPPED;
+}

@@ -1,0 +1,819 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        bt_a2dp
+ * Purpose:     A2DP source over the Bluetooth core.  Sets up an SBC
+ *              stream with AVDTP (as initiator, or answering a sink that
+ *              configures us), then sends RTP media paced by the clock
+ *              from the system sound device.
+ ******************************************************************/
+#include "bt_profiles.h"
+#include "sound_device.h"
+#include "sound_ring.h"
+#include "host_bridge.h"
+#include <string.h>
+
+#define AVDTP_PSM 0x0019u
+#define STEP_TIMEOUT_MS 20000u
+#define AUTO_START_MS 500u
+#define SINK_WAIT_MS 3000u
+#define MEDIA_MTU 1024u
+#define LOCAL_SEID 1u
+#define MAX_OWED_MILLI 16384000u     /* after a stall, drop rather than burst */
+#define MAX_BACKLOG_BYTES 3000u
+
+/* AVDTP signals. */
+#define AV_DISCOVER 0x01
+#define AV_GET_CAPABILITIES 0x02
+#define AV_SET_CONFIGURATION 0x03
+#define AV_GET_CONFIGURATION 0x04
+#define AV_RECONFIGURE 0x05
+#define AV_OPEN 0x06
+#define AV_START 0x07
+#define AV_CLOSE 0x08
+#define AV_SUSPEND 0x09
+#define AV_ABORT 0x0a
+#define AV_GET_ALL_CAPABILITIES 0x0c
+#define AV_DELAYREPORT 0x0d
+
+#define MSG_COMMAND 0
+#define MSG_GENERAL_REJECT 1
+#define MSG_ACCEPT 2
+#define MSG_REJECT 3
+
+/* Our source endpoint's SBC capabilities. */
+static const uint8_t local_caps[4] = {
+    0x33,   /* 44.1 or 48 kHz; stereo or joint stereo */
+    0xf5,   /* 4-16 blocks; 8 subbands; loudness */
+    2, 53   /* bitpool */
+};
+
+/* The idle time before a silent stream is suspended (module setting). */
+static uint32_t idle_setting = BTP_A2DP_IDLE_MS;
+
+void btp_a2dp_set_idle(uint32_t ms)
+{
+    idle_setting = ms;
+}
+
+static btp_a2dp *state(btc_core *core)
+{
+    return &core->profiles->a2dp;
+}
+
+static void fail(btc_core *core, uint32_t error)
+{
+    btp_a2dp *a = state(core);
+    a->error = error;
+    a->state = BTP_A2DP_FAILED;
+    (void)btv_sound_device_stereo_sync(0, 0, 0);
+    if (a->link < BTC_LINKS)
+        (void)btc_disconnect(core, core->links[a->link].address);
+}
+
+static void step(btp_a2dp *a, uint8_t next, uint32_t now)
+{
+    btc_note("A2DP state", next);
+    /* The device list shows this state ("setting up", "playing"), and the
+     * application only re-reads the list when the generation moves. */
+    if (a->state != next) ++btc_profile_generation;
+    a->state = next;
+    a->step_started = now;
+}
+
+static void send_signal(btc_core *core, uint8_t message, uint8_t label,
+                        uint8_t signal_id, const uint8_t *data, size_t bytes)
+{
+    btp_a2dp *a = state(core);
+    uint8_t pdu[64];
+    if (bytes > sizeof(pdu) - 2) return;
+    pdu[0] = (uint8_t)((label << 4) | message);
+    pdu[1] = (uint8_t)(signal_id & 0x3f);
+    if (bytes != 0) memcpy(pdu + 2, data, bytes);
+    (void)btc_l2cap_send(core, a->signal_channel, pdu, bytes + 2);
+}
+
+static void command(btc_core *core, uint8_t signal_id, const uint8_t *data,
+                    size_t bytes)
+{
+    btp_a2dp *a = state(core);
+    a->label = (uint8_t)((a->label + 1) & 0x0f);
+    a->waiting_signal = signal_id;
+    a->waiting_label = a->label;
+    send_signal(core, MSG_COMMAND, a->label, signal_id, data, bytes);
+}
+
+/* ---- configuration -------------------------------------------------- */
+
+static uint8_t pick(uint8_t mask, const uint8_t *order, unsigned int count)
+{
+    unsigned int index;
+    for (index = 0; index < count; ++index)
+        if (mask & order[index]) return order[index];
+    return 0;
+}
+
+/* Choose one value from each field of the sink's capabilities. */
+static int choose_config(btp_a2dp *a)
+{
+    static const uint8_t rates_order[2] = { 0x20, 0x10 };     /* 44.1, 48 */
+    static const uint8_t modes_order[2] = { 0x01, 0x02 };     /* joint, stereo */
+    static const uint8_t blocks_order[4] = { 0x10, 0x20, 0x40, 0x80 };
+    uint8_t rate = pick(a->caps[0] & 0x30, rates_order, 2);
+    uint8_t mode = pick(a->caps[0] & 0x03, modes_order, 2);
+    uint8_t blocks = pick(a->caps[1] & 0xf0, blocks_order, 4);
+    uint8_t subbands = (a->caps[1] & 0x04) ? 0x04 : 0;
+    uint8_t allocation = (a->caps[1] & 0x01) ? 0x01 :
+                         ((a->caps[1] & 0x02) ? 0x02 : 0);
+    uint8_t low = a->caps[2], high = a->caps[3];
+    if (rate == 0 || mode == 0 || blocks == 0 || subbands == 0 ||
+        allocation == 0)
+        return 0;
+    if (low < 2) low = 2;
+    /* A2DP's medium quality (bitpool 35, 237 kbit/s at 44.1 kHz) rather than
+     * its high (53, 328): a third less to send over a link that was seen to
+     * run short, for little to hear. */
+    if (high > 35) high = 35;
+    if (low > high) low = high;
+    if (high < low) return 0;
+    a->config[0] = (uint8_t)(rate | mode);
+    a->config[1] = (uint8_t)(blocks | subbands | allocation);
+    a->config[2] = low;
+    a->config[3] = high;
+    return 1;
+}
+
+/* ---- adaptive bitpool ------------------------------------------------
+ * Every SBC frame carries its own bitpool, so the encoder can change it on
+ * the fly without renegotiating.  The CSR adapter behind the CM4 completes
+ * only about 50 ACL packets a second while it also serves an LE mouse; at
+ * bitpool 35 three frames fit a packet and 44.1 kHz needs about 115 packets
+ * a second, so the audio cut out.  Lower bitpools put more frames in each
+ * packet.  The stream goes down quickly when the controller's queue backs
+ * up and creeps back up while it stays clear. */
+#define BITPOOL_MIN 10u
+#define BITPOOL_START 18u
+#define ADAPT_MS 500u
+#define CLEAR_MS 5000u
+#define BACKLOG_HIGH 1200u
+
+static void set_bitpool(btp_a2dp *a, uint8_t bitpool)
+{
+    unsigned int room = a->frame_room, count;
+    size_t frame;
+    uint8_t was = a->encoder.config.bitpool;
+    if (!btv_sbc_set_bitpool(&a->encoder, bitpool)) return;
+    frame = btv_sbc_frame_bytes(&a->encoder);
+    for (count = 0; count < 15 && room >= frame; ++count) room -= frame;
+    if (count == 0)
+    {
+        (void)btv_sbc_set_bitpool(&a->encoder, was);
+        return;
+    }
+    a->bitpool_now = bitpool;
+    a->frame_bytes = (uint16_t)frame;
+    a->frames_per_packet = (uint16_t)count;
+}
+
+static void adapt_bitpool(btc_core *core, btp_a2dp *a)
+{
+    uint32_t backlog;
+    if ((int32_t)(core->now - a->adapt_at) < 0) return;
+    a->adapt_at = core->now + ADAPT_MS;
+    backlog = btc_link_backlog(core, a->link);
+    if (backlog > BACKLOG_HIGH)
+    {
+        a->clear_since = core->now;
+        if (a->bitpool_now > BITPOOL_MIN + 2u)
+        {
+            set_bitpool(a, (uint8_t)(a->bitpool_now - 2u));
+            btc_note("A2DP: bitpool down to", a->bitpool_now);
+        }
+        return;
+    }
+    if (core->now - a->clear_since >= CLEAR_MS &&
+        a->bitpool_now < a->bitpool_max)
+    {
+        set_bitpool(a, (uint8_t)(a->bitpool_now + 1u));
+        a->clear_since = core->now;
+        btc_note("A2DP: bitpool up to", a->bitpool_now);
+    }
+}
+
+/* Encoder settings from a single-valued configuration. */
+static int start_encoder(btc_core *core)
+{
+    btp_a2dp *a = state(core);
+    btv_sbc_config config;
+    uint8_t c0 = a->config[0], c1 = a->config[1];
+    size_t frame, room;
+    unsigned int count;
+    memset(&config, 0, sizeof(config));
+    config.sample_rate = (c0 & 0x10) ? 48000u : (c0 & 0x20) ? 44100u :
+                         (c0 & 0x40) ? 32000u : 16000u;
+    config.channel_mode = (c0 & 0x01) ? 3 : (c0 & 0x02) ? 2 :
+                          (c0 & 0x04) ? 1 : 0;
+    config.blocks = (c1 & 0x10) ? 16 : (c1 & 0x20) ? 12 :
+                    (c1 & 0x40) ? 8 : 4;
+    config.subbands = (c1 & 0x04) ? 8 : 4;
+    config.allocation = (c1 & 0x01) ? 0 : 1;
+    config.bitpool = a->config[3];
+    if (config.channel_mode == 0 || config.channel_mode == 1)
+        return 0;                     /* system sound is stereo */
+    if (!btv_sbc_init(&a->encoder, &config))
+    {
+        /* The sink's maximum may be above what this mode allows. */
+        config.bitpool = 35;
+        if (!btv_sbc_init(&a->encoder, &config)) return 0;
+    }
+    a->sample_rate = config.sample_rate;
+    frame = btv_sbc_frame_bytes(&a->encoder);
+    a->frame_bytes = (uint16_t)frame;
+    a->frame_samples = (uint16_t)btv_sbc_frame_samples(&a->encoder);
+    /* RTP header (12) and SBC payload header (1) share the packet. */
+    room = core->channels[a->media_channel].remote_mtu;
+    if (room > BTP_A2DP_PACKET_BYTES) room = BTP_A2DP_PACKET_BYTES;
+    /* Keep one media packet inside one ACL packet.  The sink's MTU is
+     * usually far larger than the controller's, and a packet split into
+     * three transfers costs three times as much to send: measured, the
+     * stream then managed 17 packets a second where it needs about 43,
+     * and the audio stuttered. */
+    if (core->acl_mtu > 32u && room > (unsigned int)core->acl_mtu - 4u)
+        room = (unsigned int)core->acl_mtu - 4u;
+    room -= 13;
+    a->frame_room = (uint16_t)room;
+    for (count = 0; count < 15 && room >= frame; ++count) room -= frame;
+    if (count == 0) return 0;
+    a->frames_per_packet = (uint16_t)count;
+    a->bitpool_max = config.bitpool;
+    a->bitpool_now = config.bitpool;
+    /* Start where the CSR adapter is known to keep up (see adapt_bitpool),
+     * and let the stream earn more. */
+    if (a->bitpool_now > BITPOOL_START) set_bitpool(a, BITPOOL_START);
+    a->adapt_at = core->now + ADAPT_MS;
+    a->clear_since = core->now;
+    a->sequence = 1;
+    a->timestamp = 0;
+    a->owed_milli = 0;
+    a->clock_ms = core->now;
+    return 1;
+}
+
+/* ---- media ------------------------------------------------------ */
+
+static void send_media(btc_core *core)
+{
+    btp_a2dp *a = state(core);
+    uint32_t elapsed, packet_milli;
+    int16_t *pcm = a->pcm;
+    unsigned int frame, got;
+    size_t offset, bytes;
+    elapsed = core->now - a->clock_ms;
+    a->clock_ms = core->now;
+    /* Every two seconds: what is going out, and what the link makes of
+     * it (packets, frames the sound system had not made, packets sent
+     * late, the controller's free ACL buffers and the link's backlog). */
+    if (core->now - a->beat_at >= 2000u)
+    {
+        a->beat_at = core->now;
+        btc_note("A2DP packets", a->packets);
+        btc_note("  underruns (frames short)", a->underruns);
+        btc_note("  late", a->late);
+        btc_note("  ACL buffers free|backlog",
+                 (uint32_t)core->acl_free << 16 |
+                 (btc_link_backlog(core, a->link) & 0xffffu));
+        btc_note("  link role (0 master)|no credit", (uint32_t)core->links[a->link].role << 16 |
+                 (core->acl_no_credit & 0xffffu));
+        {
+            uint32_t refused, dropped, queued, tx, rx, over;
+            btv_sound_device_counts(&refused, &dropped, &queued);
+            btc_note("  sound queued|refused", queued << 16 | (refused & 0xffffu));
+            btc_note("  sound dropped (stale)", dropped);
+            btv_host_bridge_stats(&tx, &rx, &over);
+            btc_note("  UART bytes waiting to send|overruns", tx << 16 | (over & 0xffffu));
+            {
+                uint32_t e[5];
+                btv_host_bridge_errors(e);
+                btc_note("  UART line errors", e[0]);
+                btc_note("  events lost|ACL lost", e[1] << 16 | (e[2] & 0xffffu));
+                btc_note("  framing dropped|oversize", e[3] << 16 | (e[4] & 0xffffu));
+            }
+            btc_note("  completed-packet events|packets", core->nocp_events << 16 | (core->nocp_packets & 0xffffu));
+            btc_note("  ACL credits free|resyncs", (uint32_t)core->acl_free << 16 | core->resyncs);
+            btc_note("  ms since a completed packet", core->now - core->last_nocp);
+        }
+    }
+    if (elapsed > 1000u) elapsed = 1000u;
+    /* The clock is kept in thousandths of a sample: no division. */
+    a->owed_milli += elapsed * a->sample_rate;
+    packet_milli = (uint32_t)a->frame_samples * a->frames_per_packet * 1000u;
+    if (a->owed_milli > MAX_OWED_MILLI)
+    {
+        ++a->late;
+        a->owed_milli = packet_milli;
+    }
+    /* Keep the sound device topped up even while waiting. */
+    (void)btv_sound_device_stereo_sync(1, a->sample_rate, core->now);
+    adapt_bitpool(core, a);
+    packet_milli = (uint32_t)a->frame_samples * a->frames_per_packet * 1000u;
+    while (a->owed_milli >= packet_milli)
+    {
+        uint8_t *p = a->packet;
+        size_t total = 13u + (size_t)a->frame_bytes * a->frames_per_packet;
+        if (btc_link_backlog(core, a->link) > MAX_BACKLOG_BYTES ||
+            !btc_l2cap_can_send(core, a->media_channel, total))
+            return;
+        p[0] = 0x80;
+        p[1] = 0x60;
+        p[2] = (uint8_t)(a->sequence >> 8);
+        p[3] = (uint8_t)a->sequence;
+        p[4] = (uint8_t)(a->timestamp >> 24);
+        p[5] = (uint8_t)(a->timestamp >> 16);
+        p[6] = (uint8_t)(a->timestamp >> 8);
+        p[7] = (uint8_t)a->timestamp;
+        p[8] = 0; p[9] = 0; p[10] = 0; p[11] = 1;   /* SSRC */
+        p[12] = (uint8_t)a->frames_per_packet;
+        offset = 13;
+        for (frame = 0; frame < a->frames_per_packet; ++frame)
+        {
+            got = btv_sound_device_stereo_read(pcm, a->frame_samples);
+            if (got < a->frame_samples)
+            {
+                ++a->underruns;
+                memset(pcm + got * 2u, 0,
+                       (a->frame_samples - got) * 2u * sizeof(pcm[0]));
+            }
+            if (btv_sound_frames_audible(pcm, got, 2)) a->audible_at = core->now;
+            bytes = btv_sbc_encode(&a->encoder, pcm, p + offset,
+                                   BTP_A2DP_PACKET_BYTES - offset);
+            if (bytes == 0) return;
+            offset += bytes;
+        }
+        if (btc_l2cap_send(core, a->media_channel, p, offset) != 1) return;
+        ++a->sequence;
+        a->timestamp += (uint32_t)a->frame_samples * a->frames_per_packet;
+        a->owed_milli -= packet_milli;
+        ++a->packets;
+    }
+}
+
+static void stop_media(btc_core *core)
+{
+    (void)btv_sound_device_stereo_sync(0, 0, 0);
+    (void)core;
+}
+
+/* The stream starts, or starts again after a pause: the media clock and
+ * the queue of audio both start from now, so no stale audio is played
+ * and no credit has built up to burst. */
+static void begin_streaming(btc_core *core)
+{
+    btp_a2dp *a = state(core);
+    a->clock_ms = core->now;
+    a->owed_milli = 0;
+    a->audible_at = core->now;
+    a->idle_suspending = a->idle_suspended = 0;
+    /* A stream that was suspended for silence and starts for sound keeps
+     * what was queued: it is the beginning of that sound. */
+    if (!a->keep_queue) btv_sound_device_flush();
+    a->keep_queue = 0;
+    step(a, BTP_A2DP_STREAMING, core->now);
+}
+
+/* ---- signalling ------------------------------------------------------ */
+
+static void open_media(btc_core *core, uint32_t now)
+{
+    btp_a2dp *a = state(core);
+    a->media_channel = btc_l2cap_connect(core, a->link, AVDTP_PSM,
+                                         BTC_OWN_AVDTP_MEDIA, MEDIA_MTU);
+    if (a->media_channel < 0) fail(core, 20);
+    else step(a, BTP_A2DP_MEDIA, now);
+}
+
+static void next_capabilities(btc_core *core, uint32_t now)
+{
+    btp_a2dp *a = state(core);
+    uint8_t seid;
+    if (a->sep_index >= a->sep_count)
+    {
+        fail(core, 12);                  /* no SBC sink endpoint */
+        return;
+    }
+    seid = (uint8_t)(a->seps[a->sep_index++] << 2);
+    command(core, AV_GET_CAPABILITIES, &seid, 1);
+    step(a, BTP_A2DP_CAPABILITIES, now);
+}
+
+/* Find the SBC media codec capability in a capability list. */
+static const uint8_t *find_sbc(const uint8_t *p, size_t bytes)
+{
+    size_t offset = 0;
+    while (offset + 2 <= bytes)
+    {
+        uint8_t category = p[offset], length = p[offset + 1];
+        if (offset + 2u + length > bytes) break;
+        if (category == 0x07 && length >= 6 && p[offset + 3] == 0x00)
+            return p + offset + 4;
+        offset += 2u + length;
+    }
+    return 0;
+}
+
+static void accepted(btc_core *core, uint8_t signal_id, const uint8_t *p,
+                     size_t bytes)
+{
+    btp_a2dp *a = state(core);
+    uint32_t now = core->now;
+    size_t index;
+    switch (signal_id)
+    {
+    case AV_DISCOVER:
+        a->sep_count = 0;
+        a->sep_index = 0;
+        for (index = 0; index + 1 < bytes && a->sep_count < BTP_A2DP_SEPS;
+             index += 2)
+        {
+            uint8_t seid = (uint8_t)(p[index] >> 2);
+            int in_use = (p[index] & 0x02) != 0;
+            int audio = (p[index + 1] >> 4) == 0;
+            int sink = (p[index + 1] & 0x08) != 0;
+            if (audio && sink && !in_use) a->seps[a->sep_count++] = seid;
+        }
+        next_capabilities(core, now);
+        break;
+    case AV_GET_CAPABILITIES:
+    {
+        const uint8_t *sbc = find_sbc(p, bytes);
+        uint8_t data[14];
+        if (sbc == 0)
+        {
+            next_capabilities(core, now);
+            break;
+        }
+        memcpy(a->caps, sbc, 4);
+        if (!choose_config(a))
+        {
+            next_capabilities(core, now);
+            break;
+        }
+        a->remote_seid = a->seps[a->sep_index - 1];
+        data[0] = (uint8_t)(a->remote_seid << 2);
+        data[1] = (uint8_t)(LOCAL_SEID << 2);
+        data[2] = 0x01; data[3] = 0x00;           /* media transport */
+        data[4] = 0x07; data[5] = 0x06;           /* media codec */
+        data[6] = 0x00; data[7] = 0x00;           /* audio, SBC */
+        memcpy(data + 8, a->config, 4);
+        command(core, AV_SET_CONFIGURATION, data, 12);
+        step(a, BTP_A2DP_CONFIGURING, now);
+        break;
+    }
+    case AV_SET_CONFIGURATION:
+    {
+        uint8_t seid = (uint8_t)(a->remote_seid << 2);
+        command(core, AV_OPEN, &seid, 1);
+        step(a, BTP_A2DP_OPENING, now);
+        break;
+    }
+    case AV_OPEN:
+        open_media(core, now);
+        break;
+    case AV_START:
+        begin_streaming(core);
+        break;
+    case AV_SUSPEND:
+        if (a->idle_suspending)
+        {
+            a->idle_suspending = 0;
+            a->idle_suspended = 1;
+            btc_note("A2DP: suspended for silence", 0);
+        }
+        step(a, BTP_A2DP_SUSPENDED, now);
+        break;
+    default:
+        break;
+    }
+}
+
+/* Commands from the sink. */
+static void incoming(btc_core *core, uint8_t label, uint8_t signal_id,
+                     const uint8_t *p, size_t bytes)
+{
+    btp_a2dp *a = state(core);
+    uint8_t reply[16];
+    switch (signal_id)
+    {
+    case AV_DISCOVER:
+        reply[0] = (uint8_t)(LOCAL_SEID << 2);
+        reply[1] = 0x00;                 /* audio source */
+        send_signal(core, MSG_ACCEPT, label, signal_id, reply, 2);
+        break;
+    case AV_GET_CAPABILITIES:
+    case AV_GET_ALL_CAPABILITIES:
+        reply[0] = 0x01; reply[1] = 0x00;
+        reply[2] = 0x07; reply[3] = 0x06;
+        reply[4] = 0x00; reply[5] = 0x00;
+        memcpy(reply + 6, local_caps, 4);
+        send_signal(core, MSG_ACCEPT, label, signal_id, reply, 10);
+        break;
+    case AV_SET_CONFIGURATION:
+    {
+        const uint8_t *sbc = bytes > 2 ? find_sbc(p + 2, bytes - 2) : 0;
+        if (sbc == 0 || (a->state >= BTP_A2DP_CONFIGURING &&
+                         a->state != BTP_A2DP_FAILED))
+        {
+            reply[0] = 0x00;             /* service category */
+            reply[1] = 0x13;             /* SEP in use */
+            send_signal(core, MSG_REJECT, label, signal_id, reply, 2);
+            break;
+        }
+        memcpy(a->config, sbc, 4);
+        a->remote_seid = (uint8_t)(p[1] >> 2);
+        a->sink_initiated = 1;
+        send_signal(core, MSG_ACCEPT, label, signal_id, 0, 0);
+        step(a, BTP_A2DP_OPENING, core->now);
+        break;
+    }
+    case AV_GET_CONFIGURATION:
+        reply[0] = 0x01; reply[1] = 0x00;
+        reply[2] = 0x07; reply[3] = 0x06;
+        reply[4] = 0x00; reply[5] = 0x00;
+        memcpy(reply + 6, a->config, 4);
+        send_signal(core, MSG_ACCEPT, label, signal_id, reply, 10);
+        break;
+    case AV_OPEN:
+        send_signal(core, MSG_ACCEPT, label, signal_id, 0, 0);
+        step(a, BTP_A2DP_MEDIA, core->now);   /* the sink opens media */
+        break;
+    case AV_START:
+        send_signal(core, MSG_ACCEPT, label, signal_id, 0, 0);
+        a->auto_start = 0;
+        if (a->media_channel >= 0)
+            begin_streaming(core);
+        break;
+    case AV_SUSPEND:
+        send_signal(core, MSG_ACCEPT, label, signal_id, 0, 0);
+        step(a, BTP_A2DP_SUSPENDED, core->now);
+        break;
+    case AV_CLOSE:
+    case AV_ABORT:
+        send_signal(core, MSG_ACCEPT, label, signal_id, 0, 0);
+        stop_media(core);
+        step(a, BTP_A2DP_CLOSING, core->now);
+        break;
+    case AV_DELAYREPORT:
+        send_signal(core, MSG_ACCEPT, label, signal_id, 0, 0);
+        break;
+    default:
+        send_signal(core, MSG_GENERAL_REJECT, label, signal_id, 0, 0);
+        break;
+    }
+}
+
+static void signal_data(btc_core *core, const uint8_t *p, size_t bytes)
+{
+    btp_a2dp *a = state(core);
+    uint8_t label, message, signal_id;
+    if (bytes < 2) return;
+    label = (uint8_t)(p[0] >> 4);
+    message = (uint8_t)(p[0] & 0x03);
+    if ((p[0] & 0x0c) != 0) return;      /* fragmented: not expected */
+    signal_id = (uint8_t)(p[1] & 0x3f);
+    if (message == MSG_COMMAND)
+    {
+        incoming(core, label, signal_id, p + 2, bytes - 2);
+        return;
+    }
+    if (label != a->waiting_label || signal_id != a->waiting_signal) return;
+    a->waiting_signal = 0;
+    if (signal_id == AV_START && a->state != BTP_A2DP_STARTING)
+        return;                          /* the sink started it first */
+    if (message == MSG_ACCEPT)
+        accepted(core, signal_id, p + 2, bytes - 2);
+    else if (signal_id == AV_START)
+    {
+        step(a, BTP_A2DP_SUSPENDED, core->now);   /* wait for the sink */
+        a->retry_at = core->now + 2000u;          /* if we asked for sound */
+    }
+    else if (signal_id == AV_SUSPEND && a->idle_suspending)
+    {
+        /* The sink will not be suspended: leave it running, and do not ask
+         * again on this stream. */
+        a->idle_suspending = 0;
+        a->idle_ms = 0;
+    }
+    else if (signal_id == AV_GET_CAPABILITIES)
+        next_capabilities(core, core->now);
+    else
+        fail(core, 30u + signal_id);
+}
+
+/* ---- hooks ------------------------------------------------------ */
+
+void btp_a2dp_init(btc_core *core)
+{
+    btp_a2dp *a = state(core);
+    memset(a, 0, sizeof(*a));
+    a->idle_ms = idle_setting;
+    a->link = 0xff;
+    a->signal_channel = a->media_channel = -1;
+}
+
+void btp_a2dp_link_opened(btc_core *core, uint8_t link)
+{
+    btp_a2dp *a = state(core);
+    if (a->state != BTP_A2DP_IDLE && a->state != BTP_A2DP_FAILED &&
+        a->link != link)
+        return;                          /* one stream at a time */
+    /* Asked again for the stream already being set up on this very link
+     * (the desktop pages a speaker that has already paged us): leave it. */
+    if (a->active && a->link == link && a->state != BTP_A2DP_IDLE &&
+        a->state != BTP_A2DP_FAILED)
+        return;
+    btp_a2dp_init(core);
+    a->link = link;
+    a->active = 1;
+    step(a, BTP_A2DP_SECURING, core->now);
+    if (!btc_secure(core, link)) fail(core, 1);
+}
+
+void btp_a2dp_link_secured(btc_core *core, uint8_t link)
+{
+    btp_a2dp *a = state(core);
+    if (!a->active || a->link != link || a->state != BTP_A2DP_SECURING)
+        return;
+    btc_become_master(core, link);
+    if (!core->links[link].outgoing)
+    {
+        /* A sink that reconnected drives the setup itself. */
+        step(a, BTP_A2DP_SIGNALLING, core->now);
+        return;
+    }
+    a->signal_channel = btc_l2cap_connect(core, link, AVDTP_PSM,
+                                          BTC_OWN_AVDTP_SIGNAL, 0);
+    if (a->signal_channel < 0) fail(core, 2);
+    else step(a, BTP_A2DP_SIGNALLING, core->now);
+}
+
+void btp_a2dp_link_closed(btc_core *core, uint8_t link)
+{
+    btp_a2dp *a = state(core);
+    if (!a->active || a->link != link) return;
+    stop_media(core);
+    btp_a2dp_init(core);
+}
+
+uint8_t btp_a2dp_incoming(btc_core *core, uint8_t link)
+{
+    btp_a2dp *a = state(core);
+    if (!a->active)
+    {
+        a->active = 1;
+        a->link = link;
+        a->signal_channel = a->media_channel = -1;
+        step(a, BTP_A2DP_SIGNALLING, core->now);
+    }
+    if (a->link != link) return BTC_OWN_NONE;
+    return a->signal_channel < 0 ? BTC_OWN_AVDTP_SIGNAL :
+           (a->media_channel < 0 ? BTC_OWN_AVDTP_MEDIA : BTC_OWN_NONE);
+}
+
+void btp_a2dp_channel_open(btc_core *core, int channel)
+{
+    btp_a2dp *a = state(core);
+    uint8_t owner = core->channels[channel].owner;
+    if (owner == BTC_OWN_AVDTP_SIGNAL)
+    {
+        a->signal_channel = channel;
+        if (!core->channels[channel].incoming)
+        {
+            command(core, AV_DISCOVER, 0, 0);
+            step(a, BTP_A2DP_DISCOVERING, core->now);
+        }
+    }
+    else if (owner == BTC_OWN_AVDTP_MEDIA)
+    {
+        a->media_channel = channel;
+        if (!start_encoder(core))
+        {
+            fail(core, 21);
+            return;
+        }
+        if (!btv_sound_device_stereo_sync(1, a->sample_rate, core->now))
+        {
+            fail(core, 22);
+            return;
+        }
+        if (!a->sink_initiated)
+        {
+            uint8_t seid = (uint8_t)(a->remote_seid << 2);
+            command(core, AV_START, &seid, 1);
+            step(a, BTP_A2DP_STARTING, core->now);
+        }
+        else
+        {
+            /* Most sinks that set the stream up still wait for the
+             * source to start it; give them a moment to do it first. */
+            a->auto_start = 1;
+            a->start_at = core->now + AUTO_START_MS;
+            step(a, BTP_A2DP_SUSPENDED, core->now);
+        }
+    }
+}
+
+void btp_a2dp_channel_data(btc_core *core, int channel, const uint8_t *p,
+                           size_t bytes)
+{
+    btp_a2dp *a = state(core);
+    if (channel == a->signal_channel) signal_data(core, p, bytes);
+    /* Media from a sink (reports) is ignored. */
+}
+
+void btp_a2dp_channel_closed(btc_core *core, int channel)
+{
+    btp_a2dp *a = state(core);
+    if (channel == a->media_channel)
+    {
+        a->media_channel = -1;
+        stop_media(core);
+        if (a->state == BTP_A2DP_STREAMING || a->state == BTP_A2DP_STARTING)
+            step(a, BTP_A2DP_CLOSING, core->now);
+    }
+    else if (channel == a->signal_channel)
+    {
+        a->signal_channel = -1;
+        if (a->state != BTP_A2DP_IDLE && a->state != BTP_A2DP_FAILED)
+            fail(core, 3);
+    }
+}
+
+void btp_a2dp_pump(btc_core *core)
+{
+    btp_a2dp *a = state(core);
+    if (!a->active) return;
+    if (a->state == BTP_A2DP_STREAMING)
+    {
+        send_media(core);
+        if (a->idle_ms != 0 && !a->idle_suspending && a->media_channel >= 0 &&
+            core->now - a->audible_at >= a->idle_ms &&
+            a->waiting_signal == 0)
+        {
+            uint8_t seid = (uint8_t)(a->remote_seid << 2);
+            a->idle_suspending = 1;
+            command(core, AV_SUSPEND, &seid, 1);
+        }
+        return;
+    }
+    if (a->state == BTP_A2DP_SUSPENDED && a->idle_suspended &&
+        a->media_channel >= 0)
+    {
+        /* Suspended for silence: sound that arrives starts it again, from
+         * the beginning of that sound; silence is thrown away. */
+        if (!btv_sound_device_stereo_audible())
+            btv_sound_device_flush();
+        else if ((int32_t)(core->now - a->retry_at) >= 0)
+        {
+            uint8_t seid = (uint8_t)(a->remote_seid << 2);
+            a->keep_queue = 1;
+            command(core, AV_START, &seid, 1);
+            step(a, BTP_A2DP_STARTING, core->now);
+        }
+        return;
+    }
+    /* A sink that reconnected may wait for us to set the stream up: if it
+     * has not opened the signalling channel itself, open it. */
+    if (a->state == BTP_A2DP_SIGNALLING && a->signal_channel < 0 &&
+        core->now - a->step_started >= SINK_WAIT_MS)
+    {
+        a->signal_channel = btc_l2cap_connect(core, a->link, AVDTP_PSM,
+                                              BTC_OWN_AVDTP_SIGNAL, 0);
+        a->step_started = core->now;
+        if (a->signal_channel < 0) fail(core, 2);
+        return;
+    }
+    if (a->state == BTP_A2DP_SUSPENDED && a->media_channel >= 0 &&
+        a->auto_start && core->now - a->start_at < 0x80000000u)
+    {
+        uint8_t seid = (uint8_t)(a->remote_seid << 2);
+        a->auto_start = 0;
+        command(core, AV_START, &seid, 1);
+        step(a, BTP_A2DP_STARTING, core->now);
+        return;
+    }
+    if (a->state == BTP_A2DP_SUSPENDED && a->media_channel >= 0)
+    {
+        /* Keep SoundDMA moving while the sink pauses us. */
+        (void)btv_sound_device_stereo_read(a->pcm, 128);
+        return;
+    }
+    if (a->state != BTP_A2DP_IDLE && a->state != BTP_A2DP_FAILED &&
+        a->state != BTP_A2DP_CLOSING && a->state != BTP_A2DP_SUSPENDED &&
+        core->now - a->step_started >= STEP_TIMEOUT_MS)
+        fail(core, 40u + a->state);
+}
+
+uint32_t btp_a2dp_status(const btc_core *core)
+{
+    const btp_a2dp *a = &core->profiles->a2dp;
+    return (uint32_t)a->state | (a->error << 8);
+}

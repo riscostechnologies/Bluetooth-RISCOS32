@@ -1,0 +1,33 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#ifndef BTV_SCO_TRANSMIT_H
+#define BTV_SCO_TRANSMIT_H
+#include "sco_link.h"
+#include "sco_frame.h"
+typedef struct btv_sco_transmit {
+    const btv_sco_link *link;
+    uint16_t handle, mtu;
+    size_t head, used, block;
+    unsigned int prepared, failed;
+    uint8_t data[4096];
+} btv_sco_transmit;
+/* Copied USB output spool, not controller-credit or codec policy. Owner must
+ * select the actual controller payload MTU and endpoint transfer block size.
+ * Dedicated active synchronous link; serialized access, no overlapping objects.
+ * USB SCO flow-control policy and codec pacing must be established separately. */
+int btv_sco_transmit_init(btv_sco_transmit *tx, const btv_sco_link *link,
+                          uint16_t controller_mtu, size_t block_bytes);
+/* Copies one opaque audio payload and its HCI header. 1 queued, 0 full,
+ * -1 invalid/inactive. No truncation. No H4 type octet. */
+int btv_sco_transmit_queue(btv_sco_transmit *tx, const uint8_t *audio, size_t bytes);
+/* Produces exactly block bytes, potentially spanning HCI packets. Returns 0
+ * until enough real bytes exist; never pads with zeros or invented silence.
+ * Retries preserve bytes until sent. Output must not overlap tx. */
+size_t btv_sco_transmit_peek(btv_sco_transmit *tx, uint8_t *output, size_t capacity);
+/* Call immediately after transport accepts a copy of the most recent peek.
+ * Retires spool bytes only: does not mean USB completion or headset playback.
+ * Parent retains the USB receipt and freezes on transfer errors; drain before
+ * reinitializing after failure or disconnect. */
+int btv_sco_transmit_sent(btv_sco_transmit *tx);
+void btv_sco_transmit_abort(btv_sco_transmit *tx);
+#endif

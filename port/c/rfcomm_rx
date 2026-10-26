@@ -1,0 +1,86 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/* Copied receive storage binding for the port's RFCOMM DLC and credit window. */
+#include "rfcomm_rx.h"
+#include <string.h>
+
+int btv_rfcomm_rx_init(btv_rfcomm_rx *rx, btv_rfcomm_dlc *dlc,
+                       uint8_t *storage, size_t capacity)
+{
+    if (rx == NULL || dlc == NULL || storage == NULL || !dlc->credit_mode ||
+        !dlc->credits.active || dlc->credits.failed || dlc->credits.occupied != 0 ||
+        dlc->credits.slots == 0 || dlc->credits.slots > BTV_RFCOMM_RX_SLOTS ||
+        dlc->mtu != dlc->credits.mtu ||
+        capacity < (size_t)dlc->credits.slots * dlc->mtu)
+        return 0;
+    memset(rx, 0, sizeof(*rx));
+    rx->dlc = dlc;
+    rx->storage = storage;
+    return 1;
+}
+
+int btv_rfcomm_rx_feed(btv_rfcomm_rx *rx, const uint8_t *packet, size_t bytes, uint32_t now)
+{
+    btv_rfcomm_frame frame;
+    unsigned int slot;
+    if (rx == NULL || rx->dlc == NULL)
+        return -1;
+    /* Other DLCs may use another credit mode: do not decode their optional
+     * credit field using this DLC's contract. Their owner validates the frame. */
+    if (packet != NULL && bytes != 0 && (packet[0] >> 2) != rx->dlc->dlci)
+        return 0;
+    if (btv_rfcomm_frame_decode(packet, bytes, 1, &frame) != 1)
+    {
+        btv_rfcomm_dlc_abort(rx->dlc);
+        return -1;
+    }
+    if (frame.dlci != rx->dlc->dlci || frame.type != 0xef)
+        return 0;
+    if (btv_rfcomm_dlc_receive(rx->dlc, &frame, now) < 0 ||
+        rx->count != rx->dlc->credits.occupied ||
+        (frame.bytes != 0 && rx->count >= rx->dlc->credits.slots) ||
+        btv_rfcomm_credit_received(&rx->dlc->credits, frame.bytes,
+            frame.has_credit ? frame.credit : 0) != 1)
+    {
+        btv_rfcomm_dlc_abort(rx->dlc);
+        return -1;
+    }
+    if (frame.bytes != 0)
+    {
+        slot = (rx->head + rx->count) % rx->dlc->credits.slots;
+        memcpy(rx->storage + (size_t)slot * rx->dlc->mtu, frame.data, frame.bytes);
+        rx->lengths[slot] = (uint16_t)frame.bytes;
+        ++rx->count;
+    }
+    return 1;
+}
+
+size_t btv_rfcomm_rx_read(btv_rfcomm_rx *rx, uint8_t *output, size_t capacity)
+{
+    size_t copied, bytes;
+    if (rx == NULL || rx->dlc == NULL || output == NULL || rx->dlc->credits.failed ||
+        rx->dlc->control.state != BTV_MUX_OPEN)
+        return 0;
+    copied = 0;
+    while (rx->count && copied < capacity)
+    {
+        bytes = rx->lengths[rx->head] - rx->offset;
+        if (bytes > capacity - copied)
+            bytes = capacity - copied;
+        memcpy(output + copied, rx->storage + (size_t)rx->head * rx->dlc->mtu + rx->offset, bytes);
+        copied += bytes;
+        rx->offset += bytes;
+        if (rx->offset == rx->lengths[rx->head])
+        {
+            if (btv_rfcomm_credit_release(&rx->dlc->credits, 1) != 1)
+            {
+                btv_rfcomm_dlc_abort(rx->dlc);
+                return copied;
+            }
+            rx->head = (rx->head + 1) % rx->dlc->credits.slots;
+            --rx->count;
+            rx->offset = 0;
+        }
+    }
+    return copied;
+}

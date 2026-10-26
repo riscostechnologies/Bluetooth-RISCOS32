@@ -1,0 +1,187 @@
+/*	$NetBSD: rfcomm.h,v 1.19 2022/05/28 21:14:57 andvar Exp $	*/
+
+/*-
+ * Copyright (c) 2006 Itronix Inc.
+ * All rights reserved.
+ *
+ * Written by Iain Hibbert for Itronix Inc.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. The name of Itronix Inc. may not be used to endorse
+ *    or promote products derived from this software without specific
+ *    prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY ITRONIX INC. ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL ITRONIX INC. BE LIABLE FOR ANY
+ * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+/*-
+ * Copyright (c) 2001-2003 Maksim Yevmenkin <m_evmenkin@yahoo.com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ *
+ * $Id: rfcomm.h,v 1.19 2022/05/28 21:14:57 andvar Exp $
+ * $FreeBSD: src/sys/netgraph/bluetooth/include/ng_btsocket_rfcomm.h,v 1.4 2005/01/11 01:39:53 emax Exp $
+ */
+
+/* Explicit MSC exchange adapted from NetBSD rfcomm_dlc_open/recv_mcc_msc. */
+#include "rfcomm_msc.h"
+#include <string.h>
+
+void btv_rfcomm_msc_init(btv_rfcomm_msc *msc)
+{
+    if (msc != NULL)
+        memset(msc, 0, sizeof(*msc));
+}
+
+int btv_rfcomm_msc_ready(const btv_rfcomm_msc *msc)
+{
+    return msc != NULL && msc->active && !msc->failed && msc->own_acked && msc->peer_acked;
+}
+
+static void request(btv_rfcomm_msc *msc, uint8_t modem, uint32_t now)
+{
+    uint8_t parameters[2];
+    parameters[0] = (uint8_t)((msc->dlci << 2) | 3);
+    parameters[1] = modem | 1;
+    msc->local_modem = modem;
+    msc->own_sent = msc->own_acked = 0;
+    msc->started = now;
+    msc->request_bytes = btv_rfcomm_mcc_encode(msc->request, 4, 0x38, 1, parameters, 2);
+}
+
+int btv_rfcomm_msc_start(btv_rfcomm_msc *msc, uint8_t dlci, uint8_t modem, uint32_t now)
+{
+    if (msc == NULL || msc->active || dlci < 2 || dlci > 61 || (modem & ~0xceU))
+        return 0;
+    msc->active = 1;
+    msc->dlci = dlci;
+    request(msc, modem, now);
+    return 1;
+}
+
+int btv_rfcomm_msc_update(btv_rfcomm_msc *msc, uint8_t modem, uint32_t now)
+{
+    if (!btv_rfcomm_msc_ready(msc) || msc->response_bytes != 0 || (modem & ~0xceU))
+        return 0;
+    request(msc, modem, now);
+    return 1;
+}
+
+static int fail(btv_rfcomm_msc *msc)
+{
+    msc->failed = 1;
+    msc->request_bytes = msc->response_bytes = 0;
+    return -1;
+}
+
+void btv_rfcomm_msc_tick(btv_rfcomm_msc *msc, uint32_t now)
+{
+    if (msc != NULL && msc->active && !msc->failed && !btv_rfcomm_msc_ready(msc) &&
+        (uint32_t)(now - msc->started) >= 20000UL)
+        fail(msc);
+}
+
+size_t btv_rfcomm_msc_output(btv_rfcomm_msc *msc, uint8_t *output,
+                             size_t capacity, unsigned int *token, uint32_t now)
+{
+    size_t bytes;
+    if (msc == NULL || output == NULL || token == NULL)
+        return 0;
+    btv_rfcomm_msc_tick(msc, now);
+    bytes = msc->response_bytes ? msc->response_bytes : msc->request_bytes;
+    if (!msc->active || msc->failed || bytes == 0 || capacity < bytes)
+        return 0;
+    *token = msc->response_bytes ? 2 : 1;
+    memcpy(output, *token == 2 ? msc->response : msc->request, bytes);
+    return bytes;
+}
+
+int btv_rfcomm_msc_sent(btv_rfcomm_msc *msc, unsigned int token)
+{
+    if (msc == NULL || !msc->active || msc->failed)
+        return 0;
+    if (token == 2 && msc->response_bytes)
+    {
+        msc->response_bytes = 0;
+        msc->peer_acked = 1;
+        return 1;
+    }
+    if (token == 1 && msc->request_bytes && !msc->response_bytes)
+    {
+        msc->request_bytes = 0;
+        msc->own_sent = 1;
+        return 1;
+    }
+    return 0;
+}
+
+int btv_rfcomm_msc_receive(btv_rfcomm_msc *msc, const btv_rfcomm_mcc *mcc, uint32_t now)
+{
+    if (msc == NULL || mcc == NULL)
+        return -1;
+    btv_rfcomm_msc_tick(msc, now);
+    if (msc->failed)
+        return -1;
+    if (!msc->active || mcc->type != 0x38)
+        return 0;
+    if (mcc->data == NULL || (mcc->bytes != 2 && mcc->bytes != 3))
+        return fail(msc);
+    if ((mcc->data[0] >> 2) != msc->dlci)
+        return 0;
+    if ((mcc->data[0] & 3) != 3 ||
+        ((mcc->data[1] & 1) ? mcc->bytes != 2 : (mcc->bytes != 3 || !(mcc->data[2] & 1))))
+        return fail(msc);
+    if (!mcc->command)
+    {
+        if (!msc->own_sent || msc->own_acked || mcc->bytes != 2 ||
+            mcc->data[1] != (uint8_t)(msc->local_modem | 1))
+            return 0;
+        msc->own_acked = 1;
+        return 1;
+    }
+    if (msc->response_bytes)
+        return 2;
+    if (btv_rfcomm_msc_ready(msc))
+        msc->started = now;
+    msc->peer_acked = 0;
+    msc->peer_modem = mcc->data[1] & 0xfe;
+    msc->peer_break = mcc->bytes == 3 ? mcc->data[2] : 0;
+    msc->response_bytes = btv_rfcomm_mcc_encode(msc->response, 5, 0x38, 0, mcc->data, mcc->bytes);
+    return 1;
+}
