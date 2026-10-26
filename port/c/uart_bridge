@@ -79,7 +79,8 @@ enum boot_state
 
 static struct
 {
-    volatile uint8_t *uart, *gpio0, *gpio2, *grf, *pmugrf;
+    volatile uint8_t *window;
+    uint32_t window_phys;
     int mapped, open, booting;
 
     uint8_t tx[TX_RING];
@@ -131,32 +132,45 @@ static void wr(volatile uint8_t *b, uint32_t o, uint32_t v)
     *(volatile uint32_t *)(b + o) = v;
 }
 
-/* OS_Memory 13: device memory, uncached and unbuffered (bit 8 and 9 clear),
- * with the access permission given (bit 17, user read/write). */
+/* OS_Memory 13 permanently maps one device page. The module runs in user
+ * mode, so request explicit user read/write access; device memory remains
+ * unbuffered and uncached. */
 static volatile uint8_t *map(uint32_t phys)
 {
     uint32_t r[8] = { 0 };
+    const struct os_error *e;
+    if (u.mapped && u.window_phys == phys)
+        return u.window;
     r[0] = 13u | (1u << 17);
     r[1] = phys;
     r[2] = PAGE;
-    {
-        const struct os_error *e = rs_swi(0x33, r);
-        if (e != NULL)
-        {
-            char text[60];
-            snprintf(text, sizeof text, "map &%08X: %.40s", (unsigned)phys,
-                     e->errmess);
-            btv_host_bridge_note("uart:", text);
-            return NULL;
-        }
-    }
+    e = rs_swi(0x68, r);                /* OS_Memory */
+    if (e != NULL)
     {
         char text[60];
-        snprintf(text, sizeof text, "map &%08X -> &%08X (R0 &%X)", (unsigned)phys,
-                 (unsigned)r[3], (unsigned)r[0]);
+        snprintf(text, sizeof text, "map &%08X: %.40s", (unsigned)phys,
+                 e->errmess);
         btv_host_bridge_note("uart:", text);
+        return NULL;
     }
-    return (volatile uint8_t *)r[3];
+    if (r[3] == 0)
+    {
+        char text[60];
+        snprintf(text, sizeof text, "map &%08X: no address", (unsigned)phys);
+        btv_host_bridge_note("uart:", text);
+        return NULL;
+    }
+    u.window = (volatile uint8_t *)r[3];
+    u.window_phys = phys;
+    u.mapped = 1;
+    return u.window;
+}
+
+static void unmap_all(void)
+{
+    u.window = NULL;
+    u.window_phys = 0;
+    u.mapped = 0;
 }
 
 static int module_present(const char *name)
@@ -183,13 +197,13 @@ int btv_uart_inspect(void)
 
 /* ---- the UART --------------------------------------------------------- */
 
-static void set_baud(uint32_t baud)
+static void set_baud(volatile uint8_t *uart, uint32_t baud)
 {
     uint32_t div = uart_divisor(UART_CLOCK, baud);
-    wr(u.uart, U_LCR, LCR_DLAB | LCR_8N1);
-    wr(u.uart, U_DLL, div & 0xFFu);
-    wr(u.uart, U_DLH, (div >> 8) & 0xFFu);
-    wr(u.uart, U_LCR, LCR_8N1);
+    wr(uart, U_LCR, LCR_DLAB | LCR_8N1);
+    wr(uart, U_DLL, div & 0xFFu);
+    wr(uart, U_DLH, (div >> 8) & 0xFFu);
+    wr(uart, U_LCR, LCR_8N1);
 }
 
 static int queue_full(void)
@@ -245,20 +259,23 @@ static void packet(void)
 static void service(void)
 {
     uint32_t spins = 0, n = 0;
+    volatile uint8_t *uart;
     if (!u.mapped) return;
-    while ((rd(u.uart, U_LSR) & LSR_DR) && n < 8192u &&
+    uart = map(UART_PHYS);
+    if (uart == NULL) return;
+    while ((rd(uart, U_LSR) & LSR_DR) && n < 8192u &&
            (u.booting || !queue_full()))
     {
-        uint8_t byte = (uint8_t)rd(u.uart, U_RBR);
+        uint8_t byte = (uint8_t)rd(uart, U_RBR);
         ++n;
         if (h4_rx_byte(&u.parser, byte)) packet();
     }
     u.rx_bytes += n;
     while (u.tx_out != u.tx_in && spins < SPIN_LIMIT)
     {
-        if (rd(u.uart, U_USR) & USR_TFNF)
+        if (rd(uart, U_USR) & USR_TFNF)
         {
-            wr(u.uart, U_THR, u.tx[u.tx_out % TX_RING]);
+            wr(uart, U_THR, u.tx[u.tx_out % TX_RING]);
             ++u.tx_out;
         }
         else
@@ -266,9 +283,9 @@ static void service(void)
             ++spins;
             /* The controller may be waiting for us to read, while we wait
              * for it to take: keep reading. */
-            if ((rd(u.uart, U_LSR) & LSR_DR) && (u.booting || !queue_full()))
+            if ((rd(uart, U_LSR) & LSR_DR) && (u.booting || !queue_full()))
             {
-                uint8_t byte = (uint8_t)rd(u.uart, U_RBR);
+                uint8_t byte = (uint8_t)rd(uart, U_RBR);
                 ++u.rx_bytes;
                 if (h4_rx_byte(&u.parser, byte)) packet();
             }
@@ -305,45 +322,49 @@ static int boot_command(uint16_t opcode, const uint8_t *params, uint8_t length)
     return 1;
 }
 
-static void bt_on(int on)
+static int bt_on(int on)
 {
-    uint32_t d = rd(u.gpio0, GPIO_DR);
-    wr(u.gpio0, GPIO_DR, on ? d | BT_REG_ON : d & ~BT_REG_ON);
-    wr(u.gpio0, GPIO_DDR, rd(u.gpio0, GPIO_DDR) | BT_REG_ON);
+    volatile uint8_t *gpio0 = map(GPIO0_PHYS);
+    uint32_t d;
+    if (gpio0 == NULL) return 0;
+    d = rd(gpio0, GPIO_DR);
+    wr(gpio0, GPIO_DR, on ? d | BT_REG_ON : d & ~BT_REG_ON);
+    wr(gpio0, GPIO_DDR, rd(gpio0, GPIO_DDR) | BT_REG_ON);
+    return 1;
 }
 
 static int map_all(void)
 {
-    if (u.mapped) return 1;
-    u.uart = map(UART_PHYS);
-    u.gpio0 = map(GPIO0_PHYS);
-    u.gpio2 = map(GPIO2_PHYS);
-    u.grf = map(GRF_PHYS);
-    u.pmugrf = map(PMUGRF_PHYS);
-    if (u.uart == NULL || u.gpio0 == NULL || u.gpio2 == NULL ||
-        u.grf == NULL || u.pmugrf == NULL)
-        return 0;
-    u.mapped = 1;
-    return 1;
+    return map(UART_PHYS) != NULL;
 }
 
 /* The pins and the UART, at the speed the controller starts at. */
-static void hardware_setup(void)
+static int hardware_setup(void)
 {
     uint32_t d;
+    volatile uint8_t *p;
     /* GPIO2 C0-C3 to the UART (function 1); GPIO0 B1 back to a plain pin. */
-    wr(u.grf, GRF_GPIO2C_IOMUX, 0x00FF0055u);
-    wr(u.pmugrf, PMUGRF_GPIO0B_IOMUX, 0x000C0000u);
+    p = map(GRF_PHYS);
+    if (p == NULL) return 0;
+    wr(p, GRF_GPIO2C_IOMUX, 0x00FF0055u);
+    p = map(PMUGRF_PHYS);
+    if (p == NULL) return 0;
+    wr(p, PMUGRF_GPIO0B_IOMUX, 0x000C0000u);
     /* The controller awake. */
-    d = rd(u.gpio2, GPIO_DR);
-    wr(u.gpio2, GPIO_DR, d | BT_WAKE);
-    wr(u.gpio2, GPIO_DDR, rd(u.gpio2, GPIO_DDR) | BT_WAKE);
-    wr(u.uart, U_IER, 0);
-    wr(u.uart, U_MCR, 0);
-    set_baud(INIT_BAUD);
-    wr(u.uart, U_FCR, FCR_ON);
-    wr(u.uart, U_MCR, MCR_AFE | MCR_RTS);
-    while (rd(u.uart, U_LSR) & LSR_DR) (void)rd(u.uart, U_RBR);
+    p = map(GPIO2_PHYS);
+    if (p == NULL) return 0;
+    d = rd(p, GPIO_DR);
+    wr(p, GPIO_DR, d | BT_WAKE);
+    wr(p, GPIO_DDR, rd(p, GPIO_DDR) | BT_WAKE);
+    p = map(UART_PHYS);
+    if (p == NULL) return 0;
+    wr(p, U_IER, 0);
+    wr(p, U_MCR, 0);
+    set_baud(p, INIT_BAUD);
+    wr(p, U_FCR, FCR_ON);
+    wr(p, U_MCR, MCR_AFE | MCR_RTS);
+    while (rd(p, U_LSR) & LSR_DR) (void)rd(p, U_RBR);
+    return 1;
 }
 
 int btv_uart_open(void)
@@ -390,6 +411,7 @@ int btv_uart_boot(void)
     uint16_t opcode;
     const uint8_t *params;
     uint8_t plen;
+    volatile uint8_t *uart;
     if (!u.open) return -1;
     if (u.state == B_DONE) return 1;
     if (u.state == B_FAIL) return -1;
@@ -398,20 +420,22 @@ int btv_uart_boot(void)
     switch (u.state)
     {
     case B_IDLE:
-        hardware_setup();
-        bt_on(0);
+        if (!hardware_setup() || !bt_on(0))
+            return boot_fail("could not access controller registers");
         u.since = now;
         u.state = B_POWER_OFF;
         return 0;
     case B_POWER_OFF:
         if (waited < 300u) return 0;
-        bt_on(1);
+        if (!bt_on(1)) return boot_fail("could not power on the controller");
         u.since = now;
         u.state = B_POWER_ON;
         return 0;
     case B_POWER_ON:
         if (waited < 200u) return 0;
-        while (rd(u.uart, U_LSR) & LSR_DR) (void)rd(u.uart, U_RBR);
+        uart = map(UART_PHYS);
+        if (uart == NULL) return boot_fail("could not access UART0");
+        while (rd(uart, U_LSR) & LSR_DR) (void)rd(uart, U_RBR);
         h4_rx_init(&u.parser);
         if (!boot_command(0x0C03u, NULL, 0)) return boot_fail("no room");
         u.state = B_RESET_WAIT;
@@ -428,7 +452,7 @@ int btv_uart_boot(void)
         else if (waited > 1500u)
         {
             if (++u.attempts >= 3) return boot_fail("no answer to Reset");
-            bt_on(0);
+            if (!bt_on(0)) return boot_fail("could not power off the controller");
             u.since = now;
             u.state = B_POWER_OFF;
         }
@@ -501,7 +525,9 @@ int btv_uart_boot(void)
             if (u.reply_ready && u.reply[5] == 0)
             {
                 if (u.tx_out != u.tx_in) return 0;
-                set_baud(RUN_BAUD);
+                uart = map(UART_PHYS);
+                if (uart == NULL) return boot_fail("could not access UART0");
+                set_baud(uart, RUN_BAUD);
                 note_num("controller speed", RUN_BAUD);
             }
             else
@@ -512,7 +538,9 @@ int btv_uart_boot(void)
         return 0;
     case B_BAUD_SETTLE:
         if (waited < 20u) return 0;
-        while (rd(u.uart, U_LSR) & LSR_DR) (void)rd(u.uart, U_RBR);
+        uart = map(UART_PHYS);
+        if (uart == NULL) return boot_fail("could not access UART0");
+        while (rd(uart, U_LSR) & LSR_DR) (void)rd(uart, U_RBR);
         h4_rx_init(&u.parser);
         u.booting = 0;
         u.state = B_DONE;
@@ -616,8 +644,10 @@ int btv_uart_close(void)
     {
         if (u.mapped)
         {
-            wr(u.uart, U_IER, 0);
-            bt_on(0);
+            volatile uint8_t *uart = map(UART_PHYS);
+            if (uart != NULL) wr(uart, U_IER, 0);
+            (void)bt_on(0);
+            unmap_all();
         }
         release_patch();
         u.open = 0;
