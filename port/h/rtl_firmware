@@ -1,0 +1,33 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#ifndef BTV_RTL_FIRMWARE_H
+#define BTV_RTL_FIRMWARE_H
+/*
+ * Realtek USB Bluetooth controllers (RTL8761B: TP-Link UB4A, UB500 and
+ * others) run from ROM code that needs a patch sent at every power-up.
+ * This builds the patch from Realtek's "epatch" file, the way Linux's
+ * btrtl driver does: pick the section for the chip's ROM version, stamp
+ * the file's firmware version into its last four bytes, append the config
+ * file. Pure: no SWIs, no allocation.
+ */
+#include <stddef.h>
+#include <stdint.h>
+
+#define BTV_RTL_MANUFACTURER 0x005Du   /* Realtek, in Read Local Version */
+#define BTV_RTL_FRAGMENT 252u          /* bytes per Download command */
+
+/* Which file a controller needs, from Read Local Version's HCI revision
+ * and LMP subversion; NULL when it is not a Realtek part this knows. The
+ * name is the leaf of the patch file; the config file is the same leaf
+ * with "_config" in place of "_fw". project is the ID the file must carry. */
+const char *btv_rtl_firmware_name(uint16_t hci_revision, uint16_t lmp_subversion,
+                                  uint8_t *project);
+
+/* 0 and *patch_bytes set on success; negative when the file is not one the
+ * chip can take (bad signature, wrong project, no section for this ROM
+ * version, or out too small: it needs at most fw_bytes + cfg_bytes). */
+int btv_rtl_build_patch(const uint8_t *fw, size_t fw_bytes,
+                        const uint8_t *cfg, size_t cfg_bytes,
+                        uint8_t rom_version, uint8_t project,
+                        uint8_t *out, size_t out_bytes, size_t *patch_bytes);
+#endif

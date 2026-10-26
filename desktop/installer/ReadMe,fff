@@ -11,7 +11,8 @@ What you need
   Other RISC OS 5 machines with working USB 2 host drivers, such as a
   Pinebook Pro, should work with a USB adapter; on them the Pi USB
   drivers in the package are left alone.
-  A USB Bluetooth adapter with a CSR8510 chip, such as the TP-Link UB400.
+  A USB Bluetooth adapter: CSR8510 (TP-Link UB400) or Realtek RTL8761B
+  (TP-Link UB4A, UB500). The Realtek firmware is included.
   SharedUnixLibrary 1.16 or later (a copy is included).
 
 Installing

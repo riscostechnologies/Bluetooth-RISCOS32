@@ -100,10 +100,68 @@ void btv_hci_bootstrap_abort(btv_hci_bootstrap *boot)
         fail(boot, BTV_BOOT_TRANSPORT_ERROR, 0);
 }
 
+int btv_hci_bootstrap_vendor_probe(btv_hci_bootstrap *boot)
+{
+    if (boot->stage != BTV_BOOT_RESET || boot->awaiting) return 0;
+    boot->vendor = BTV_VENDOR_VERSION;
+    return 1;
+}
+
+int btv_hci_bootstrap_needs_patch(const btv_hci_bootstrap *boot,
+                                  uint16_t *hci_revision,
+                                  uint16_t *lmp_subversion, uint8_t *rom)
+{
+    if (boot->vendor != BTV_VENDOR_NEED_PATCH) return 0;
+    *hci_revision = boot->hci_revision;
+    *lmp_subversion = boot->lmp_subversion;
+    *rom = boot->rom_version;
+    return 1;
+}
+
+void btv_hci_bootstrap_patch(btv_hci_bootstrap *boot, const uint8_t *patch,
+                             uint32_t bytes)
+{
+    if (boot->vendor != BTV_VENDOR_NEED_PATCH) return;
+    boot->patch = patch;
+    boot->patch_bytes = patch != NULL ? bytes : 0;
+    boot->patch_sent = 0;
+    boot->download_index = 0;
+    boot->download_last = 0;
+    boot->vendor = boot->patch_bytes != 0 ? BTV_VENDOR_DOWNLOAD : BTV_VENDOR_NONE;
+}
+
+/* The vendor stages' commands: Read Local Version, Realtek Read ROM
+ * Version, Realtek Download (index byte, then up to 252 bytes; bit 7 of the
+ * index marks the last; the index runs 0..0x7f, then 1..0x7f again). */
+static size_t vendor_command(const btv_hci_bootstrap *boot, uint8_t *output,
+                             size_t capacity)
+{
+    uint8_t chunk[1 + 252];
+    uint32_t n;
+    if (boot->vendor == BTV_VENDOR_VERSION)
+        return btv_hci_command(output, capacity, 0x1001u, NULL, 0);
+    if (boot->vendor == BTV_VENDOR_ROM)
+        return btv_hci_command(output, capacity, 0xfc6du, NULL, 0);
+    if (boot->vendor != BTV_VENDOR_DOWNLOAD) return 0;
+    /* As Linux: fragments = bytes / 252 + 1, the last holds bytes % 252. */
+    n = 252u;
+    chunk[0] = boot->download_index;
+    if (boot->patch_sent / 252u == boot->patch_bytes / 252u)
+    {
+        chunk[0] |= 0x80u;
+        n = boot->patch_bytes % 252u;
+    }
+    memcpy(chunk + 1, boot->patch + boot->patch_sent, n);
+    return btv_hci_command(output, capacity, 0xfc20u, chunk, n + 1u);
+}
+
 size_t btv_hci_bootstrap_command(const btv_hci_bootstrap *boot, uint8_t *output, size_t capacity)
 {
     if (boot->stage >= BTV_BOOT_DISCOVERED || boot->awaiting || (!boot->scheduler_owned && boot->credits == 0))
         return 0;
+    if (boot->vendor == BTV_VENDOR_NEED_PATCH) return 0;
+    if (boot->vendor != BTV_VENDOR_NONE)
+        return vendor_command(boot, output, capacity);
     return btv_hci_command(output, capacity, opcodes[boot->stage],
                            boot->stage == BTV_BOOT_EXTENDED ? &boot->page : NULL,
                            boot->stage == BTV_BOOT_EXTENDED ? 1 : 0);
@@ -118,6 +176,57 @@ int btv_hci_bootstrap_sent(btv_hci_bootstrap *boot, uint32_t now)
     boot->awaiting = 1;
     boot->changed = now;
     return 1;
+}
+
+/* A reply in the vendor stages. Read Local Version that fails, or a chip
+ * that is not a Realtek one, goes on to Reset as if nothing were asked. */
+static int vendor_event(btv_hci_bootstrap *boot, const uint8_t *packet,
+                        size_t bytes, uint16_t opcode, uint8_t status,
+                        uint32_t now)
+{
+    uint16_t expected = boot->vendor == BTV_VENDOR_VERSION ? 0x1001u :
+                        boot->vendor == BTV_VENDOR_ROM ? 0xfc6du : 0xfc20u;
+    if (!boot->awaiting || opcode != expected) return 0;
+    if (packet[0] == 0x0f && status == 0) return 0;
+    boot->awaiting = 0;
+    boot->changed = now;
+    switch (boot->vendor)
+    {
+    case BTV_VENDOR_VERSION:
+        /* 0e 0c n op op status ver rev(2) lmp_ver manufacturer(2) subver(2) */
+        if (packet[0] != 0x0e || status != 0 || bytes < 14)
+        {
+            boot->vendor = BTV_VENDOR_NONE;
+            return 1;
+        }
+        boot->hci_revision = read16(packet + 7);
+        boot->manufacturer = read16(packet + 10);
+        boot->lmp_subversion = read16(packet + 12);
+        boot->vendor = boot->manufacturer == 0x005du ? BTV_VENDOR_ROM
+                                                      : BTV_VENDOR_NONE;
+        return 1;
+    case BTV_VENDOR_ROM:
+        /* Older parts have no ROM version: zero, as Linux takes it. */
+        boot->rom_version = packet[0] == 0x0e && status == 0 && bytes >= 7
+                            ? packet[6] : 0;
+        boot->vendor = BTV_VENDOR_NEED_PATCH;
+        return 1;
+    case BTV_VENDOR_DOWNLOAD:
+        if (packet[0] != 0x0e || status != 0)
+            return fail(boot, BTV_BOOT_CONTROLLER_ERROR, status);
+        if (boot->patch_sent / 252u == boot->patch_bytes / 252u)
+        {
+            /* The last fragment: the patch runs; now the usual Reset. */
+            boot->vendor = BTV_VENDOR_NONE;
+            return 1;
+        }
+        boot->patch_sent += 252u;
+        boot->download_index = boot->download_index == 0x7fu ? 1u
+                               : (uint8_t)(boot->download_index + 1u);
+        return 1;
+    default:
+        return 0;
+    }
 }
 
 int btv_hci_bootstrap_event(btv_hci_bootstrap *boot, const uint8_t *packet, size_t bytes, uint32_t now)
@@ -146,6 +255,8 @@ int btv_hci_bootstrap_event(btv_hci_bootstrap *boot, const uint8_t *packet, size
     else return 0;
     /* The event advertises the current allowance, not additional credits. */
     boot->credits = credits;
+    if (boot->vendor != BTV_VENDOR_NONE)
+        return vendor_event(boot, packet, bytes, opcode, status, now);
     if (!boot->awaiting || opcode != opcodes[boot->stage]) return 0;
     if (status != 0) return fail(boot, BTV_BOOT_CONTROLLER_ERROR, status);
     if (packet[0] == 0x0f) return 0;

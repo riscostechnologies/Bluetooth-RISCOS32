@@ -31,7 +31,33 @@ typedef struct btv_hci_bootstrap
     uint8_t credits, awaiting, status, page, scheduler_owned, failed_stage;
     uint8_t skip_extended;
     uint32_t started, changed;
+    /* Vendor start-up, before Reset (BTV_VENDOR_*): Realtek patch download. */
+    uint8_t vendor, rom_version, download_index, download_last;
+    uint16_t manufacturer, hci_revision, lmp_subversion;
+    const uint8_t *patch;
+    uint32_t patch_bytes, patch_sent, patch_chunk;
 } btv_hci_bootstrap;
+
+enum btv_boot_vendor
+{
+    BTV_VENDOR_NONE,        /* straight to Reset (the default) */
+    BTV_VENDOR_VERSION,     /* Read Local Version, to see whose chip it is */
+    BTV_VENDOR_ROM,         /* Realtek: Read ROM Version (0xFC6D) */
+    BTV_VENDOR_NEED_PATCH,  /* waiting for the owner: btv_hci_bootstrap_patch */
+    BTV_VENDOR_DOWNLOAD     /* Realtek: Download (0xFC20), 252 bytes a time */
+};
+
+/* Ask the controller who made it before Reset, so that a Realtek chip can
+ * be sent its patch. Call after start, before the first command. */
+int btv_hci_bootstrap_vendor_probe(btv_hci_bootstrap *boot);
+/* 1 while the owner must supply the patch (Realtek), with the details. */
+int btv_hci_bootstrap_needs_patch(const btv_hci_bootstrap *boot,
+                                  uint16_t *hci_revision,
+                                  uint16_t *lmp_subversion, uint8_t *rom);
+/* The patch, which must stay valid until the bootstrap leaves the vendor
+ * stages; NULL (or no bytes) goes on to Reset without one. */
+void btv_hci_bootstrap_patch(btv_hci_bootstrap *boot, const uint8_t *patch,
+                             uint32_t bytes);
 
 /* Fresh, exclusively owned controller only: this sequence issues HCI Reset.
  * The owner must drain old USB operations and tear down old links first.

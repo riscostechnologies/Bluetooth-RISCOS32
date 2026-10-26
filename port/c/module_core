@@ -16,6 +16,7 @@
 #include "sound_device.h"
 #include "bttrace.h"
 #include "host_bridge.h"
+#include "rtl_firmware.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -124,6 +125,80 @@ static uint8_t *read_file(const char *name, uint32_t *length)
     if (data != NULL) data[*length] = 0;
     file_note("read", name, "ok, bytes", *length);
     return data;
+}
+
+/* ---- vendor patches (Realtek) ------------------------------------- */
+
+static uint8_t *vendor_patch;
+
+/* The firmware lives in the application, which the boot sequence may not
+ * have seen when the module starts the controller from PreDesk: the
+ * installed copy first, then wherever !Bluetooth was run from. */
+static uint8_t *read_firmware(const char *leaf, uint32_t *length)
+{
+    static const char *const places[] = {
+        "BootResources:!Bluetooth.Firmware.", "<Bluetooth$Dir>.Firmware."
+    };
+    char name[96];
+    unsigned int i;
+    for (i = 0; i < sizeof(places) / sizeof(places[0]); ++i)
+    {
+        uint8_t *data;
+        snprintf(name, sizeof(name), "%s%s", places[i], leaf);
+        if ((data = read_file(name, length)) != NULL) return data;
+    }
+    return NULL;
+}
+
+static void release_vendor_patch(void)
+{
+    if (vendor_patch != NULL)
+    {
+        free(vendor_patch);
+        vendor_patch = NULL;
+    }
+}
+
+static const uint8_t *make_vendor_patch(uint16_t hci_revision,
+                                        uint16_t lmp_subversion,
+                                        uint8_t rom_version, uint32_t *bytes)
+{
+    uint8_t project = 0;
+    const char *leaf = btv_rtl_firmware_name(hci_revision, lmp_subversion,
+                                             &project);
+    char config_leaf[32];
+    uint8_t *fw, *cfg = NULL;
+    uint32_t fw_bytes = 0, cfg_bytes = 0;
+    size_t patch_bytes = 0;
+    int result;
+    release_vendor_patch();
+    *bytes = 0;
+    if (leaf == NULL)
+    {
+        btv_host_bridge_note("vendor patch:", "none needed: the chip already runs its patch (a restart without a power cycle), or it is one this does not know");
+        return NULL;
+    }
+    fw = read_firmware(leaf, &fw_bytes);
+    if (fw == NULL) return NULL;
+    /* "rtl8761bu_fw" -> "rtl8761bu_config" (optional). */
+    snprintf(config_leaf, sizeof(config_leaf), "%.*s_config",
+             (int)(strlen(leaf) - 3), leaf);
+    cfg = read_firmware(config_leaf, &cfg_bytes);
+    vendor_patch = malloc(fw_bytes + cfg_bytes + 4u);
+    result = vendor_patch == NULL ? -9 :
+             btv_rtl_build_patch(fw, fw_bytes, cfg, cfg_bytes, rom_version,
+                                 project, vendor_patch,
+                                 fw_bytes + cfg_bytes + 4u, &patch_bytes);
+    free(fw);
+    if (cfg != NULL) free(cfg);
+    if (result != 0)
+    {
+        file_note("vendor patch", leaf, "unusable, reason", (uint32_t)-result);
+        release_vendor_patch();
+        return NULL;
+    }
+    *bytes = (uint32_t)patch_bytes;
+    return vendor_patch;
 }
 
 /* Saves a file under Choices:Bluetooth (the directory made first with
@@ -691,6 +766,8 @@ void btm_init(void *pw)
 {
     drive.pw = pw;
     bt_glue_init(pw);
+    btc_vendor_patch = make_vendor_patch;
+    btc_vendor_release = release_vendor_patch;
     btp_a2dp_set_idle(0);   /* see BTUI_IDLE_DEFAULT */
     memset(&core, 0, sizeof(core));
     btc_origin_ms = now_ms();

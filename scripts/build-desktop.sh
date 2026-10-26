@@ -57,6 +57,10 @@ cp "desktop/modules/SharedULib,ffa" "$app/!BTSetup/Modules/SharedULib,ffa"
 python3 desktop/mksprites.py "$app"
 rm -f "$app/!Bluetooth/LoadUSB,feb"
 cp 'desktop/!Help,fff' "$app/!Bluetooth/!Help,fff"
+# Realtek controller patches (RTL8761B: TP-Link UB4A, UB500), sent by the
+# module at every start-up; redistributable unmodified, with their licence.
+rm -rf "$app/!Bluetooth/Firmware"
+cp -r desktop/firmware "$app/!Bluetooth/Firmware"
 cp 'desktop/appfiles/Bluetooth/!Run,feb' 'desktop/appfiles/Bluetooth/!Boot,feb' "$app/!Bluetooth/"
 cp 'desktop/appfiles/BTSetup/!Run,feb' 'desktop/appfiles/BTSetup/!Boot,feb' "$app/!BTSetup/"
 version=$(sed -n 's/.*VERSION_TEXT "\([^"]*\)".*/\1/p' client/c/btbar | head -1)

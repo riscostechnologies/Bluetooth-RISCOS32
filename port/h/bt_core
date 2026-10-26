@@ -349,6 +349,17 @@ typedef struct btc_core
     struct btc_profiles *profiles;
 } btc_core;
 
+/* Vendor patch provider, set once by the module (NULL in the host tests,
+ * which leaves the bring-up as it always was). Given the controller's
+ * Read Local Version and ROM version, returns the patch to download, or
+ * NULL when none is wanted or none could be had; the memory stays valid
+ * until btc_vendor_release is called. */
+extern const uint8_t *(*btc_vendor_patch)(uint16_t hci_revision,
+                                          uint16_t lmp_subversion,
+                                          uint8_t rom_version,
+                                          uint32_t *bytes);
+extern void (*btc_vendor_release)(void);
+
 /* A line on the HAL debug channel: "[bt] core: <what> <value in hex>". */
 void btc_note(const char *what, uint32_t value);
 extern uint32_t btc_origin_ms;

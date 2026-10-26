@@ -1,7 +1,7 @@
 # Bluetooth for RISC OS (32-bit)
 
 A Bluetooth host stack for 32-bit RISC OS 5 that works through a USB
-Bluetooth adapter. Version 0.92.
+Bluetooth adapter. Version 0.93.
 
 - **Audio:** plays the computer's sound through Bluetooth speakers and
   headphones (A2DP, SBC).
@@ -11,7 +11,9 @@ Bluetooth adapter. Version 0.92.
   when they wake.
 
 Tested on a Raspberry Pi CM4 under RISC OS 5.31 with a TP-Link UB400
-(CSR8510) adapter. Other RISC OS 5 machines with working USB 2 host drivers,
+(CSR8510) adapter. Realtek RTL8761B adapters, such as the TP-Link UB4A and
+UB500, are sent Realtek's patch at start-up, as Linux does; the firmware is
+in `desktop/firmware` and is installed in `!Bluetooth.Firmware`. Other RISC OS 5 machines with working USB 2 host drivers,
 such as a Pinebook Pro, should work with a USB adapter.
 
 The software has three parts:

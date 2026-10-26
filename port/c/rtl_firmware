@@ -1,0 +1,82 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        rtl_firmware
+ * Purpose:     Realtek epatch (v1, "Realtech") parsing: see h/rtl_firmware.
+ * Reference:   Linux drivers/bluetooth/btrtl.c, rtlbt_parse_firmware()
+ *              and rtl_download_firmware() (format and sequence only).
+ *******************************************************************/
+#include "rtl_firmware.h"
+#include <string.h>
+
+static uint16_t get16(const uint8_t *p)
+{
+    return (uint16_t)(p[0] | (p[1] << 8));
+}
+
+static uint32_t get32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+const char *btv_rtl_firmware_name(uint16_t hci_revision, uint16_t lmp_subversion,
+                                  uint8_t *project)
+{
+    /* RTL8761B over USB: LMP subversion 0x8761, HCI revision 0x000b. */
+    if (lmp_subversion == 0x8761u && hci_revision == 0x000bu)
+    {
+        *project = 14;
+        return "rtl8761bu_fw";
+    }
+    return NULL;
+}
+
+int btv_rtl_build_patch(const uint8_t *fw, size_t fw_bytes,
+                        const uint8_t *cfg, size_t cfg_bytes,
+                        uint8_t rom_version, uint8_t project,
+                        uint8_t *out, size_t out_bytes, size_t *patch_bytes)
+{
+    static const uint8_t signature[8] = { 'R','e','a','l','t','e','c','h' };
+    static const uint8_t extension[4] = { 0x51, 0x04, 0xfd, 0x77 };
+    const uint8_t *p;
+    unsigned int count, i;
+    int found_project = -1;
+    uint32_t length = 0, offset = 0;
+    /* Header: signature 8, firmware version 4, section count 2. */
+    if (fw == NULL || fw_bytes < 14u + 4u + 3u) return -1;
+    if (memcmp(fw, signature, 8) != 0) return -2;
+    if (memcmp(fw + fw_bytes - 4, extension, 4) != 0) return -3;
+    /* The extension, read backwards from its signature: opcode, length,
+     * data; opcode 0 with length 1 is the project ID, 0xff ends it. */
+    p = fw + fw_bytes - 4;
+    while (p >= fw + 14 + 3)
+    {
+        uint8_t opcode = *--p, len = *--p, data = *--p;
+        if (opcode == 0xff) break;
+        if (len == 0) return -4;
+        if (opcode == 0 && len == 1) { found_project = data; break; }
+        if ((size_t)(p - fw) < len) return -4;
+        p -= len;
+    }
+    if (found_project != project) return -5;
+    count = get16(fw + 12);
+    if (14u + 8u * count > fw_bytes) return -6;
+    /* Chip IDs, then lengths, then offsets; the section for ROM version v
+     * has chip ID v + 1. */
+    for (i = 0; i < count; ++i)
+        if (get16(fw + 14 + 2 * i) == (uint16_t)(rom_version + 1u))
+        {
+            length = get16(fw + 14 + 2 * count + 2 * i);
+            offset = get32(fw + 14 + 4 * count + 4 * i);
+            break;
+        }
+    if (i == count || length < 4 || offset > fw_bytes || length > fw_bytes - offset)
+        return -7;
+    if (out_bytes < length + cfg_bytes) return -8;
+    memcpy(out, fw + offset, length);
+    memcpy(out + length - 4, fw + 8, 4);          /* the firmware version */
+    if (cfg != NULL && cfg_bytes != 0) memcpy(out + length, cfg, cfg_bytes);
+    *patch_bytes = length + cfg_bytes;
+    return 0;
+}

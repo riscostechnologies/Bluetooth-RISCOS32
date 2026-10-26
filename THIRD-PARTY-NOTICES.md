@@ -26,6 +26,15 @@ Tematic Ltd, under the Apache License, Version 2.0
 (http://www.apache.org/licenses/LICENSE-2.0). That file is distributed
 under the Apache License 2.0.
 
+## Realtek Bluetooth firmware (Realtek redistribution licence)
+
+`desktop/firmware/rtl8761bu_fw,ffd` and `rtl8761bu_config,ffd` are
+Realtek's RTL8761B patch files, unmodified, from the linux-firmware
+repository (`rtl_bt/`). Copyright (c) 2010 Realtek Semiconductor
+Corporation; redistributable in binary form under the terms in
+`desktop/firmware/Licence`, which ship with them. They are not covered by
+`LICENSE`.
+
 ## Modules not in this repository
 
 The desktop package bundles three binary modules that are not part of this

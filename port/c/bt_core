@@ -2246,17 +2246,38 @@ static void configure(btc_core *core)
     core->state_since = core->now;
 }
 
+const uint8_t *(*btc_vendor_patch)(uint16_t, uint16_t, uint8_t, uint32_t *);
+void (*btc_vendor_release)(void);
+
 static void boot_pump(btc_core *core)
 {
-    uint8_t command[68];
+    uint8_t command[260];
     size_t bytes;
     uint32_t ignored;
     int result;
     btv_hci_bootstrap_tick(&core->boot, core->now);
     if (core->boot.stage == BTV_BOOT_FAILED)
     {
+        if (btc_vendor_release != 0) btc_vendor_release();
         fail(core, 0x0400u | core->boot.error);
         return;
+    }
+    {
+        uint16_t revision, subversion;
+        uint8_t rom;
+        if (btv_hci_bootstrap_needs_patch(&core->boot, &revision, &subversion,
+                                          &rom))
+        {
+            uint32_t bytes = 0;
+            const uint8_t *patch = btc_vendor_patch != 0 ?
+                btc_vendor_patch(revision, subversion, rom, &bytes) : 0;
+            btc_note("vendor chip, subversion|ROM", (uint32_t)subversion << 8 | rom);
+            btc_note(patch != 0 ? "vendor patch, bytes" :
+                                  "no vendor patch for it: going on without", bytes);
+            btv_hci_bootstrap_patch(&core->boot, patch, bytes);
+        }
+        else if (core->boot.vendor == BTV_VENDOR_NONE && btc_vendor_release != 0)
+            btc_vendor_release();
     }
     if (core->boot.stage == BTV_BOOT_DISCOVERED)
     {
@@ -2321,6 +2342,9 @@ static void transport_up(btc_core *core)
     core->transport_wait = 0;
     btv_hci_bootstrap_start(&core->boot, core->now, 0);
     btv_hci_bootstrap_skip_extended(&core->boot);
+    /* With a patch provider (the module), ask whose chip it is first, so a
+     * Realtek one can be sent its patch before Reset. */
+    if (btc_vendor_patch != 0) btv_hci_bootstrap_vendor_probe(&core->boot);
     /* The bring-up's timeouts run from the first pump after this. */
     core->boot_rebase = 1;
     btc_note("transport up, bring-up begins", core->now);
