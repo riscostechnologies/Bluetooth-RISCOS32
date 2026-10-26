@@ -139,7 +139,23 @@ static volatile uint8_t *map(uint32_t phys)
     r[0] = 13u | (1u << 17);
     r[1] = phys;
     r[2] = PAGE;
-    if (rs_swi(0x33, r) != NULL) return NULL;
+    {
+        const struct os_error *e = rs_swi(0x33, r);
+        if (e != NULL)
+        {
+            char text[60];
+            snprintf(text, sizeof text, "map &%08X: %.40s", (unsigned)phys,
+                     e->errmess);
+            btv_host_bridge_note("uart:", text);
+            return NULL;
+        }
+    }
+    {
+        char text[60];
+        snprintf(text, sizeof text, "map &%08X -> &%08X (R0 &%X)", (unsigned)phys,
+                 (unsigned)r[3], (unsigned)r[0]);
+        btv_host_bridge_note("uart:", text);
+    }
     return (volatile uint8_t *)r[3];
 }
 
@@ -333,7 +349,16 @@ static void hardware_setup(void)
 int btv_uart_open(void)
 {
     if (u.open) return 1;
-    if (!btv_uart_inspect() || !map_all()) return 0;
+    if (!btv_uart_inspect())
+    {
+        btv_host_bridge_note("uart:", "not a Pinebook Pro (inspect)");
+        return 0;
+    }
+    if (!map_all())
+    {
+        btv_host_bridge_note("uart:", "could not map the registers");
+        return 0;
+    }
     u.tx_in = u.tx_out = 0;
     u.event_in = u.event_out = u.acl_in = u.acl_out = 0;
     memset(u.pending, 0, sizeof u.pending);
@@ -419,9 +444,9 @@ int btv_uart_boot(void)
         return 0;
     case B_MINI_PAUSE:
         if (waited < 50u) return 0;
-        u.patch = btm_firmware_load("BCM4345C5.hcd", &u.patch_bytes);
+        u.patch = btm_firmware_load("BCM4345C5", &u.patch_bytes);
         if (u.patch == NULL)
-            return boot_fail("BCM4345C5.hcd is not in !Bluetooth.Firmware");
+            return boot_fail("BCM4345C5 (the Broadcom patch) is not in !Bluetooth.Firmware");
         u.patch_at = 0;
         u.records = 0;
         u.state = B_REC_SEND;
