@@ -1,0 +1,133 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/* The pure half of the UART transport: see h/btuartcalc. */
+#include "btuartcalc.h"
+#include <string.h>
+
+enum { RX_TYPE, RX_HEADER, RX_PAYLOAD };
+
+void h4_rx_init(struct h4_rx *p)
+{
+    memset(p, 0, sizeof *p);
+}
+
+/* The header that follows each type, and where its length is. */
+static uint16_t header_bytes(uint8_t type)
+{
+    switch (type)
+    {
+    case H4_EVENT:   return 2;    /* code, length */
+    case H4_ACL:     return 4;    /* handle and flags, 16-bit length */
+    case H4_SCO:     return 3;    /* handle and flags, 8-bit length */
+    case H4_COMMAND: return 3;    /* opcode, length */
+    default:         return 0;
+    }
+}
+
+static uint16_t payload_bytes(const struct h4_rx *p)
+{
+    switch (p->type)
+    {
+    case H4_EVENT: return p->buf[1];
+    case H4_ACL:   return (uint16_t)(p->buf[2] | p->buf[3] << 8);
+    default:       return p->buf[2];
+    }
+}
+
+int h4_rx_byte(struct h4_rx *p, uint8_t byte)
+{
+    switch (p->state)
+    {
+    case RX_TYPE:
+        p->need = header_bytes(byte);
+        if (p->need == 0)
+        {
+            p->dropped++;
+            return 0;
+        }
+        p->type = byte;
+        p->have = 0;
+        p->state = RX_HEADER;
+        return 0;
+    case RX_HEADER:
+        p->buf[p->have++] = byte;
+        if (--p->need != 0) return 0;
+        p->need = payload_bytes(p);
+        p->length = (uint16_t)(p->have + p->need);
+        if (p->length > H4_MAX_PACKET) p->oversize++;
+        if (p->need == 0)
+        {
+            p->state = RX_TYPE;
+            return p->length <= H4_MAX_PACKET;
+        }
+        p->state = RX_PAYLOAD;
+        return 0;
+    default:
+        if (p->have < H4_MAX_PACKET) p->buf[p->have] = byte;
+        p->have++;
+        if (--p->need != 0) return 0;
+        p->state = RX_TYPE;
+        return p->length <= H4_MAX_PACKET;
+    }
+}
+
+size_t h4_command(uint8_t *out, size_t room, uint16_t opcode,
+                  const uint8_t *params, uint8_t length)
+{
+    if (room < 4u + length) return 0;
+    out[0] = H4_COMMAND;
+    out[1] = (uint8_t)opcode;
+    out[2] = (uint8_t)(opcode >> 8);
+    out[3] = length;
+    if (length != 0) memcpy(out + 4, params, length);
+    return 4u + length;
+}
+
+int hci_command_done(const uint8_t *event, size_t length, uint16_t opcode,
+                     uint8_t *status)
+{
+    if (length >= 6 && event[0] == 0x0E && event[1] >= 4 &&
+        (uint16_t)(event[3] | event[4] << 8) == opcode)
+    {
+        *status = event[5];
+        return 1;
+    }
+    if (length >= 6 && event[0] == 0x0F && event[1] >= 4 &&
+        (uint16_t)(event[4] | event[5] << 8) == opcode)
+    {
+        *status = event[2];
+        return 1;
+    }
+    return 0;
+}
+
+uint32_t uart_divisor(uint32_t clock, uint32_t baud)
+{
+    uint32_t d;
+    if (baud == 0 || baud > 3000000u || clock > 100000000u) return 1;
+    d = (clock + 8u * baud) / (16u * baud);
+    return d == 0 ? 1 : d;
+}
+
+void bcm_baud_params(uint8_t out[6], uint32_t baud)
+{
+    out[0] = 0;
+    out[1] = 0;
+    out[2] = (uint8_t)baud;
+    out[3] = (uint8_t)(baud >> 8);
+    out[4] = (uint8_t)(baud >> 16);
+    out[5] = (uint8_t)(baud >> 24);
+}
+
+int hcd_next(const uint8_t *file, size_t length, size_t *at,
+             uint16_t *opcode, const uint8_t **params, uint8_t *plen)
+{
+    size_t i = *at;
+    if (i + 3 > length) return 0;
+    *opcode = (uint16_t)(file[i] | file[i + 1] << 8);
+    *plen = file[i + 2];
+    if (i + 3 + *plen > length) return 0;
+    *params = file + i + 3;
+    *at = i + 3 + *plen;
+    return 1;
+}

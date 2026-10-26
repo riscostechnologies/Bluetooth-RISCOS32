@@ -1,0 +1,65 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*
+ * The pure half of the UART transport (c/uart_bridge): HCI over a serial
+ * line as the Bluetooth Core specification's UART transport layer (H4) has
+ * it, a packet-type byte before each packet; the 16550 divisor; Broadcom's
+ * vendor commands for start-up; and its patch file (.hcd), a run of HCI
+ * commands. Nothing here touches hardware.
+ */
+#ifndef BTUARTCALC_H
+#define BTUARTCALC_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+/* H4 packet types (Core specification, Volume 4 Part A). */
+#define H4_COMMAND	0x01u
+#define H4_ACL		0x02u
+#define H4_SCO		0x03u
+#define H4_EVENT	0x04u
+
+#define H4_MAX_PACKET	1100u	/* an ACL header and 1021 data, with room */
+
+struct h4_rx {
+    uint8_t   state;     /* 0 type, 1 header, 2 payload */
+    uint8_t   type;
+    uint16_t  need;      /* bytes still to come in this part */
+    uint16_t  have;      /* bytes of the packet so far */
+    uint16_t  length;    /* the whole packet, header included */
+    uint32_t  dropped;   /* bytes thrown away resynchronising */
+    uint32_t  oversize;  /* packets too long to keep */
+    uint8_t   buf[H4_MAX_PACKET];
+};
+
+void h4_rx_init(struct h4_rx *p);
+
+/* One byte from the line: 1 when it ends a packet, whose type is p->type
+ * and whose bytes (header first, no type byte) are p->buf[0..length). */
+int h4_rx_byte(struct h4_rx *p, uint8_t byte);
+
+/* An H4 command: type, opcode, length and parameters. Answers its length,
+ * or 0 if it will not fit in `room`. */
+size_t h4_command(uint8_t *out, size_t room, uint16_t opcode,
+                  const uint8_t *params, uint8_t length);
+
+/* A Command Complete (0x0E) or Command Status (0x0F) event for `opcode`
+ * (without the type byte): 1 and its status, or 0 if it is not one. */
+int hci_command_done(const uint8_t *event, size_t length, uint16_t opcode,
+                     uint8_t *status);
+
+/* The 16550 divisor for `baud` from `clock`, to the nearest (32-bit). */
+uint32_t uart_divisor(uint32_t clock, uint32_t baud);
+
+/* Broadcom's Update UART Baud Rate (0xFC18): two noughts, then the rate
+ * as a 32-bit little-endian word. */
+#define BCM_OP_UPDATE_BAUD   0xFC18u
+#define BCM_OP_DOWNLOAD_MINI 0xFC2Eu
+void bcm_baud_params(uint8_t out[6], uint32_t baud);
+
+/* The next record of a .hcd patch from offset *at: its opcode and
+ * parameters. 0 at the end or at a record running past the file. */
+int hcd_next(const uint8_t *file, size_t length, size_t *at,
+             uint16_t *opcode, const uint8_t **params, uint8_t *plen);
+
+#endif

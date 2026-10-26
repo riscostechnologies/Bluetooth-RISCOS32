@@ -8,4 +8,4 @@ RMEnsure DWCDriver 0.00 Set Bluetooth$Pi 0
 If "<Bluetooth$Pi>" = "1" Then IfThere BootResources:!Bluetooth.Modules.USBDriver Then RMEnsure USBDriver 1.35 RMLoad BootResources:!Bluetooth.Modules.USBDriver
 If "<Bluetooth$Pi>" = "1" Then IfThere BootResources:!Bluetooth.Modules.DWCDriver Then RMEnsure DWCDriver 0.40 RMLoad BootResources:!Bluetooth.Modules.DWCDriver
 Unset Bluetooth$Pi
-IfThere BootResources:!Bluetooth.Modules.BTVoice Then RMEnsure BluetoothVoice 0.93 RMLoad BootResources:!Bluetooth.Modules.BTVoice
+IfThere BootResources:!Bluetooth.Modules.BTVoice Then RMEnsure BluetoothVoice 0.94 RMLoad BootResources:!Bluetooth.Modules.BTVoice

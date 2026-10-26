@@ -2,3 +2,4 @@ build/
 *.err
 __pycache__/
 desktop/modules/*,ffa
+desktop/firmware/BCM4345C5*

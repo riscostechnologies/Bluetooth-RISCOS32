@@ -17,3 +17,4 @@ run hidmap "-x c $T/hidmap.c" hid_report hid_input
 run hid "-x c $T/hid.c" hid_input
 run pure "$(for f in $T/pure.c $T/test_*.c; do printf -- '-x c %s ' $f; done)" hci_inquiry hci_pairing hci_security hci_frame l2cap_signal l2cap_channel l2cap_dispatch acl_transmit acl_receive acl_link sdp_query sdp_record sdp_data sdp_session
 run sbc "-x c $T/sbc.c" sbc_encoder
+run uart "-x c $T/uart.c" btuartcalc

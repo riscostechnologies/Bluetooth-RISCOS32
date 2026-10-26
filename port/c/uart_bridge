@@ -1,0 +1,616 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+/*******************************************************************
+ * File:        uart_bridge
+ * Purpose:     The Pinebook Pro's built-in Bluetooth over RK3399 UART0.
+ *
+ * What the registers are, from the board's device tree and the Linux
+ * clock and pin drivers; verified on the machine:
+ *   UART0       0xFF180000  Synopsys 16550, registers 4 bytes apart, 64-byte
+ *                           FIFOs; its clock is the 24 MHz crystal (set by
+ *                           the boot loader), so divisor 13 is 115200 and
+ *                           divisor 1 is 1.5 Mbaud
+ *   pins        GPIO2 C0 RX, C1 TX, C2 CTS, C3 RTS: GRF 0xFF77E008, two
+ *               bits a pin, function 1 (the upper half of the word is the
+ *               write mask)
+ *   BT_REG_ON   GPIO0 B1 (bit 9 of the port at 0xFF720000; its pin mux is
+ *               PMUGRF 0xFF320004 bits 3:2, GPIO is 0)
+ *   BT_WAKE     GPIO2 D3 (bit 27 of the port at 0xFF780000), high = awake
+ * The controller has almost no firmware of its own: before its patch
+ * (BCM4345C5.hcd) it answers only HCI Reset and Download Minidriver.
+ *******************************************************************/
+#include "uart_bridge.h"
+#include "btuartcalc.h"
+#include "riscos_shim.h"
+#include <stdio.h>
+#include <string.h>
+
+#define UART_PHYS    0xFF180000u
+#define GPIO0_PHYS   0xFF720000u
+#define GPIO2_PHYS   0xFF780000u
+#define GRF_PHYS     0xFF77E000u
+#define PMUGRF_PHYS  0xFF320000u
+#define PAGE         0x1000u
+
+#define GRF_GPIO2C_IOMUX   0x008u
+#define PMUGRF_GPIO0B_IOMUX 0x004u
+#define GPIO_DR            0x00u
+#define GPIO_DDR           0x04u
+#define BT_REG_ON          (1u << 9)     /* GPIO0 B1 */
+#define BT_WAKE            (1u << 27)    /* GPIO2 D3 */
+
+#define UART_CLOCK   24000000u
+#define INIT_BAUD    115200u
+#define RUN_BAUD     1500000u
+
+/* 16550 registers. */
+#define U_RBR 0x00u
+#define U_THR 0x00u
+#define U_DLL 0x00u
+#define U_IER 0x04u
+#define U_DLH 0x04u
+#define U_FCR 0x08u
+#define U_LCR 0x0Cu
+#define U_MCR 0x10u
+#define U_LSR 0x14u
+#define U_USR 0x7Cu
+#define LSR_DR   0x01u
+#define USR_TFNF 0x02u
+#define LCR_8N1  0x03u
+#define LCR_DLAB 0x80u
+#define MCR_RTS  0x02u
+#define MCR_AFE  0x20u
+#define FCR_ON   0x87u   /* FIFOs on, both cleared, receive trigger half */
+
+#define TX_RING      8192u              /* a power of two */
+#define EVENTS       32u
+#define EVENT_BYTES  260u
+#define ACLS         8u
+#define TX_TICKETS   16u
+#define KIND_SHIFT   24
+#define SPIN_LIMIT   60000u             /* register reads in one service */
+
+enum boot_state
+{
+    B_IDLE, B_POWER_OFF, B_POWER_ON, B_RESET_WAIT, B_MINI_WAIT, B_MINI_PAUSE,
+    B_REC_SEND, B_REC_WAIT, B_PATCH_END, B_RESET2_WAIT, B_BAUD_WAIT,
+    B_BAUD_SETTLE, B_DONE, B_FAIL
+};
+
+static struct
+{
+    volatile uint8_t *uart, *gpio0, *gpio2, *grf, *pmugrf;
+    int mapped, open, booting;
+
+    uint8_t tx[TX_RING];
+    uint32_t tx_in;
+    volatile uint32_t tx_out;
+
+    struct h4_rx parser;
+    uint8_t event[EVENTS][EVENT_BYTES];
+    uint16_t event_len[EVENTS];
+    uint32_t event_in, event_out;
+    uint8_t acl[ACLS][H4_MAX_PACKET];
+    uint16_t acl_len[ACLS];
+    uint32_t acl_in, acl_out;
+    uint32_t events_lost, rx_bytes, acl_in_count, acl_out_count;
+
+    struct { uint32_t ticket, end, kind, bytes; } pending[TX_TICKETS];
+    uint32_t sequence;
+
+    /* the controller's start-up */
+    int state, attempts;
+    uint32_t since;
+    uint16_t awaiting;                 /* opcode whose reply is wanted */
+    uint8_t reply[16];
+    uint32_t reply_bytes;
+    int reply_ready;
+    const uint8_t *patch;
+    uint32_t patch_bytes, patch_at, records;
+} u;
+
+static uint32_t now_ms(void)
+{
+    return os_read_monotonic_time() * 10u;
+}
+
+static void note_num(const char *what, uint32_t value)
+{
+    char text[40];
+    snprintf(text, sizeof text, "%s %u", what, (unsigned)value);
+    btv_host_bridge_note("uart:", text);
+}
+
+static uint32_t rd(volatile uint8_t *b, uint32_t o)
+{
+    return *(volatile uint32_t *)(b + o);
+}
+
+static void wr(volatile uint8_t *b, uint32_t o, uint32_t v)
+{
+    *(volatile uint32_t *)(b + o) = v;
+}
+
+/* OS_Memory 13: device memory, uncached and unbuffered (bit 8 and 9 clear),
+ * with the access permission given (bit 17, user read/write). */
+static volatile uint8_t *map(uint32_t phys)
+{
+    uint32_t r[8] = { 0 };
+    r[0] = 13u | (1u << 17);
+    r[1] = phys;
+    r[2] = PAGE;
+    if (rs_swi(0x33, r) != NULL) return NULL;
+    return (volatile uint8_t *)r[3];
+}
+
+static int module_present(const char *name)
+{
+    uint32_t r[8] = { 0 };
+    r[0] = 18;
+    r[1] = (uint32_t)name;
+    return rs_swi(0x1E, r) == NULL;          /* OS_Module 18: lookup */
+}
+
+int btv_uart_is_open(void) { return u.open; }
+
+/* A Pinebook Pro: an RK3399 (its video driver is loaded) with the Broadcom
+ * Wi-Fi/Bluetooth module (WLanB). Bluetooth$UART set to 0 turns it off. */
+int btv_uart_inspect(void)
+{
+    char value[8];
+    uint32_t len = sizeof value - 1;
+    if (kernel_read_var_val("Bluetooth$UART", value, &len) == NULL &&
+        len >= 1 && value[0] == '0')
+        return 0;
+    return module_present("RK3399Video") && module_present("WLanB");
+}
+
+/* ---- the UART --------------------------------------------------------- */
+
+static void set_baud(uint32_t baud)
+{
+    uint32_t div = uart_divisor(UART_CLOCK, baud);
+    wr(u.uart, U_LCR, LCR_DLAB | LCR_8N1);
+    wr(u.uart, U_DLL, div & 0xFFu);
+    wr(u.uart, U_DLH, (div >> 8) & 0xFFu);
+    wr(u.uart, U_LCR, LCR_8N1);
+}
+
+static int queue_full(void)
+{
+    return u.event_in - u.event_out >= EVENTS ||
+           u.acl_in - u.acl_out >= ACLS;
+}
+
+/* A whole packet from the controller. */
+static void packet(void)
+{
+    uint32_t i;
+    if (u.booting)
+    {
+        /* The start-up wants only the reply it is waiting for. */
+        if (u.parser.type == H4_EVENT)
+        {
+            uint8_t status;
+            if (hci_command_done(u.parser.buf, u.parser.length, u.awaiting,
+                                 &status))
+            {
+                u.reply_bytes = u.parser.length > sizeof u.reply ?
+                                sizeof u.reply : u.parser.length;
+                memcpy(u.reply, u.parser.buf, u.reply_bytes);
+                u.reply[0] = 0x0E;
+                u.reply[5] = status;
+                u.reply_ready = 1;
+            }
+        }
+        return;
+    }
+    if (u.parser.type == H4_EVENT && u.parser.length <= EVENT_BYTES)
+    {
+        i = u.event_in % EVENTS;
+        memcpy(u.event[i], u.parser.buf, u.parser.length);
+        u.event_len[i] = u.parser.length;
+        u.event_in++;
+    }
+    else if (u.parser.type == H4_ACL)
+    {
+        i = u.acl_in % ACLS;
+        memcpy(u.acl[i], u.parser.buf, u.parser.length);
+        u.acl_len[i] = u.parser.length;
+        u.acl_in++;
+        u.acl_in_count++;
+    }
+    else if (u.parser.type == H4_EVENT)
+        u.events_lost++;
+}
+
+/* Receive what is waiting, then send what can go. Leaves bytes in the FIFO
+ * (and so holds the controller off) when the queues are full. */
+static void service(void)
+{
+    uint32_t spins = 0, n = 0;
+    if (!u.mapped) return;
+    while ((rd(u.uart, U_LSR) & LSR_DR) && n < 8192u &&
+           (u.booting || !queue_full()))
+    {
+        uint8_t byte = (uint8_t)rd(u.uart, U_RBR);
+        ++n;
+        if (h4_rx_byte(&u.parser, byte)) packet();
+    }
+    u.rx_bytes += n;
+    while (u.tx_out != u.tx_in && spins < SPIN_LIMIT)
+    {
+        if (rd(u.uart, U_USR) & USR_TFNF)
+        {
+            wr(u.uart, U_THR, u.tx[u.tx_out % TX_RING]);
+            ++u.tx_out;
+        }
+        else
+        {
+            ++spins;
+            /* The controller may be waiting for us to read, while we wait
+             * for it to take: keep reading. */
+            if ((rd(u.uart, U_LSR) & LSR_DR) && (u.booting || !queue_full()))
+            {
+                uint8_t byte = (uint8_t)rd(u.uart, U_RBR);
+                ++u.rx_bytes;
+                if (h4_rx_byte(&u.parser, byte)) packet();
+            }
+        }
+        ++spins;
+    }
+}
+
+/* One H4 packet into the transmit ring: 1, or 0 when it will not fit. */
+static int send_bytes(uint8_t type, const uint8_t *data, uint32_t bytes,
+                      uint32_t *end)
+{
+    uint32_t i;
+    if (u.tx_in - u.tx_out + bytes + 1u > TX_RING) return 0;
+    u.tx[u.tx_in++ % TX_RING] = type;
+    for (i = 0; i < bytes; ++i) u.tx[u.tx_in++ % TX_RING] = data[i];
+    *end = u.tx_in;
+    return 1;
+}
+
+/* A command for the start-up, whose reply the next packets may bring. */
+static int boot_command(uint16_t opcode, const uint8_t *params, uint8_t length)
+{
+    uint8_t packet_bytes[4 + 255];
+    uint32_t end;
+    size_t n = h4_command(packet_bytes, sizeof packet_bytes, opcode, params,
+                          length);
+    if (n == 0 || !send_bytes(packet_bytes[0], packet_bytes + 1, (uint32_t)n - 1u,
+                              &end))
+        return 0;
+    u.awaiting = opcode;
+    u.reply_ready = 0;
+    u.since = now_ms();
+    return 1;
+}
+
+static void bt_on(int on)
+{
+    uint32_t d = rd(u.gpio0, GPIO_DR);
+    wr(u.gpio0, GPIO_DR, on ? d | BT_REG_ON : d & ~BT_REG_ON);
+    wr(u.gpio0, GPIO_DDR, rd(u.gpio0, GPIO_DDR) | BT_REG_ON);
+}
+
+static int map_all(void)
+{
+    if (u.mapped) return 1;
+    u.uart = map(UART_PHYS);
+    u.gpio0 = map(GPIO0_PHYS);
+    u.gpio2 = map(GPIO2_PHYS);
+    u.grf = map(GRF_PHYS);
+    u.pmugrf = map(PMUGRF_PHYS);
+    if (u.uart == NULL || u.gpio0 == NULL || u.gpio2 == NULL ||
+        u.grf == NULL || u.pmugrf == NULL)
+        return 0;
+    u.mapped = 1;
+    return 1;
+}
+
+/* The pins and the UART, at the speed the controller starts at. */
+static void hardware_setup(void)
+{
+    uint32_t d;
+    /* GPIO2 C0-C3 to the UART (function 1); GPIO0 B1 back to a plain pin. */
+    wr(u.grf, GRF_GPIO2C_IOMUX, 0x00FF0055u);
+    wr(u.pmugrf, PMUGRF_GPIO0B_IOMUX, 0x000C0000u);
+    /* The controller awake. */
+    d = rd(u.gpio2, GPIO_DR);
+    wr(u.gpio2, GPIO_DR, d | BT_WAKE);
+    wr(u.gpio2, GPIO_DDR, rd(u.gpio2, GPIO_DDR) | BT_WAKE);
+    wr(u.uart, U_IER, 0);
+    wr(u.uart, U_MCR, 0);
+    set_baud(INIT_BAUD);
+    wr(u.uart, U_FCR, FCR_ON);
+    wr(u.uart, U_MCR, MCR_AFE | MCR_RTS);
+    while (rd(u.uart, U_LSR) & LSR_DR) (void)rd(u.uart, U_RBR);
+}
+
+int btv_uart_open(void)
+{
+    if (u.open) return 1;
+    if (!btv_uart_inspect() || !map_all()) return 0;
+    u.tx_in = u.tx_out = 0;
+    u.event_in = u.event_out = u.acl_in = u.acl_out = 0;
+    memset(u.pending, 0, sizeof u.pending);
+    h4_rx_init(&u.parser);
+    u.state = B_IDLE;
+    u.attempts = 0;
+    u.booting = 1;
+    u.open = 1;
+    return 1;
+}
+
+static void release_patch(void)
+{
+    if (u.patch != NULL) btm_firmware_free(u.patch);
+    u.patch = NULL;
+}
+
+static int boot_fail(const char *why)
+{
+    btv_host_bridge_note("uart: start-up failed:", why);
+    release_patch();
+    u.state = B_FAIL;
+    return -1;
+}
+
+int btv_uart_boot(void)
+{
+    uint32_t now = now_ms(), waited;
+    uint16_t opcode;
+    const uint8_t *params;
+    uint8_t plen;
+    if (!u.open) return -1;
+    if (u.state == B_DONE) return 1;
+    if (u.state == B_FAIL) return -1;
+    service();
+    waited = now - u.since;
+    switch (u.state)
+    {
+    case B_IDLE:
+        hardware_setup();
+        bt_on(0);
+        u.since = now;
+        u.state = B_POWER_OFF;
+        return 0;
+    case B_POWER_OFF:
+        if (waited < 300u) return 0;
+        bt_on(1);
+        u.since = now;
+        u.state = B_POWER_ON;
+        return 0;
+    case B_POWER_ON:
+        if (waited < 200u) return 0;
+        while (rd(u.uart, U_LSR) & LSR_DR) (void)rd(u.uart, U_RBR);
+        h4_rx_init(&u.parser);
+        if (!boot_command(0x0C03u, NULL, 0)) return boot_fail("no room");
+        u.state = B_RESET_WAIT;
+        return 0;
+    case B_RESET_WAIT:
+        if (u.reply_ready)
+        {
+            if (u.reply[5] != 0) return boot_fail("Reset refused");
+            note_num("controller answered Reset, attempt", (uint32_t)u.attempts);
+            if (!boot_command(BCM_OP_DOWNLOAD_MINI, NULL, 0))
+                return boot_fail("no room");
+            u.state = B_MINI_WAIT;
+        }
+        else if (waited > 1500u)
+        {
+            if (++u.attempts >= 3) return boot_fail("no answer to Reset");
+            bt_on(0);
+            u.since = now;
+            u.state = B_POWER_OFF;
+        }
+        return 0;
+    case B_MINI_WAIT:
+        if (u.reply_ready)
+        {
+            if (u.reply[5] != 0) return boot_fail("Download Minidriver refused");
+            u.since = now;
+            u.state = B_MINI_PAUSE;
+        }
+        else if (waited > 1000u) return boot_fail("no answer to Download Minidriver");
+        return 0;
+    case B_MINI_PAUSE:
+        if (waited < 50u) return 0;
+        u.patch = btm_firmware_load("BCM4345C5.hcd", &u.patch_bytes);
+        if (u.patch == NULL)
+            return boot_fail("BCM4345C5.hcd is not in !Bluetooth.Firmware");
+        u.patch_at = 0;
+        u.records = 0;
+        u.state = B_REC_SEND;
+        return 0;
+    case B_REC_SEND:
+    {
+        size_t at = u.patch_at;
+        if (!hcd_next(u.patch, u.patch_bytes, &at, &opcode, &params, &plen))
+        {
+            note_num("patch sent, records", u.records);
+            release_patch();
+            u.since = now;
+            u.state = B_PATCH_END;
+            return 0;
+        }
+        if (!boot_command(opcode, params, plen)) return 0;   /* ring full */
+        u.patch_at = (uint32_t)at;
+        ++u.records;
+        u.state = B_REC_WAIT;
+        return 0;
+    }
+    case B_REC_WAIT:
+        if (u.reply_ready)
+        {
+            if (u.reply[5] != 0) return boot_fail("patch record refused");
+            u.state = B_REC_SEND;
+            return 0;
+        }
+        /* The record is 250 bytes at 115200 baud: 22 ms to send. */
+        if (waited > 1500u) return boot_fail("patch record unanswered");
+        return 0;
+    case B_PATCH_END:
+        if (waited < 250u) return 0;
+        h4_rx_init(&u.parser);
+        if (!boot_command(0x0C03u, NULL, 0)) return boot_fail("no room");
+        u.state = B_RESET2_WAIT;
+        return 0;
+    case B_RESET2_WAIT:
+        if (u.reply_ready)
+        {
+            uint8_t p[6];
+            if (u.reply[5] != 0) return boot_fail("Reset after the patch refused");
+            bcm_baud_params(p, RUN_BAUD);
+            if (!boot_command(BCM_OP_UPDATE_BAUD, p, 6)) return boot_fail("no room");
+            u.state = B_BAUD_WAIT;
+        }
+        else if (waited > 2000u) return boot_fail("no answer to Reset after the patch");
+        return 0;
+    case B_BAUD_WAIT:
+        if (u.reply_ready || waited > 1000u)
+        {
+            if (u.reply_ready && u.reply[5] == 0)
+            {
+                if (u.tx_out != u.tx_in) return 0;
+                set_baud(RUN_BAUD);
+                note_num("controller speed", RUN_BAUD);
+            }
+            else
+                btv_host_bridge_note("uart:", "baud change refused: staying at 115200");
+            u.since = now;
+            u.state = B_BAUD_SETTLE;
+        }
+        return 0;
+    case B_BAUD_SETTLE:
+        if (waited < 20u) return 0;
+        while (rd(u.uart, U_LSR) & LSR_DR) (void)rd(u.uart, U_RBR);
+        h4_rx_init(&u.parser);
+        u.booting = 0;
+        u.state = B_DONE;
+        btv_host_bridge_note("uart:", "controller ready");
+        return 1;
+    default:
+        return -1;
+    }
+}
+
+/* ---- the transport's API ---------------------------------------------- */
+
+static uint32_t new_ticket(uint32_t kind)
+{
+    u.sequence = (u.sequence + 1u) & 0xFFFFFFu;
+    if (u.sequence == 0) u.sequence = 1;
+    return kind << KIND_SHIFT | u.sequence;
+}
+
+int btv_uart_submit(unsigned int kind, const uint8_t *data, uint32_t bytes,
+                    uint32_t *ticket)
+{
+    uint32_t end, i;
+    if (!u.open) return BTV_HOST_BRIDGE_INVALID;
+    switch (kind)
+    {
+    case BTV_HOST_BRIDGE_EVENT_IN:
+    case BTV_HOST_BRIDGE_ACL_IN:
+        *ticket = new_ticket(kind);
+        return BTV_HOST_BRIDGE_OK;
+    case BTV_HOST_BRIDGE_COMMAND:
+    case BTV_HOST_BRIDGE_ACL_OUT:
+        for (i = 0; i < TX_TICKETS && u.pending[i].ticket != 0; ++i) {}
+        if (i == TX_TICKETS) return BTV_HOST_BRIDGE_BUSY;
+        service();
+        if (!send_bytes(kind == BTV_HOST_BRIDGE_COMMAND ? H4_COMMAND : H4_ACL,
+                        data, bytes, &end))
+            return BTV_HOST_BRIDGE_BUSY;
+        if (kind == BTV_HOST_BRIDGE_ACL_OUT) ++u.acl_out_count;
+        u.pending[i].ticket = new_ticket(kind);
+        u.pending[i].end = end;
+        u.pending[i].kind = kind;
+        u.pending[i].bytes = bytes;
+        *ticket = u.pending[i].ticket;
+        return BTV_HOST_BRIDGE_OK;
+    default:
+        return BTV_HOST_BRIDGE_UNSUPPORTED;
+    }
+}
+
+int btv_uart_poll(uint32_t ticket, btv_host_bridge_completion *c)
+{
+    uint32_t kind = ticket >> KIND_SHIFT, i;
+    if (c == NULL || !u.open) return BTV_HOST_BRIDGE_INVALID;
+    service();
+    c->error = 0;
+    c->packet_count = 0;
+    c->kind = kind;
+    switch (kind)
+    {
+    case BTV_HOST_BRIDGE_EVENT_IN:
+        if (u.event_out == u.event_in) return BTV_HOST_BRIDGE_PENDING;
+        i = u.event_out % EVENTS;
+        memcpy(c->data, u.event[i], u.event_len[i]);
+        c->bytes = u.event_len[i];
+        ++u.event_out;
+        return BTV_HOST_BRIDGE_OK;
+    case BTV_HOST_BRIDGE_ACL_IN:
+        if (u.acl_out == u.acl_in) return BTV_HOST_BRIDGE_PENDING;
+        i = u.acl_out % ACLS;
+        memcpy(c->data, u.acl[i], u.acl_len[i]);
+        c->bytes = u.acl_len[i];
+        ++u.acl_out;
+        return BTV_HOST_BRIDGE_OK;
+    case BTV_HOST_BRIDGE_COMMAND:
+    case BTV_HOST_BRIDGE_ACL_OUT:
+        for (i = 0; i < TX_TICKETS; ++i)
+            if (u.pending[i].ticket == ticket) break;
+        if (i == TX_TICKETS) return BTV_HOST_BRIDGE_INVALID;
+        if ((int32_t)(u.tx_out - u.pending[i].end) < 0)
+            return BTV_HOST_BRIDGE_PENDING;
+        c->bytes = u.pending[i].bytes;
+        u.pending[i].ticket = 0;
+        return BTV_HOST_BRIDGE_OK;
+    default:
+        return BTV_HOST_BRIDGE_INVALID;
+    }
+}
+
+int btv_uart_cancel(uint32_t ticket)
+{
+    uint32_t i;
+    for (i = 0; i < TX_TICKETS; ++i)
+        if (u.pending[i].ticket == ticket) u.pending[i].ticket = 0;
+    return BTV_HOST_BRIDGE_OK;
+}
+
+int btv_uart_close(void)
+{
+    if (u.open)
+    {
+        if (u.mapped)
+        {
+            wr(u.uart, U_IER, 0);
+            bt_on(0);
+        }
+        release_patch();
+        u.open = 0;
+        u.booting = 0;
+        u.state = B_IDLE;
+    }
+    return BTV_HOST_BRIDGE_OK;
+}
+
+void btv_uart_counts(uint32_t *in_count, uint32_t *out_count)
+{
+    *in_count = u.acl_in_count;
+    *out_count = u.acl_out_count;
+}
+
+void btv_uart_stats(uint32_t *tx_waiting, uint32_t *rx_total, uint32_t *rx_lost)
+{
+    if (tx_waiting) *tx_waiting = u.tx_in - u.tx_out;
+    if (rx_total) *rx_total = u.rx_bytes;
+    if (rx_lost) *rx_lost = u.events_lost;
+}

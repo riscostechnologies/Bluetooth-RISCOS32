@@ -150,6 +150,17 @@ static uint8_t *read_firmware(const char *leaf, uint32_t *length)
     return NULL;
 }
 
+/* The UART transport's firmware: a file from !Bluetooth.Firmware. */
+const uint8_t *btm_firmware_load(const char *leaf, uint32_t *bytes)
+{
+    return read_firmware(leaf, bytes);
+}
+
+void btm_firmware_free(const uint8_t *data)
+{
+    free((void *)data);
+}
+
 static void release_vendor_patch(void)
 {
     if (vendor_patch != NULL)

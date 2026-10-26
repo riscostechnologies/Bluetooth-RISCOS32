@@ -1,0 +1,35 @@
+/* SPDX-License-Identifier: BSD-2-Clause
+ * Copyright (c) 2026 RISC OS Technologies */
+#ifndef BTV_UART_BRIDGE_H
+#define BTV_UART_BRIDGE_H
+/*
+ * The Pinebook Pro's built-in Bluetooth (Broadcom BCM4345C5 on the RK3399's
+ * UART0, H4 framing), as a transport beside the USB one. Polled: every call
+ * into it drains the UART's receive FIFO, and the controller is held off by
+ * hardware flow control (RTS/CTS) when it is not drained.
+ */
+#include <stdint.h>
+#include "host_bridge.h"
+
+/* Is this a board with that controller? Reads nothing from the hardware. */
+int btv_uart_inspect(void);
+/* Maps the registers, sets the pins and the UART; the controller is not
+ * powered until btv_uart_boot. */
+int btv_uart_open(void);
+/* The controller's start-up, a little each call (power, Reset, patch
+ * download, speed): 1 when done, 0 for not yet, -1 failed. */
+int btv_uart_boot(void);
+int btv_uart_submit(unsigned int kind, const uint8_t *data, uint32_t bytes,
+                    uint32_t *ticket);
+int btv_uart_poll(uint32_t ticket, btv_host_bridge_completion *completion);
+int btv_uart_cancel(uint32_t ticket);
+int btv_uart_close(void);
+int btv_uart_is_open(void);
+void btv_uart_counts(uint32_t *in_count, uint32_t *out_count);
+void btv_uart_stats(uint32_t *tx_waiting, uint32_t *rx_total, uint32_t *rx_lost);
+
+/* Supplied by the module: the contents of a file from the application's
+ * Firmware directory (malloc'd, NULL when absent) and its release. */
+const uint8_t *btm_firmware_load(const char *leaf, uint32_t *bytes);
+void btm_firmware_free(const uint8_t *data);
+#endif
