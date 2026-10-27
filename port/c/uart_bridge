@@ -350,12 +350,15 @@ static int hardware_setup(void)
     p = map(PMUGRF_PHYS);
     if (p == NULL) return 0;
     wr(p, PMUGRF_GPIO0B_IOMUX, 0x000C0000u);
-    /* The controller awake. */
+    /* BT_WAKE (GPIO2 D3) is already high from the boot loader. It is NOT
+     * written here: the GPIO2 output register also holds the NVMe slot's
+     * PCIe reset (GPIO2 D4), and a read-modify-write of it can put the
+     * reset back to a stale value while the NVMe driver is using it. */
     p = map(GPIO2_PHYS);
     if (p == NULL) return 0;
     d = rd(p, GPIO_DR);
-    wr(p, GPIO_DR, d | BT_WAKE);
-    wr(p, GPIO_DDR, rd(p, GPIO_DDR) | BT_WAKE);
+    if ((d & BT_WAKE) == 0)
+        btv_host_bridge_note("uart:", "BT_WAKE is low (left alone)");
     p = map(UART_PHYS);
     if (p == NULL) return 0;
     wr(p, U_IER, 0);
