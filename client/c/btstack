@@ -19,7 +19,7 @@
 #define MODULE_INSERT_COPY 11
 #define MODULE_LOOKUP 18
 #define USB_VERSION_NEEDED 135
-#define VOICE_VERSION_NEEDED 94
+#define VOICE_VERSION_NEEDED 95
 
 typedef struct image
 {
@@ -67,8 +67,23 @@ int bt_module_version(const char *title)
     return whole * 100 + fraction;
 }
 
+/* Booted from a disc on USB (a SATA or flash drive behind a USB bridge shows
+ * up as SCSI::)?  Replacing the USB drivers restarts every USB device, the
+ * boot disc included: the machine then asks "Please insert disc" and often
+ * hangs.  So with a USB boot disc the drivers are left as the ROM has them. */
+static int booted_from_usb(void)
+{
+    const char *dir = getenv("Boot$Dir");
+    return dir != NULL && (dir[0] == 'S' || dir[0] == 's') &&
+           (dir[1] == 'C' || dir[1] == 'c') && (dir[2] == 'S' || dir[2] == 's') &&
+           (dir[3] == 'I' || dir[3] == 'i') && dir[4] == ':';
+}
+
 int bt_usb_stack_ready(void)
 {
+    if (booted_from_usb()) return 1;
+    /* A Pi 4's sockets are XHCI (VL805): the DWC fix is for DWC-only boards. */
+    if (bt_module_version("XHCIDriver") >= 0) return 1;
     /* USBDriver 1.35 is only swapped in on a Raspberry Pi (DWCDriver), where
      * the controller driver is reloaded straight after it.  Elsewhere (a
      * Pinebook Pro's EHCI/OHCI/XHCI) the ROM's USBDriver serves A2DP and
@@ -195,6 +210,7 @@ static void update_dwc(const char *directory)
     char ignored[200];
     int version = bt_module_version("DWCDriver");
     if (version < 0 || version >= DWC_VERSION_WANTED) return;
+    if (booted_from_usb() || bt_module_version("XHCIDriver") >= 0) return;
     if (!load_image(directory, "DWCDriver", &dwc, ignored,
                     (int)sizeof(ignored)))
         return;

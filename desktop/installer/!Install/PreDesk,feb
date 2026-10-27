@@ -5,6 +5,13 @@
 | DWC host driver from the package.  Other boards keep their own USB stack.
 Set Bluetooth$Pi 1
 RMEnsure DWCDriver 0.00 Set Bluetooth$Pi 0
+| A boot disc on USB (SCSI::) must not lose its drivers: leave them alone.
+If "<Boot$Dir>" LEFT 5 = "SCSI:" Then Set Bluetooth$Pi 0
+| A Pi 4 has its sockets on XHCI (VL805), where the DWC fix is not needed.
+Set Bluetooth$XHCI 1
+RMEnsure XHCIDriver 0.00 Set Bluetooth$XHCI 0
+If "<Bluetooth$XHCI>" = "1" Then Set Bluetooth$Pi 0
+Unset Bluetooth$XHCI
 If "<Bluetooth$Pi>" = "1" Then IfThere BootResources:!Bluetooth.Modules.USBDriver Then RMEnsure USBDriver 1.35 RMLoad BootResources:!Bluetooth.Modules.USBDriver
 If "<Bluetooth$Pi>" = "1" Then IfThere BootResources:!Bluetooth.Modules.DWCDriver Then RMEnsure DWCDriver 0.40 RMLoad BootResources:!Bluetooth.Modules.DWCDriver
 Unset Bluetooth$Pi
