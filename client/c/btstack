@@ -19,7 +19,7 @@
 #define MODULE_INSERT_COPY 11
 #define MODULE_LOOKUP 18
 #define USB_VERSION_NEEDED 135
-#define VOICE_VERSION_NEEDED 96
+#define VOICE_VERSION_NEEDED 97
 
 typedef struct image
 {

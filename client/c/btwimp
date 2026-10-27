@@ -338,6 +338,24 @@ void bt_icon_set_shaded(int window, int icon, int shaded)
     set_flag(window, icon, ICON_SHADED, shaded);
 }
 
+void bt_icon_set_visible(int window, int icon, int visible)
+{
+    set_flag(window, icon, ICON_DELETED, !visible);
+}
+
+void bt_icon_set_fg(int window, int icon, int colour)
+{
+    _kernel_swi_regs regs;
+    int block[4];
+    block[0] = window;
+    block[1] = icon;
+    block[2] = (colour & 15) << 24;
+    block[3] = 15 << 24;
+    memset(&regs, 0, sizeof(regs));
+    regs.r[1] = (int)block;
+    (void)swi(Wimp_SetIconState, &regs);
+}
+
 void bt_caret_to(int window, int icon)
 {
     _kernel_swi_regs regs;

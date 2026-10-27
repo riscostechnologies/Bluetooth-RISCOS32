@@ -3,21 +3,24 @@ Bluetooth for RISC OS
 
 Plays sound through Bluetooth speakers and headphones (A2DP), and works
 with Bluetooth mice and keyboards (classic and Low Energy), through a
-USB Bluetooth adapter. Tested with a TP-Link UB400 (CSR8510) on a
-Raspberry Pi CM4 under RISC OS 5.
+USB Bluetooth adapter, or the Pinebook Pro's own Bluetooth.
 
 Icon bar
   SELECT   open the Devices window
   MENU     status, Info, Devices, connect the saved speaker,
-           Disconnect all, Configure, Quit
-  ADJUST   open Configure > Bluetooth
+           Disconnect all, Configure, Help, Quit
+  ADJUST   open the Bluetooth settings
 
 Devices window
-  Scan       look for devices for 10 seconds; put the device in
-             pairing mode first
-  Connect    pair with the chosen device and connect it
-  Disconnect drop the chosen device's connection
-  Forget     remove the pairing; the device must be paired again
+  Each device has its own card: a round badge for what it is (speaker,
+  headphones, mouse, keyboard, game pad), its name, details, and how it
+  is doing (Connected, Paired, Not paired). The button on the card does
+  the obvious thing: Pair (for a new device), Connect, or Disconnect.
+  Click MENU on a card to Forget the device.
+    Scan for devices   look for devices for 10 seconds; put the device
+                       in pairing mode first
+    Settings...        start-up and sound choices
+    Help               this text
 
 Paired devices come back by themselves: when the computer starts, and
 whenever a sleeping mouse or keyboard wakes. A speaker that was off is
@@ -31,3 +34,5 @@ desktop starts, from Choices:Boot.PreDesk.Bluetooth. Use !Install to
 add or remove everything.
 
 Settings and pairings are kept in Choices:Bluetooth.
+If something goes wrong, double-click BTReport in !Bluetooth and send
+the file that opens.
