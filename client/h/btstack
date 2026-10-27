@@ -12,6 +12,7 @@
 int bt_module_version(const char *title);
 /* USBDriver 1.35 or later is in charge of USB. */
 int bt_usb_stack_ready(void);
+int bt_read_var(const char *name, char *buffer, int size);
 /* Replaces the USB stack from files under `directory` (…Modules.USBDriver,
  * …Modules.EHCIDriver) and ensures BluetoothVoice (…Modules.BTVoice).
  * Every file is read into memory before USB is touched, because the files

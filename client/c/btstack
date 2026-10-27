@@ -19,7 +19,7 @@
 #define MODULE_INSERT_COPY 11
 #define MODULE_LOOKUP 18
 #define USB_VERSION_NEEDED 135
-#define VOICE_VERSION_NEEDED 95
+#define VOICE_VERSION_NEEDED 96
 
 typedef struct image
 {
@@ -71,9 +71,30 @@ int bt_module_version(const char *title)
  * up as SCSI::)?  Replacing the USB drivers restarts every USB device, the
  * boot disc included: the machine then asks "Please insert disc" and often
  * hangs.  So with a USB boot disc the drivers are left as the ROM has them. */
+/* A system variable's value into the caller's own buffer, straight from the
+ * OS: the C library's getenv shares storage between calls, and a second
+ * lookup then replaced the first one's result. */
+int bt_read_var(const char *name, char *buffer, int size)
+{
+    _kernel_swi_regs regs;
+    memset(&regs, 0, sizeof(regs));
+    regs.r[0] = (int)name;
+    regs.r[1] = (int)buffer;
+    regs.r[2] = size - 1;
+    regs.r[3] = 0;
+    regs.r[4] = 3;                      /* expand macros: a string */
+    buffer[0] = '\0';
+    if (_kernel_swi(0x23, &regs, &regs) != NULL || regs.r[2] <= 0)
+        return 0;                       /* OS_ReadVarVal */
+    buffer[regs.r[2]] = '\0';
+    return 1;
+}
+
 static int booted_from_usb(void)
 {
-    const char *dir = getenv("Boot$Dir");
+    char buffer[260];
+    const char *dir = bt_read_var("Boot$Dir", buffer, (int)sizeof(buffer)) ?
+                      buffer : NULL;
     return dir != NULL && (dir[0] == 'S' || dir[0] == 's') &&
            (dir[1] == 'C' || dir[1] == 'c') && (dir[2] == 'S' || dir[2] == 's') &&
            (dir[3] == 'I' || dir[3] == 'i') && dir[4] == ':';
