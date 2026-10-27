@@ -324,11 +324,17 @@ int btv_host_bridge_boot(void)
 #define NOTE_RING 8192u
 static char note_ring[NOTE_RING];
 static uint32_t note_end, note_wrapped;
+/* The first notes are kept for good: the ring fills with routine scan
+ * commands within minutes, and a start-up failure is in the first lines. */
+#define NOTE_HEAD 3072u
+static char note_head[NOTE_HEAD];
+static uint32_t note_head_len;
 
 static void note_put(const char *text)
 {
     while (*text != 0)
     {
+        if (note_head_len < NOTE_HEAD) note_head[note_head_len++] = *text;
         note_ring[note_end++] = *text++;
         if (note_end == NOTE_RING) { note_end = 0; note_wrapped = 1; }
     }
@@ -360,6 +366,22 @@ uint32_t btv_host_bridge_notes(char *buffer, uint32_t size)
 {
     uint32_t used = 0, i, start = note_wrapped ? note_end : 0;
     uint32_t total = note_wrapped ? NOTE_RING : note_end;
+    if (note_wrapped)
+    {
+        /* The ring has lost the start-up: give the kept head, a marker,
+         * then the ring from its next whole line. */
+        static const char marker[] = "\n[ ... notes between ... ]\n";
+        for (i = 0; i < note_head_len && used + 1 < size; ++i)
+            if (note_head[i] != 0) buffer[used++] = note_head[i];
+        for (i = 0; marker[i] != 0 && used + 1 < size; ++i)
+            buffer[used++] = marker[i];
+        while (total != 0 && note_ring[start % NOTE_RING] != '\n')
+        {
+            ++start;
+            --total;
+        }
+        if (total != 0) { ++start; --total; }
+    }
     for (i = 0; i < total && used + 1 < size; ++i)
     {
         char c = note_ring[(start + i) % NOTE_RING];

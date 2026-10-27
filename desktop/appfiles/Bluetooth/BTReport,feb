@@ -1,0 +1,19 @@
+| SPDX-License-Identifier: BSD-2-Clause
+| Copyright (c) 2026 RISC OS Technologies
+| Bluetooth support report: double-click, then send the file that opens.
+Set BTReport$File <Wimp$ScrapDir>.BluetoothReport
+Echo Bluetooth support report { > <BTReport$File> }
+Echo --- module { >> <BTReport$File> }
+Help BluetoothVoice { >> <BTReport$File> }
+Echo --- boot { >> <BTReport$File> }
+Show Boot$Dir { >> <BTReport$File> }
+Show BootResources$Path { >> <BTReport$File> }
+Show Choices$Path { >> <BTReport$File> }
+Echo --- USB { >> <BTReport$File> }
+USBDevices { >> <BTReport$File> }
+Help USBDriver { >> <BTReport$File> }
+Echo --- modules { >> <BTReport$File> }
+Modules { >> <BTReport$File> }
+Echo --- core state and notes { >> <BTReport$File> }
+BASIC -quit <Obey$Dir>.ReportProg { >> <BTReport$File> }
+Filer_Run <BTReport$File>

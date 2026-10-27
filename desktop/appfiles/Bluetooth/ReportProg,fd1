@@ -1,0 +1,12 @@
+REM SPDX-License-Identifier: BSD-2-Clause
+REM Copyright (c) 2026 RISC OS Technologies
+REM Prints the Bluetooth core's state and its notes, for BTReport.
+DIM b% 30000
+ON ERROR PRINT "BluetoothVoice is not loaded: ";REPORT$:END
+SYS &D7BC8,0,2 TO ,s%,e%
+PRINT "core state ";s%;" error &";~e%
+SYS &D7BC8,0,30,b%,29000 TO ,,,n%
+FOR k%=0 TO n%-1
+ IF b%?k%=10 OR b%?k%>=32 THEN VDU b%?k%
+NEXT
+PRINT

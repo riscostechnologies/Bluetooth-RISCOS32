@@ -62,6 +62,7 @@ cp 'desktop/!Help,fff' "$app/!Bluetooth/!Help,fff"
 rm -rf "$app/!Bluetooth/Firmware"
 cp -r desktop/firmware "$app/!Bluetooth/Firmware"
 cp 'desktop/appfiles/Bluetooth/!Run,feb' 'desktop/appfiles/Bluetooth/!Boot,feb' "$app/!Bluetooth/"
+cp 'desktop/appfiles/Bluetooth/BTReport,feb' 'desktop/appfiles/Bluetooth/ReportProg,fd1' "$app/!Bluetooth/"
 cp 'desktop/appfiles/BTSetup/!Run,feb' 'desktop/appfiles/BTSetup/!Boot,feb' "$app/!BTSetup/"
 version=$(sed -n 's/.*VERSION_TEXT "\([^"]*\)".*/\1/p' client/c/btbar | head -1)
 sed "s/VERSION/$version/" 'desktop/appfiles/BTSetup/Messages,fff' > "$app/!BTSetup/Messages,fff"
