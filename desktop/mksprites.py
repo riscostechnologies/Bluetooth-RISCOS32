@@ -106,7 +106,7 @@ def sprite(name, rows, ydpi):
     return header + bytes(image) + bytes(mask)
 
 
-def sprite_alpha(name, rows):
+def sprite_alpha(name, rows, ydpi=90):
     """RISC OS 5 32bpp sprite with an 8bpp alpha mask (mode word bit 31),
     as the Shield theme's co_ icons use.  rows: (r, g, b, a) top first."""
     height = len(rows)
@@ -118,7 +118,7 @@ def sprite_alpha(name, rows):
             image += struct.pack('<I', r | (g << 8) | (b << 16))
         line = bytes(a for _, _, _, a in row)
         mask += line + b'\0' * ((-len(line)) % 4)
-    mode = (1 << 31) | (6 << 27) | (90 << 14) | (90 << 1) | 1
+    mode = (1 << 31) | (6 << 27) | (ydpi << 14) | (90 << 1) | 1
     mask_offset = 44 + len(image)
     total = mask_offset + len(mask)
     header = struct.pack('<I12s7I', total, name.encode('latin-1')[:12].ljust(12, b'\0'),
@@ -202,6 +202,118 @@ def configure_icon(base_path):
     return [[tuple(p) for p in row] for row in px]
 
 
+ACTIVE = (0x00, 0x7F, 0xE8)
+INACTIVE = (0x9A, 0x9C, 0xA6)
+
+
+def _rr(u, v, x0, y0, x1, y1, r):
+    cx = max(x0 + r, min(u, x1 - r))
+    cy = max(y0 + r, min(v, y1 - r))
+    return (u - cx) ** 2 + (v - cy) ** 2 <= r * r
+
+
+def _circle(u, v, cx, cy, r):
+    return (u - cx) ** 2 + (v - cy) ** 2 <= r * r
+
+
+def _line(u, v, ax, ay, bx, by, t):
+    return seg_distance(u, v, ax, ay, bx, by) <= t
+
+
+def glyph_speaker(u, v):
+    return (_rr(u, v, .30, .17, .70, .83, .07) and not _circle(u, v, .5, .60, .13)
+            and not _circle(u, v, .5, .34, .055))
+
+
+def glyph_headset(u, v):
+    d = math.hypot(u - .5, v - .56)
+    band = .22 <= d <= .285 and v <= .56
+    return band or _rr(u, v, .20, .52, .33, .76, .045) or _rr(u, v, .67, .52, .80, .76, .045)
+
+
+def glyph_mouse(u, v):
+    if not _rr(u, v, .33, .16, .67, .84, .17):
+        return False
+    if _line(u, v, .33, .445, .67, .445, .012): return False
+    if _line(u, v, .5, .17, .5, .23, .012): return False
+    return not _rr(u, v, .465, .26, .535, .37, .03)
+
+
+def glyph_keyboard(u, v):
+    if not _rr(u, v, .14, .30, .86, .70, .05):
+        return False
+    for i in range(6):
+        if _rr(u, v, .21 + .1 * i, .355, .27 + .1 * i, .415, .012): return False
+    for i in range(5):
+        if _rr(u, v, .26 + .1 * i, .455, .32 + .1 * i, .515, .012): return False
+    return not _rr(u, v, .32, .56, .68, .62, .012)
+
+
+def glyph_pad(u, v):
+    if not _rr(u, v, .14, .33, .86, .69, .13):
+        return False
+    if _line(u, v, .24, .505, .38, .505, .024): return False
+    if _line(u, v, .31, .43, .31, .58, .024): return False
+    return not (_circle(u, v, .64, .57, .04) or _circle(u, v, .74, .47, .04))
+
+
+def glyph_other(u, v):
+    return any(_line(u, v, *a, *b, .04) for a, b in RUNE)
+
+
+GLYPHS = {'spk': glyph_speaker, 'hdst': glyph_headset, 'mouse': glyph_mouse,
+          'kbd': glyph_keyboard, 'pad': glyph_pad, 'other': glyph_other}
+
+
+def device_icon(kind, colour, size=40):
+    """A round badge with a white glyph, anti-aliased, as (r, g, b, a) rows."""
+    glyph = GLYPHS[kind]
+    n = 4
+    rows = []
+    for y in range(size):
+        row = []
+        for x in range(size):
+            inside = white = 0
+            for sy in range(n):
+                for sx in range(n):
+                    u = (x + (sx + .5) / n) / size
+                    v = (y + (sy + .5) / n) / size
+                    if _circle(u, v, .5, .5, .485):
+                        inside += 1
+                        if glyph(u, v):
+                            white += 1
+            if not inside:
+                row.append((0, 0, 0, 0))
+                continue
+            t = (y + .5) / size
+            shade = 1.14 - .28 * t
+            base = [min(255, int(c * shade)) for c in colour]
+            w = white / inside
+            rgb = tuple(int(round(base[i] * (1 - w) + 255 * w)) for i in range(3))
+            row.append(rgb + (int(round(255 * inside / (n * n))),))
+        rows.append(row)
+    return rows
+
+
+def squash_alpha(rows):
+    out = []
+    for i in range(0, len(rows) - 1, 2):
+        a, b = rows[i], rows[i + 1]
+        out.append([tuple((a[x][k] + b[x][k]) // 2 for k in range(4)) for x in range(len(a[0]))])
+    return out
+
+
+def device_sprites(ydpi):
+    out = []
+    for kind in GLYPHS:
+        for tag, colour in (('b', ACTIVE), ('g', INACTIVE)):
+            rows = device_icon(kind, colour)
+            if ydpi != 90:
+                rows = squash_alpha(rows)
+            out.append(sprite_alpha('dv_%s_%s' % (kind, tag), rows, ydpi))
+    return out
+
+
 def sprite_file(path, sprites):
     body = b''.join(sprites)
     # A sprite area without its first (size) word.
@@ -227,7 +339,7 @@ def build(out):
             sprite('bt_idle', logo(34, GREY), ydpi),
             sprite('bt_busy', logo(34, AMBER), ydpi),
             sprite('bt_on', logo(34, BLUE), ydpi),
-        ])
+        ] + device_sprites(ydpi))
         sprite_file(os.path.join(setup, '!Sprites%s,ff9' % suffix), [
             sprite('!btsetup', logo(34, BLUE), ydpi),
             sprite('sm!btsetup', logo(18, BLUE, True), ydpi),

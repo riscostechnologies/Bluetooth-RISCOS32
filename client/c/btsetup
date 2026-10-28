@@ -15,7 +15,7 @@
 
 #define TASK_NAME "Bluetooth Setup"
 #define WINDOW_WIDTH 1000
-#define WINDOW_HEIGHT 524
+#define WINDOW_HEIGHT 780
 
 enum
 {
@@ -24,6 +24,7 @@ enum
     I_SOUND, I_START, I_CONNECT, I_USB,
     I_NOTE,
     I_DEFAULT, I_CANCEL, I_SET,
+    I_LOGO, I_TITLE, I_H_SPEAKER, I_H_START, I_H_SOUND, I_H_ADVANCED,
     I_COUNT
 };
 
@@ -31,48 +32,48 @@ static int window;
 
 static void create_window(void)
 {
-    bt_icon_spec icons[I_COUNT];
+    static bt_icon_spec icons[I_COUNT];
+    const unsigned int grey = (bt_flags_label() & ~(15u << 24)) | (5u << 24);
     memset(icons, 0, sizeof(icons));
-    icons[I_ADDRESS_LABEL] = (bt_icon_spec){ 16, -72, 300, -20, 0,
-        "Speaker", NULL, 0 };
-    icons[I_ADDRESS] = (bt_icon_spec){ 310, -72, 660, -20, 0, "",
-        "Kta;A0-9a-fA-F:;Pptr_write", 18 };
-    icons[I_ADDRESS_HINT] = (bt_icon_spec){ 676, -72, 984, -20, 0,
+    icons[I_LOGO] = (bt_icon_spec){ 24, -100, 104, -20, bt_flags_label() | 0x2u,
+        "", "S!btsetup", 4 };
+    icons[I_TITLE] = (bt_icon_spec){ 124, -62, 960, -20, bt_flags_label(),
+        "Bluetooth settings", NULL, 0 };
+    icons[I_NOTE] = (bt_icon_spec){ 124, -100, 984, -66, grey,
+        "Pair and connect devices from the Bluetooth icon on the icon bar.",
+        NULL, 0 };
+    icons[I_H_SPEAKER] = (bt_icon_spec){ 16, -152, 984, -116, grey, "Speaker",
+        NULL, 0 };
+    icons[I_ADDRESS_LABEL] = (bt_icon_spec){ 32, -212, 270, -160,
+        bt_flags_label(), "Reconnects at start-up", NULL, 0 };
+    icons[I_ADDRESS] = (bt_icon_spec){ 280, -212, 570, -160, bt_flags_label(),
+        "", NULL, 18 };
+    icons[I_ADDRESS_HINT] = (bt_icon_spec){ 580, -212, 984, -160, bt_flags_label(),
         "", NULL, 64 };
-    icons[I_PIN_LABEL] = (bt_icon_spec){ 16, -136, 300, -84, 0,
-        "Pairing PIN", NULL, 0 };
-    icons[I_PIN] = (bt_icon_spec){ 310, -136, 520, -84, 0, "",
-        "Kta;A0-9;Pptr_write", 17 };
-    icons[I_SOUND] = (bt_icon_spec){ 16, -200, 984, -152, 0,
-        "Play system sound through the headset", "Soptoff,opton", 0 };
-    icons[I_START] = (bt_icon_spec){ 16, -256, 984, -208, 0,
-        "Start Bluetooth when the desktop starts", "Soptoff,opton", 0 };
-    icons[I_CONNECT] = (bt_icon_spec){ 16, -312, 984, -264, 0,
-        "Reconnect the speaker when Bluetooth starts", "Soptoff,opton", 0 };
-    icons[I_USB] = (bt_icon_spec){ 16, -368, 984, -320, 0,
-        "Load the USB audio drivers at start-up", "Soptoff,opton", 0 };
-    icons[I_NOTE] = (bt_icon_spec){ 16, -428, 984, -380, 0,
-        "Connect devices from the Bluetooth icon's Devices window.", NULL, 0 };
-    icons[I_DEFAULT] = (bt_icon_spec){ 16, -508, 216, -448, 0,
+    icons[I_H_START] = (bt_icon_spec){ 16, -268, 984, -232, grey,
+        "When the computer starts", NULL, 0 };
+    icons[I_START] = (bt_icon_spec){ 32, -328, 984, -276, bt_flags_option(),
+        "Start Bluetooth", "Soptoff,opton", 0 };
+    icons[I_CONNECT] = (bt_icon_spec){ 32, -384, 984, -332, bt_flags_option(),
+        "Reconnect my speaker and other paired devices", "Soptoff,opton", 0 };
+    icons[I_H_SOUND] = (bt_icon_spec){ 16, -440, 984, -404, grey, "Sound", NULL, 0 };
+    icons[I_SOUND] = (bt_icon_spec){ 32, -500, 984, -448, bt_flags_option(),
+        "Play the computer's sound through the speaker", "Soptoff,opton", 0 };
+    icons[I_H_ADVANCED] = (bt_icon_spec){ 16, -556, 984, -520, grey, "Advanced",
+        NULL, 0 };
+    icons[I_PIN_LABEL] = (bt_icon_spec){ 32, -616, 420, -564, bt_flags_label(),
+        "PIN for older devices", NULL, 0 };
+    icons[I_PIN] = (bt_icon_spec){ 430, -616, 640, -564, bt_flags_writable(),
+        "", "Kta;A0-9;Pptr_write", 17 };
+    icons[I_USB] = (bt_icon_spec){ 32, -672, 984, -620, bt_flags_option(),
+        "Load the USB audio drivers at start-up (Raspberry Pi)", "Soptoff,opton", 0 };
+    icons[I_DEFAULT] = (bt_icon_spec){ 16, -764, 216, -704, bt_flags_action(),
         "Default", "R5,3", 0 };
-    icons[I_CANCEL] = (bt_icon_spec){ 572, -508, 772, -448, 0,
+    icons[I_CANCEL] = (bt_icon_spec){ 572, -764, 772, -704, bt_flags_action(),
         "Cancel", "R5,3", 0 };
-    icons[I_SET] = (bt_icon_spec){ 784, -512, 984, -444, 0,
+    icons[I_SET] = (bt_icon_spec){ 784, -768, 984, -700, bt_flags_action(),
         "Set", "R6,3", 0 };
-    icons[I_ADDRESS_LABEL].flags = bt_flags_label() | 0x200u;
-    icons[I_PIN_LABEL].flags = bt_flags_label() | 0x200u;
-    icons[I_ADDRESS_HINT].flags = bt_flags_label();
-    icons[I_NOTE].flags = bt_flags_label();
-    icons[I_ADDRESS].flags = bt_flags_writable();
-    icons[I_PIN].flags = bt_flags_writable();
-    icons[I_SOUND].flags = bt_flags_option();
-    icons[I_START].flags = bt_flags_option();
-    icons[I_CONNECT].flags = bt_flags_option();
-    icons[I_USB].flags = bt_flags_option();
-    icons[I_DEFAULT].flags = bt_flags_action();
-    icons[I_CANCEL].flags = bt_flags_action();
-    icons[I_SET].flags = bt_flags_action();
-    window = bt_window_create("Bluetooth configuration", WINDOW_WIDTH,
+    window = bt_window_create("Bluetooth settings", WINDOW_WIDTH,
                               WINDOW_HEIGHT, icons, I_COUNT, 1);
 }
 
@@ -82,7 +83,8 @@ static void show(const bt_settings *settings, int start_with_desktop,
     bt_icon_set_text(window, I_ADDRESS, settings->address);
     bt_icon_set_text(window, I_ADDRESS_HINT,
                      settings->name[0] ? settings->name :
-                     settings->address[0] ? "" : "(none chosen)");
+                     settings->address[0] ? "" :
+                     "None yet: connect a speaker in the Devices window");
     bt_icon_set_text(window, I_PIN, settings->pin);
     bt_icon_set_selected(window, I_SOUND, settings->system_sound);
     bt_icon_set_selected(window, I_START, start_with_desktop);

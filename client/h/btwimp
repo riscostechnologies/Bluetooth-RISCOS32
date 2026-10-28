@@ -35,6 +35,7 @@
 
 #define ICON_SELECTED (1u << 21)
 #define ICON_SHADED (1u << 22)
+#define ICON_DELETED (1u << 23)
 
 typedef struct bt_icon_spec
 {
@@ -70,6 +71,9 @@ void bt_icon_set_text(int window, int icon, const char *text);
 int bt_icon_selected(int window, int icon);
 void bt_icon_set_selected(int window, int icon, int selected);
 void bt_icon_set_shaded(int window, int icon, int shaded);
+/* Shown or hidden (the deleted flag), and the text colour (0-15). */
+void bt_icon_set_visible(int window, int icon, int visible);
+void bt_icon_set_fg(int window, int icon, int colour);
 void bt_icon_redraw(int window, int icon);
 void bt_caret_to(int window, int icon);
 

@@ -47,7 +47,7 @@
 
 #define MAX_DEVICES 32
 #define ENTRY_BYTES 96
-#define LIST_ROWS 14
+#define LIST_ROWS 10
 #define KEYS_BYTES 4096
 
 typedef struct device
@@ -56,11 +56,12 @@ typedef struct device
     unsigned int flags;
     int rssi, address_type;
     int link_state, profile_state, security;
+    int battery;                  /* per cent, or 255 when unknown */
     char name[64];
 } device;
 
 static device devices[MAX_DEVICES];
-static int device_count, row_device[LIST_ROWS];
+static int device_count;
 static unsigned int core_state, core_error, last_generation = 0xffffffffu;
 static unsigned int passkey_generation, keys_generation = 0xffffffffu;
 static unsigned int last_problem, shown_problem;
@@ -76,15 +77,19 @@ static int boot_tries, boot_retry_at;
 static char problem_note[100];
 static int problem_note_until;
 static int start_pending;   /* started, not yet seen READY or failed */
-static unsigned char selected_address[6];
-static int have_selection;
 static char status_line[80] = "Starting";
 static bt_settings settings;
 
 enum { M_STATUS, M_INFO, M_DEVICES, M_CONNECT, M_DISCONNECT, M_CONFIGURE,
        M_HELP, M_QUIT, M_COUNT };
-enum { D_STATUS, D_ROW0, D_SCAN = D_ROW0 + LIST_ROWS, D_FORGET,
-       D_DISCONNECT, D_CONNECT, D_COUNT };
+/* The Devices window: a header (logo, title, status, Scan), an empty-state
+ * message, a card for each device (round badge, name, details, state, and
+ * the button that does the obvious thing), and a footer. */
+enum { D_LOGO, D_TITLE, D_STATUS, D_SCAN, D_EMPTY, D_HINT, D_HELP,
+       D_SETTINGS, D_TIP, D_ROW0 };
+enum { R_CARD, R_BADGE, R_NAME, R_DETAIL, R_STATE, R_ACTION, ROW_ICONS };
+#define D_COUNT (D_ROW0 + LIST_ROWS * ROW_ICONS)
+#define ROW_ICON(row, part) (D_ROW0 + (row) * ROW_ICONS + (part))
 enum { P_TEXT, P_NO, P_YES, P_COUNT };
 
 static _kernel_oserror *call(int number, _kernel_swi_regs *regs)
@@ -333,6 +338,7 @@ static void read_devices(void)
         d->link_state = e[13];
         d->profile_state = e[14];
         d->security = e[15];
+        d->battery = e[82];
         /* Keep a good name if the module has not got one this time. */
         if (e[16] != 0)
         {
@@ -841,98 +847,221 @@ static void create_info_window(void)
                                    (int)(sizeof(copy) / sizeof(copy[0])), 0);
 }
 
-#define DEVICES_WIDTH 1300
-#define ROW_HEIGHT 48
-#define LIST_TOP -72
+#define DEVICES_WIDTH 1000
+#define ROW_HEIGHT 96
+#define LIST_TOP -150
+#define COL_GREY 5
+#define COL_GREEN 13
+#define COL_ORANGE 14
+
+/* Which badge a device wears. */
+static const char *badge_kind(const device *d)
+{
+    if (d->flags & DEV_KEYBOARD) return "kbd";
+    if (d->flags & DEV_MOUSE) return "mouse";
+    if (d->flags & DEV_HID) return "pad";
+    if ((d->flags & DEV_HANDSFREE) && !(d->flags & DEV_AUDIO_SINK)) return "hdst";
+    if (d->flags & DEV_AUDIO_SINK) return "spk";
+    return "other";
+}
+
+/* The sprite validation strings the badge icons point at, rewritten in
+ * place when a device's kind or state changes. */
+static char row_sprite[LIST_ROWS][20];
+static int row_device[LIST_ROWS];
+
+/* What each row shows now, so the Wimp is only touched when it changes. */
+static struct row_shown
+{
+    char name[64], detail[96], state[24], action[24], badge[20];
+    int fg, shaded, visible;
+} shown[LIST_ROWS];
+static char shown_status[80], shown_scan[24], shown_hint[100];
+static int shown_empty = -1;
 
 static void create_devices_window(void)
 {
-    bt_icon_spec icons[D_COUNT];
-    int row, list_bottom = LIST_TOP - LIST_ROWS * ROW_HEIGHT;
-    int height = -list_bottom + 100;
-    unsigned int row_flags = 0x1u | 0x4u | 0x10u | 0x20u | 0x100u |
-                             (11u << 12) | (1u << 16) | (7u << 24);
+    static bt_icon_spec icons[D_COUNT];
+    const unsigned int on_white = (0x1u | 0x10u | 0x100u | (7u << 24) | (0u << 28));
+    const unsigned int grey_text = (bt_flags_label() & ~(15u << 24)) | (COL_GREY << 24);
+    int row, bottom = LIST_TOP - LIST_ROWS * ROW_HEIGHT;
+    int height = -bottom + 120;
     memset(icons, 0, sizeof(icons));
-    icons[D_STATUS] = (bt_icon_spec){ 16, -60, DEVICES_WIDTH - 16, -12,
-        bt_flags_label(), "", NULL, 80 };
+    icons[D_LOGO] = (bt_icon_spec){ 24, -124, 104, -44, bt_flags_label() | 0x2u,
+        "", "Sbt_on", 4 };
+    icons[D_TITLE] = (bt_icon_spec){ 124, -80, 700, -28, bt_flags_label(),
+        "Bluetooth", NULL, 24 };
+    icons[D_STATUS] = (bt_icon_spec){ 124, -128, 740, -84, grey_text, "", NULL, 80 };
+    icons[D_SCAN] = (bt_icon_spec){ 764, -118, 984, -50, bt_flags_action(),
+        "Scan for devices", "R5,3", 24 };
+    icons[D_EMPTY] = (bt_icon_spec){ 24, -330, 976, -270,
+        bt_flags_label() | 0x8u, "No devices yet", NULL, 40 };
+    icons[D_HINT] = (bt_icon_spec){ 24, -400, 976, -340, grey_text | 0x8u, "",
+        NULL, 100 };
+    icons[D_SETTINGS] = (bt_icon_spec){ 16, bottom - 90, 236, bottom - 30,
+        bt_flags_action(), "Settings...", "R5,3", 0 };
+    icons[D_HELP] = (bt_icon_spec){ 252, bottom - 90, 432, bottom - 30,
+        bt_flags_action(), "Help", "R5,3", 0 };
+    icons[D_TIP] = (bt_icon_spec){ 456, bottom - 90, 984, bottom - 30, grey_text,
+        "Right-click a device for more options", NULL, 48 };
     for (row = 0; row < LIST_ROWS; ++row)
-        icons[D_ROW0 + row] = (bt_icon_spec){
-            16, LIST_TOP - (row + 1) * ROW_HEIGHT + 4,
-            DEVICES_WIDTH - 16, LIST_TOP - row * ROW_HEIGHT,
-            row_flags | ICON_SHADED, "", NULL, 128 };
-    icons[D_SCAN] = (bt_icon_spec){ 16, list_bottom - 76, 216,
-        list_bottom - 16, bt_flags_action(), "Scan", "R5,3", 0 };
-    icons[D_FORGET] = (bt_icon_spec){ 228, list_bottom - 76, 428,
-        list_bottom - 16, bt_flags_action(), "Forget", "R5,3", 0 };
-    icons[D_DISCONNECT] = (bt_icon_spec){ 800, list_bottom - 76, 1060,
-        list_bottom - 16, bt_flags_action(), "Disconnect", "R5,3", 0 };
-    icons[D_CONNECT] = (bt_icon_spec){ 1072, list_bottom - 80,
-        DEVICES_WIDTH - 16, list_bottom - 12, bt_flags_action(), "Connect",
-        "R6,3", 0 };
-    devices_window = bt_window_create("Bluetooth devices", DEVICES_WIDTH,
-                                      height, icons, D_COUNT, 1);
+    {
+        int top = LIST_TOP - row * ROW_HEIGHT;
+        int y0 = top - ROW_HEIGHT + 8, y1 = top - 4;
+        const unsigned int hidden = ICON_DELETED;
+        strcpy(row_sprite[row], "Sdv_other_g");
+        icons[ROW_ICON(row, R_CARD)] = (bt_icon_spec){ 16, y0,
+            DEVICES_WIDTH - 16, y1,
+            0x20u | (3u << 12) | (7u << 24) | hidden, "", NULL, 1 };
+        icons[ROW_ICON(row, R_BADGE)] = (bt_icon_spec){ 28, y0 + 2, 108, y0 + 82,
+            on_white | 0x2u | hidden, "", row_sprite[row], 4 };
+        icons[ROW_ICON(row, R_NAME)] = (bt_icon_spec){ 124, y0 + 44, 640, y1 - 2,
+            on_white | hidden, "", NULL, 64 };
+        icons[ROW_ICON(row, R_DETAIL)] = (bt_icon_spec){ 124, y0 + 6, 640, y0 + 44,
+            (on_white & ~(15u << 24)) | (COL_GREY << 24) | hidden, "", NULL, 96 };
+        icons[ROW_ICON(row, R_STATE)] = (bt_icon_spec){ 640, y0 + 4, 820, y1 - 4,
+            on_white | 0x200u | hidden, "", NULL, 24 };
+        icons[ROW_ICON(row, R_ACTION)] = (bt_icon_spec){ 836, y0 + 18, 984, y1 - 18,
+            bt_flags_action() | hidden, "", "R5,3", 24 };
+    }
+    devices_window = bt_window_create("Bluetooth", DEVICES_WIDTH, height, icons,
+                                      D_COUNT, 1);
 }
 
-static int selected_device(void)
+static const char *state_label(const device *d, int *colour)
 {
-    int row;
-    for (row = 0; row < LIST_ROWS; ++row)
-        if (row_device[row] >= 0 &&
-            bt_icon_selected(devices_window, D_ROW0 + row))
-            return row_device[row];
-    return -1;
+    const char *s = state_text(d);
+    *colour = COL_GREY;
+    if (strcmp(s, "connected") == 0) { *colour = COL_GREEN; return "Connected"; }
+    if (strcmp(s, "playing") == 0) { *colour = COL_GREEN; return "Playing"; }
+    if (strcmp(s, "paused") == 0) { *colour = COL_GREEN; return "Paused"; }
+    if (strcmp(s, "setting up") == 0) { *colour = COL_ORANGE; return "Setting up"; }
+    if (strcmp(s, "connecting") == 0) { *colour = COL_ORANGE; return "Connecting"; }
+    if (strcmp(s, "disconnecting") == 0) { *colour = COL_ORANGE; return "Disconnecting"; }
+    if (strcmp(s, "paired") == 0) return "Paired";
+    return "Not paired";
+}
+
+/* Connected devices first, then paired ones, then what the scan found. */
+static int list_order(int *order)
+{
+    int pass, i, n = 0;
+    for (pass = 0; pass < 3; ++pass)
+        for (i = 0; i < device_count; ++i)
+        {
+            unsigned int f = devices[i].flags;
+            int group = devices[i].link_state != 0 ? 0 :
+                        (f & DEV_PAIRED) ? 1 : 2;
+            if (group == pass) order[n++] = i;
+        }
+    return n;
+}
+
+static void put_text(int icon, char *shown_text, size_t size, const char *text)
+{
+    if (strncmp(shown_text, text, size - 1) == 0 &&
+        strlen(text) < size) return;
+    strncpy(shown_text, text, size - 1);
+    shown_text[size - 1] = '\0';
+    bt_icon_set_text(devices_window, icon, text);
 }
 
 static void refresh_devices_window(void)
 {
-    char text[128], name[20], address[18];
-    int row, chosen;
+    int order[MAX_DEVICES], n, row, show_empty;
+    char text[100];
     if (devices_window == 0) return;
-    bt_icon_set_text(devices_window, D_STATUS, status_line);
-    chosen = selected_device();
-    if (chosen >= 0)
+    put_text(D_STATUS, shown_status, sizeof(shown_status), status_line);
+    put_text(D_SCAN, shown_scan, sizeof(shown_scan),
+             scanning ? "Scanning..." : "Scan for devices");
+    bt_icon_set_shaded(devices_window, D_SCAN, scanning);
+    n = list_order(order);
+    show_empty = n == 0;
+    if (show_empty != shown_empty)
     {
-        memcpy(selected_address, devices[chosen].address, 6);
-        have_selection = 1;
+        shown_empty = show_empty;
+        bt_icon_set_visible(devices_window, D_EMPTY, show_empty);
+        bt_icon_set_visible(devices_window, D_HINT, show_empty);
     }
+    if (show_empty)
+        put_text(D_HINT, shown_hint, sizeof(shown_hint),
+                 scanning ? "Searching for devices..." :
+                 "Put your speaker, mouse or keyboard in pairing mode, "
+                 "then click Scan for devices.");
     for (row = 0; row < LIST_ROWS; ++row)
     {
-        device *d;
-        if (row >= device_count)
+        struct row_shown *w = shown + row;
+        int visible = row < n;
+        if (!visible)
         {
             row_device[row] = -1;
-            bt_icon_set_text(devices_window, D_ROW0 + row, "");
-            bt_icon_set_selected(devices_window, D_ROW0 + row, 0);
-            bt_icon_set_shaded(devices_window, D_ROW0 + row, 1);
+            if (w->visible)
+            {
+                int part;
+                for (part = 0; part < ROW_ICONS; ++part)
+                    bt_icon_set_visible(devices_window, ROW_ICON(row, part), 0);
+                w->visible = 0;
+            }
             continue;
         }
-        d = devices + row;
-        row_device[row] = row;
-        format_address(d->address, address);
-        snprintf(text, sizeof(text), "%.36s   %s%s   %s   %s",
-                 device_name(d, name), (d->flags & DEV_LE) ? "LE " : "",
-                 type_text(d->flags), address, state_text(d));
-        bt_icon_set_text(devices_window, D_ROW0 + row, text);
-        bt_icon_set_shaded(devices_window, D_ROW0 + row, 0);
-        bt_icon_set_selected(devices_window, D_ROW0 + row,
-                             have_selection &&
-                             memcmp(selected_address, d->address, 6) == 0);
-    }
-    bt_icon_set_shaded(devices_window, D_SCAN, scanning);
-    /* Only the buttons that would do something are live. */
-    chosen = have_selection ? -1 : chosen;
-    for (row = 0; row < device_count; ++row)
-        if (have_selection &&
-            memcmp(selected_address, devices[row].address, 6) == 0)
-            chosen = row;
-    {
-        int connected = chosen >= 0 && devices[chosen].link_state != 0;
-        int paired = chosen >= 0 &&
-                     (devices[chosen].flags & DEV_PAIRED) != 0;
-        bt_icon_set_shaded(devices_window, D_CONNECT,
-                           chosen < 0 || connected || core_state != CORE_READY);
-        bt_icon_set_shaded(devices_window, D_DISCONNECT, !connected);
-        bt_icon_set_shaded(devices_window, D_FORGET, !paired);
+        {
+            const device *d = devices + order[row];
+            char fallback[20], address[18], badge[20], action[24];
+            const char *type = type_text(d->flags), *label;
+            int colour, busy = d->link_state == 1 || d->link_state == 3;
+            int connected = d->link_state == 2;
+            row_device[row] = order[row];
+            if (!w->visible)
+            {
+                int part;
+                for (part = 0; part < ROW_ICONS; ++part)
+                    bt_icon_set_visible(devices_window, ROW_ICON(row, part), 1);
+                w->visible = 1;
+                w->name[0] = w->detail[0] = w->state[0] = w->action[0] = '\0';
+                w->badge[0] = '\0';
+                w->fg = -1;
+                w->shaded = -1;
+            }
+            snprintf(badge, sizeof(badge), "Sdv_%s_%c", badge_kind(d),
+                     connected ? 'b' : 'g');
+            if (strcmp(badge, w->badge) != 0)
+            {
+                strcpy(w->badge, badge);
+                strcpy(row_sprite[row], badge);
+                bt_icon_redraw(devices_window, ROW_ICON(row, R_BADGE));
+            }
+            put_text(ROW_ICON(row, R_NAME), w->name, sizeof(w->name),
+                     device_name(d, fallback));
+            format_address(d->address, address);
+            snprintf(text, sizeof(text), "%c%s%s   %s", type[0] - 32 * (type[0] >= 'a'),
+                     type + 1, (d->flags & DEV_LE) ? ", Low Energy" : "",
+                     address);
+            if (d->battery <= 100)
+            {
+                size_t len = strlen(text);
+                snprintf(text + len, sizeof(text) - len, "   Battery %d%%",
+                         d->battery);
+            }
+            put_text(ROW_ICON(row, R_DETAIL), w->detail, sizeof(w->detail), text);
+            label = state_label(d, &colour);
+            put_text(ROW_ICON(row, R_STATE), w->state, sizeof(w->state), label);
+            if (w->fg != colour)
+            {
+                w->fg = colour;
+                bt_icon_set_fg(devices_window, ROW_ICON(row, R_STATE), colour);
+            }
+            strcpy(action, connected ? "Disconnect" : busy ? "Please wait" :
+                   (d->flags & DEV_PAIRED) ? "Connect" : "Pair");
+            put_text(ROW_ICON(row, R_ACTION), w->action, sizeof(w->action), action);
+            {
+                int shade = busy || (!connected && core_state != CORE_READY);
+                if (w->shaded != shade)
+                {
+                    w->shaded = shade;
+                    bt_icon_set_shaded(devices_window, ROW_ICON(row, R_ACTION), shade);
+                }
+            }
+        }
     }
 }
 
@@ -962,38 +1091,98 @@ static void open_devices(void)
     if (core_state == CORE_OFF) (void)start_core(1);
 }
 
+static int *current_menu;
+static void open_configure(void);
+
+/* The one obvious thing for a device: connect it, pairing first if it is
+ * new, or let it go. */
+static void primary_action(const device *d)
+{
+    if (d->link_state == 2) disconnect_device(d->address);
+    else if (d->link_state == 0) connect_device(d, 0);
+}
+
+static int menu_context, menu_device = -1;     /* 1: a device's menu */
+
+static void device_menu(int index, const int *click)
+{
+    static char title[40], first[16];
+    bt_menu_item items[2];
+    const device *d = devices + index;
+    char fallback[20];
+    snprintf(title, sizeof(title), "%.30s", device_name(d, fallback));
+    strcpy(first, d->link_state == 2 ? "Disconnect" :
+                  (d->flags & DEV_PAIRED) ? "Connect" : "Pair");
+    memset(items, 0, sizeof(items));
+    items[0].text = first;
+    items[0].shaded = d->link_state == 1 || d->link_state == 3 ||
+                      core_state != CORE_READY;
+    items[1].text = "Forget";
+    items[1].shaded = !(d->flags & DEV_PAIRED);
+    menu_context = 1;
+    menu_device = index;
+    current_menu = bt_menu_build(title, items, 2);
+    bt_menu_open(current_menu, click[0] - 64, click[1]);
+}
+
+static void device_menu_choice(int item)
+{
+    int index = menu_device;
+    menu_context = 0;
+    menu_device = -1;
+    if (index < 0 || index >= device_count) return;
+    if (item == 0) primary_action(devices + index);
+    else if (item == 1 &&
+             bt_ask("Forget this device? It will need to pair again.",
+                    "Forget,Keep") == 0)
+        forget_device(devices[index].address);
+    last_generation = 0xffffffffu;
+    poll_core();
+}
+
+/* Which list row a click was on, from the pointer position, so that a click
+ * on a plain text label counts as well as one on a button: -1 for none. */
+static int row_at(const int *click)
+{
+    _kernel_swi_regs regs;
+    int state[9], work_y, row;
+    state[0] = devices_window;
+    memset(&regs, 0, sizeof(regs));
+    regs.r[1] = (int)state;
+    if (_kernel_swi(Wimp_GetWindowState, &regs, &regs) != NULL) return -1;
+    work_y = click[1] - (state[4] - state[6]);
+    if (work_y > LIST_TOP) return -1;
+    row = (LIST_TOP - work_y) / ROW_HEIGHT;
+    return row < LIST_ROWS ? row : -1;
+}
+
 static void on_devices_click(const int *block)
 {
-    int icon = block[4], chosen = selected_device();
-    switch (icon)
+    int icon = block[4];
+    if (block[2] == BUTTON_MENU)
     {
-    case D_SCAN:
+        int row = row_at(block);
+        if (row >= 0 && row_device[row] >= 0) device_menu(row_device[row], block);
+        return;
+    }
+    if (icon == D_SCAN)
+    {
         if (core_state == CORE_READY) start_scan();
         else
         {
             scan_when_ready = 1;
             if (core_state == CORE_OFF) (void)start_core(1);
         }
-        break;
-    case D_CONNECT:
-        if (chosen < 0)
-        {
-            strcpy(problem_note, "Choose a device in the list first");
-            problem_note_until = bt_monotonic() + 500;
-        }
-        else connect_device(&devices[chosen], 0);
-        break;
-    case D_DISCONNECT:
-        if (chosen >= 0) disconnect_device(devices[chosen].address);
-        break;
-    case D_FORGET:
-        if (chosen >= 0 &&
-            bt_ask("Forget this device? It will need to pair again.",
-                   "Forget,Keep") == 0)
-            forget_device(devices[chosen].address);
-        break;
-    default:
-        break;
+    }
+    else if (icon == D_SETTINGS) open_configure();
+    else if (icon == D_HELP) bt_start_task("Filer_Run <Bluetooth$Dir>.!Help");
+    else if (icon >= D_ROW0)
+    {
+        int row = (icon - D_ROW0) / ROW_ICONS, part = (icon - D_ROW0) % ROW_ICONS;
+        int index = row < LIST_ROWS ? row_device[row] : -1;
+        if (index < 0) return;
+        if (block[2] == BUTTON_MENU) device_menu(index, block);
+        else if (part == R_ACTION) primary_action(devices + index);
     }
     last_generation = 0xffffffffu;
     poll_core();
@@ -1035,6 +1224,7 @@ static void open_menu(int x)
     items[M_HELP].text = "Help...";
     items[M_QUIT].text = "Quit";
     refresh_info();
+    menu_context = 0;
     current_menu = bt_menu_build("Bluetooth", items, M_COUNT);
     bt_menu_open(current_menu, x - 64, 96 + 44 * M_COUNT);
 }
@@ -1056,6 +1246,11 @@ static void on_menu(const int *block)
 {
     _kernel_swi_regs regs;
     int pointer[5], index;
+    if (menu_context == 1)
+    {
+        device_menu_choice(block[0]);
+        return;
+    }
     switch (block[0])
     {
     case M_DEVICES: open_devices(); break;
@@ -1103,13 +1298,14 @@ static void on_help(int *message)
     else if (devices_window != 0 && message[8] == devices_window)
     {
         int icon = message[9];
+        int part = icon >= D_ROW0 ? (icon - D_ROW0) % ROW_ICONS : -1;
         const char *text =
             icon == D_SCAN ? "Click to look for devices for 10 seconds. Put the device in pairing mode first." :
-            icon == D_CONNECT ? "Click to pair with the chosen device and connect it." :
-            icon == D_DISCONNECT ? "Click to disconnect the chosen device. It is not brought back until you connect it again." :
-            icon == D_FORGET ? "Click to remove the chosen device's pairing. It will have to pair again." :
-            icon >= D_ROW0 && icon < D_ROW0 + LIST_ROWS ? "Click to choose this device." :
-            "This window lists Bluetooth devices: paired ones first, then those found by Scan.";
+            icon == D_SETTINGS ? "Click to open the Bluetooth settings." :
+            icon == D_HELP ? "Click to read the help." :
+            part == R_ACTION ? "Click to connect or disconnect this device. A new device is paired first." :
+            part >= 0 ? "A Bluetooth device. Click MENU on it to disconnect it or make it forget its pairing." :
+            "Bluetooth devices: those connected first, then paired ones, then what the scan found.";
         snprintf(reply_text, sizeof(reply_text), "%s", text);
     }
     else if (pair_window != 0 && message[8] == pair_window)
