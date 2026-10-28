@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-2-Clause
- * Copyright (c) 2026 RISC OS Technologies */
+ * Copyright (C) RISC OS Technologies 2026 */
 #define _POSIX_C_SOURCE 200809L
 /*******************************************************************
  * File:        btbar
@@ -18,8 +18,8 @@
 #include <string.h>
 
 #define TASK_NAME "Bluetooth"
-#define VERSION_TEXT "0.98 (28-Oct-26)"
-#define VOICE_VERSION 98
+#define VERSION_TEXT "0.99 (28-Oct-26)"
+#define VOICE_VERSION 99
 
 #define SWI_CORE 0x000d7bc8
 #define SWI_SCAN 0x000d7bc9
@@ -414,7 +414,15 @@ static const char *device_name(const device *d, char *fallback)
     parse_saved(saved);
     if (settings.name[0] != '\0' && memcmp(saved, d->address, 6) == 0)
         return settings.name;
-    format_address(d->address, fallback);
+    /* Never named: say what it is, not its address (the address is on the
+     * detail line, where it tells two unnamed devices apart). */
+    strcpy(fallback, (d->flags & DEV_KEYBOARD) ? "Unnamed keyboard" :
+                     (d->flags & DEV_MOUSE) ? "Unnamed mouse" :
+                     (d->flags & DEV_HID) ? "Unnamed controller" :
+                     ((d->flags & DEV_HANDSFREE) &&
+                      !(d->flags & DEV_AUDIO_SINK)) ? "Unnamed headset" :
+                     (d->flags & DEV_AUDIO_SINK) ? "Unnamed speaker" :
+                     "Unnamed device");
     return fallback;
 }
 
@@ -828,8 +836,8 @@ static void create_info_window(void)
         { 190, -56, 700, -12, 0, "Bluetooth", NULL, 0 },
         { 16, -104, 180, -60, 0, "Purpose", NULL, 0 },
         { 190, -104, 700, -60, 0, "Speakers, keyboards and mice", NULL, 0 },
-        { 16, -152, 180, -108, 0, "Author", NULL, 0 },
-        { 190, -152, 700, -108, 0, "BluetoothVoice project", NULL, 0 },
+        { 16, -152, 180, -108, 0, "Copyright", NULL, 0 },
+        { 190, -152, 1000, -108, 0, "(C) RISC OS Technologies 2026", NULL, 0 },
         { 16, -200, 180, -156, 0, "Version", NULL, 0 },
         { 190, -200, 700, -156, 0, VERSION_TEXT, NULL, 0 },
         { 16, -248, 180, -204, 0, "Status", NULL, 0 },
@@ -847,7 +855,7 @@ static void create_info_window(void)
                                    (int)(sizeof(copy) / sizeof(copy[0])), 0);
 }
 
-#define DEVICES_WIDTH 1000
+#define DEVICES_WIDTH 1200
 #define ROW_HEIGHT 96
 #define LIST_TOP -150
 #define COL_GREY 5
@@ -889,20 +897,20 @@ static void create_devices_window(void)
     memset(icons, 0, sizeof(icons));
     icons[D_LOGO] = (bt_icon_spec){ 24, -124, 104, -44, bt_flags_label() | 0x2u,
         "", "Sbt_on", 4 };
-    icons[D_TITLE] = (bt_icon_spec){ 124, -80, 700, -28, bt_flags_label(),
+    icons[D_TITLE] = (bt_icon_spec){ 124, -80, DEVICES_WIDTH - 300, -28, bt_flags_label(),
         "Bluetooth", NULL, 24 };
-    icons[D_STATUS] = (bt_icon_spec){ 124, -128, 740, -84, grey_text, "", NULL, 80 };
-    icons[D_SCAN] = (bt_icon_spec){ 764, -118, 984, -50, bt_flags_action(),
+    icons[D_STATUS] = (bt_icon_spec){ 124, -128, DEVICES_WIDTH - 260, -84, grey_text, "", NULL, 80 };
+    icons[D_SCAN] = (bt_icon_spec){ DEVICES_WIDTH - 236, -118, DEVICES_WIDTH - 16, -50, bt_flags_action(),
         "Scan for devices", "R5,3", 24 };
-    icons[D_EMPTY] = (bt_icon_spec){ 24, -330, 976, -270,
+    icons[D_EMPTY] = (bt_icon_spec){ 24, -330, DEVICES_WIDTH - 24, -270,
         bt_flags_label() | 0x8u, "No devices yet", NULL, 40 };
-    icons[D_HINT] = (bt_icon_spec){ 24, -400, 976, -340, grey_text | 0x8u, "",
+    icons[D_HINT] = (bt_icon_spec){ 24, -400, DEVICES_WIDTH - 24, -340, grey_text | 0x8u, "",
         NULL, 100 };
     icons[D_SETTINGS] = (bt_icon_spec){ 16, bottom - 90, 236, bottom - 30,
         bt_flags_action(), "Settings...", "R5,3", 0 };
     icons[D_HELP] = (bt_icon_spec){ 252, bottom - 90, 432, bottom - 30,
         bt_flags_action(), "Help", "R5,3", 0 };
-    icons[D_TIP] = (bt_icon_spec){ 456, bottom - 90, 984, bottom - 30, grey_text,
+    icons[D_TIP] = (bt_icon_spec){ 456, bottom - 90, DEVICES_WIDTH - 16, bottom - 30, grey_text,
         "Right-click a device for more options", NULL, 48 };
     for (row = 0; row < LIST_ROWS; ++row)
     {
@@ -915,13 +923,13 @@ static void create_devices_window(void)
             0x20u | (3u << 12) | (7u << 24) | hidden, "", NULL, 1 };
         icons[ROW_ICON(row, R_BADGE)] = (bt_icon_spec){ 28, y0 + 2, 108, y0 + 82,
             on_white | 0x2u | hidden, "", row_sprite[row], 4 };
-        icons[ROW_ICON(row, R_NAME)] = (bt_icon_spec){ 124, y0 + 44, 640, y1 - 2,
+        icons[ROW_ICON(row, R_NAME)] = (bt_icon_spec){ 124, y0 + 44, DEVICES_WIDTH - 440, y1 - 2,
             on_white | hidden, "", NULL, 64 };
-        icons[ROW_ICON(row, R_DETAIL)] = (bt_icon_spec){ 124, y0 + 6, 640, y0 + 44,
+        icons[ROW_ICON(row, R_DETAIL)] = (bt_icon_spec){ 124, y0 + 6, DEVICES_WIDTH - 440, y0 + 44,
             (on_white & ~(15u << 24)) | (COL_GREY << 24) | hidden, "", NULL, 96 };
-        icons[ROW_ICON(row, R_STATE)] = (bt_icon_spec){ 640, y0 + 4, 820, y1 - 4,
+        icons[ROW_ICON(row, R_STATE)] = (bt_icon_spec){ DEVICES_WIDTH - 440, y0 + 4, DEVICES_WIDTH - 188, y1 - 4,
             on_white | 0x200u | hidden, "", NULL, 24 };
-        icons[ROW_ICON(row, R_ACTION)] = (bt_icon_spec){ 836, y0 + 18, 984, y1 - 18,
+        icons[ROW_ICON(row, R_ACTION)] = (bt_icon_spec){ DEVICES_WIDTH - 172, y0 + 18, DEVICES_WIDTH - 16, y1 - 18,
             bt_flags_action() | hidden, "", "R5,3", 24 };
     }
     devices_window = bt_window_create("Bluetooth", DEVICES_WIDTH, height, icons,
@@ -1036,14 +1044,13 @@ static void refresh_devices_window(void)
             snprintf(text, sizeof(text), "%c%s%s   %s", type[0] - 32 * (type[0] >= 'a'),
                      type + 1, (d->flags & DEV_LE) ? ", Low Energy" : "",
                      address);
-            if (d->battery <= 100)
-            {
-                size_t len = strlen(text);
-                snprintf(text + len, sizeof(text) - len, "   Battery %d%%",
-                         d->battery);
-            }
             put_text(ROW_ICON(row, R_DETAIL), w->detail, sizeof(w->detail), text);
             label = state_label(d, &colour);
+            if (connected && d->battery <= 100)
+            {
+                snprintf(text, sizeof(text), "%s, %d%%", label, d->battery);
+                label = text;
+            }
             put_text(ROW_ICON(row, R_STATE), w->state, sizeof(w->state), label);
             if (w->fg != colour)
             {

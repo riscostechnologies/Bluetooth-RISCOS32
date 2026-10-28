@@ -1,6 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: BSD-2-Clause
-# Copyright (c) 2026 RISC OS Technologies
+# Copyright (C) RISC OS Technologies 2026
 # bv70: the 64-bit protocol core over the 32-bit USB transport.
 set -u
 cd "$(dirname "$0")/.."

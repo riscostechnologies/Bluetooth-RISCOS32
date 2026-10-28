@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-2-Clause
-# Copyright (c) 2026 RISC OS Technologies
+# Copyright (C) RISC OS Technologies 2026
 """Makes Sources/Networking/Bluetooth/test/btcore/lesc_vectors.inc: an LE Secure Connections pairing
 transcript (just works, and passkey entry) worked out with OpenSSL through
 Python's `cryptography` package, from the formulas in Bluetooth Core Spec

@@ -1,6 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: BSD-2-Clause
-# Copyright (c) 2026 RISC OS Technologies
+# Copyright (C) RISC OS Technologies 2026
 # Build the !Bluetooth desktop package: the icon bar task, the Configure
 # plug-in, their sprites, and the modules they load.  Output:
 #   build/desktop/app          the tree as it is installed

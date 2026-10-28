@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-2-Clause
- * Copyright (c) 2026 RISC OS Technologies */
+ * Copyright (C) RISC OS Technologies 2026 */
 /*
  * Host checks for the SDP server (c/bt_sdp_server.c): the three records it
  * publishes (A2DP Audio Source, AVRCP Controller, AVRCP Target), and the

@@ -37,3 +37,5 @@ Known limits
   Audio uses SBC at a modest bitrate; quality depends on the radio link,
   so keep the adapter clear of the computer (a short USB extension lead
   helps). Headset microphones (HFP) are not supported in this version.
+
+(C) RISC OS Technologies 2026

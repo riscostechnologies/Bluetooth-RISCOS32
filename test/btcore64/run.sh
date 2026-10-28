@@ -1,6 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: BSD-2-Clause
-# Copyright (c) 2026 RISC OS Technologies
+# Copyright (C) RISC OS Technologies 2026
 # The 64-bit core's host suites, built against bv70's sources (port/c), with
 # the 10-line check.c harness.  Run: sh test/btcore64/run.sh
 set -eu

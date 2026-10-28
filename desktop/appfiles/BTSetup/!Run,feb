@@ -1,5 +1,5 @@
 | SPDX-License-Identifier: BSD-2-Clause
-| Copyright (c) 2026 RISC OS Technologies
+| Copyright (C) RISC OS Technologies 2026
 | !Run for the Bluetooth Configure plug-in
 IF "<Choices$Write>" = "" THEN Error No !Boot application has been run.
 Set BTSetup$Dir <Obey$Dir>

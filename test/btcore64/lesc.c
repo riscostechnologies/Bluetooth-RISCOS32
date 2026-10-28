@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-2-Clause
- * Copyright (c) 2026 RISC OS Technologies */
+ * Copyright (C) RISC OS Technologies 2026 */
 /*
  * Host checks for BluetoothVoice's Low Energy input: the real bt_core.c,
  * bt_l2cap.c, bt_le.c, le_crypto.c, p256.c, hid_report.c and hid_input.c

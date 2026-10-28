@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-2-Clause
- * Copyright (c) 2026 RISC OS Technologies */
+ * Copyright (C) RISC OS Technologies 2026 */
 #ifndef CHECK_H
 #define CHECK_H
 #include <stdio.h>

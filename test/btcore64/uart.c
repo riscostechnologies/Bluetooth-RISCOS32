@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-2-Clause
- * Copyright (c) 2026 RISC OS Technologies */
+ * Copyright (C) RISC OS Technologies 2026 */
 /* Host checks for the UART transport's pure half (c/btuartcalc): H4
  * framing, the 16550 divisor, Broadcom's baud command and the .hcd patch
  * file reader. */

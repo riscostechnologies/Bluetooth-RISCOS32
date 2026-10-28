@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-2-Clause
- * Copyright (c) 2026 RISC OS Technologies */
+ * Copyright (C) RISC OS Technologies 2026 */
 /* Shared by the HID checks (hidx.c, a2dp.c): report descriptors written
  * from the USB HID 1.11 item encoding and the Usage Tables, and a HID
  * service record built from the Bluetooth HID Profile 1.1.1 attribute list. */

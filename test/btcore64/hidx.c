@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-2-Clause
- * Copyright (c) 2026 RISC OS Technologies */
+ * Copyright (C) RISC OS Technologies 2026 */
 /*
  * Host checks for what classic HID needs beyond boot reports: the SDP
  * client that fetches a device's record (with continuation), the record's

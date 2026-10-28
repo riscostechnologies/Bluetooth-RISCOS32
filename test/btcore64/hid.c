@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-2-Clause
- * Copyright (c) 2026 RISC OS Technologies */
+ * Copyright (C) RISC OS Technologies 2026 */
 /*
  * Host checks for BluetoothVoice's HID input (modules/network/bluetooth/
  * c/hid_input.c): boot-protocol keyboard and mouse reports as a Bluetooth

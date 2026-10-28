@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-2-Clause
- * Copyright (c) 2026 RISC OS Technologies */
+ * Copyright (C) RISC OS Technologies 2026 */
 /*
  * Host checks for HID report-mode input (modules/network/bluetooth/c/
  * hid_report.c): a report descriptor in the style of a Logitech MX Master

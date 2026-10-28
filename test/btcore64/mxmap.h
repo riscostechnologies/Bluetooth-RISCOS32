@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-2-Clause
- * Copyright (c) 2026 RISC OS Technologies */
+ * Copyright (C) RISC OS Technologies 2026 */
 /* HID report descriptors shared by the report-mode checks (hidmap.c, lesc.c):
  * a mouse in the style of a Logitech MX Master, with vendor-defined HID++
  * reports that must be ignored, and a keyboard. Written from the HID 1.11

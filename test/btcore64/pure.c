@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-2-Clause
- * Copyright (c) 2026 RISC OS Technologies */
+ * Copyright (C) RISC OS Technologies 2026 */
 /*
  * Host checks for the pure protocol halves of BluetoothVoice: HCI inquiry
  * and pairing state machines, L2CAP signalling, channels and dispatch, and

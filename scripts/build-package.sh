@@ -1,6 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: BSD-2-Clause
-# Copyright (c) 2026 RISC OS Technologies
+# Copyright (C) RISC OS Technologies 2026
 # Shipping package: build/package/Bluetooth-<version>.zip, holding
 #   Bluetooth.!Install          the Wimp installer
 #   Bluetooth.Apps.!Bluetooth   the icon bar task and its modules

@@ -1,5 +1,5 @@
 REM SPDX-License-Identifier: BSD-2-Clause
-REM Copyright (c) 2026 RISC OS Technologies
+REM Copyright (C) RISC OS Technologies 2026
 REM >!RunImage  Bluetooth installer
 REM Installs !Bluetooth and its Configure plug-in into !Boot, adds the
 REM PreDesk driver loader and the desktop start entry; or removes them.

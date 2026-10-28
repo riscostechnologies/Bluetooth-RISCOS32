@@ -1,7 +1,7 @@
 # Messages file for Bluetooth configuration
 _TaskName:Bluetooth Setup
 _Purpose:Configuring Bluetooth
-_Author:BluetoothVoice project
+_Author:(C) RISC OS Technologies 2026
 _Version:VERSION
 _ConfigText:Bluetooth
 _ConfigHelp:Click SELECT to open the Bluetooth configuration window.
