@@ -486,32 +486,49 @@ int btv_uart_boot(void)
         u.state = B_REC_SEND;
         return 0;
     case B_REC_SEND:
-    {
-        size_t at = u.patch_at;
-        if (!hcd_next(u.patch, u.patch_bytes, &at, &opcode, &params, &plen))
-        {
-            note_num("patch sent, records", u.records);
-            release_patch();
-            u.since = now;
-            u.state = B_PATCH_END;
-            return 0;
-        }
-        if (!boot_command(opcode, params, plen)) return 0;   /* ring full */
-        u.patch_at = (uint32_t)at;
-        ++u.records;
-        u.state = B_REC_WAIT;
-        return 0;
-    }
     case B_REC_WAIT:
-        if (u.reply_ready)
+    {
+        /* Several records a call: send one, then wait for its reply right
+         * here (22 ms to send 250 bytes at 115200 baud, the reply a
+         * millisecond later), until about 20 ms have passed so that the
+         * desktop still gets its turn.  One record a tick took 75 ms each:
+         * 15 s for the patch. */
+        uint32_t start = now;
+        for (;;)
         {
-            if (u.reply[5] != 0) return boot_fail("patch record refused");
-            u.state = B_REC_SEND;
-            return 0;
+            if (u.state == B_REC_SEND)
+            {
+                size_t at = u.patch_at;
+                if (!hcd_next(u.patch, u.patch_bytes, &at, &opcode, &params, &plen))
+                {
+                    note_num("patch sent, records", u.records);
+                    release_patch();
+                    u.since = now_ms();
+                    u.state = B_PATCH_END;
+                    return 0;
+                }
+                if (!boot_command(opcode, params, plen)) return 0;   /* ring full */
+                u.patch_at = (uint32_t)at;
+                ++u.records;
+                u.state = B_REC_WAIT;
+            }
+            else
+            {
+                uint32_t spins;
+                for (spins = 0; !u.reply_ready && spins < 4000u; ++spins)
+                    service();
+                if (!u.reply_ready)
+                {
+                    if (now_ms() - u.since > 1500u)
+                        return boot_fail("patch record unanswered");
+                    return 0;                        /* the next call */
+                }
+                if (u.reply[5] != 0) return boot_fail("patch record refused");
+                u.state = B_REC_SEND;
+            }
+            if (now_ms() - start >= 20u) return 0;
         }
-        /* The record is 250 bytes at 115200 baud: 22 ms to send. */
-        if (waited > 1500u) return boot_fail("patch record unanswered");
-        return 0;
+    }
     case B_PATCH_END:
         if (waited < 250u) return 0;
         h4_rx_init(&u.parser);
