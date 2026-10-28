@@ -1,7 +1,7 @@
 # Bluetooth for RISC OS (32-bit)
 
 A Bluetooth host stack for 32-bit RISC OS 5 that works through a USB
-Bluetooth adapter. Version 0.97.
+Bluetooth adapter. Version 0.98.
 
 - **Audio:** plays the computer's sound through Bluetooth speakers and
   headphones (A2DP, SBC).
