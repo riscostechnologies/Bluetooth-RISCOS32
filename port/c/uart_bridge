@@ -184,9 +184,9 @@ static int module_present(const char *name)
 int btv_uart_is_open(void) { return u.open; }
 
 /* A Pinebook Pro: an RK3399 (its video driver is loaded) with the SDIO
- * driver the Broadcom module hangs off, both in the ROM. Not WLanB: that
- * only loads when NetManager starts Wi-Fi, and Bluetooth must not need it.
- * Bluetooth$UART set to 0 turns it off. */
+ * driver the Broadcom module hangs off, both in the ROM. Older images expose
+ * the SDIO side as WLanB once Wi-Fi has started, while newer ones use
+ * SDIODriver; accept either form. Bluetooth$UART set to 0 turns it off. */
 int btv_uart_inspect(void)
 {
     char value[8];
@@ -194,7 +194,8 @@ int btv_uart_inspect(void)
     if (kernel_read_var_val("Bluetooth$UART", value, &len) == NULL &&
         len >= 1 && value[0] == '0')
         return 0;
-    return module_present("RK3399Video") && module_present("SDIODriver");
+    return module_present("RK3399Video") &&
+           (module_present("SDIODriver") || module_present("WLanB"));
 }
 
 /* ---- the UART --------------------------------------------------------- */
