@@ -183,8 +183,10 @@ static int module_present(const char *name)
 
 int btv_uart_is_open(void) { return u.open; }
 
-/* A Pinebook Pro: an RK3399 (its video driver is loaded) with the Broadcom
- * Wi-Fi/Bluetooth module (WLanB). Bluetooth$UART set to 0 turns it off. */
+/* A Pinebook Pro: an RK3399 (its video driver is loaded) with the SDIO
+ * driver the Broadcom module hangs off, both in the ROM. Not WLanB: that
+ * only loads when NetManager starts Wi-Fi, and Bluetooth must not need it.
+ * Bluetooth$UART set to 0 turns it off. */
 int btv_uart_inspect(void)
 {
     char value[8];
@@ -192,7 +194,7 @@ int btv_uart_inspect(void)
     if (kernel_read_var_val("Bluetooth$UART", value, &len) == NULL &&
         len >= 1 && value[0] == '0')
         return 0;
-    return module_present("RK3399Video") && module_present("WLanB");
+    return module_present("RK3399Video") && module_present("SDIODriver");
 }
 
 /* ---- the UART --------------------------------------------------------- */
@@ -350,15 +352,20 @@ static int hardware_setup(void)
     p = map(PMUGRF_PHYS);
     if (p == NULL) return 0;
     wr(p, PMUGRF_GPIO0B_IOMUX, 0x000C0000u);
-    /* BT_WAKE (GPIO2 D3) is already high from the boot loader. It is NOT
-     * written here: the GPIO2 output register also holds the NVMe slot's
-     * PCIe reset (GPIO2 D4), and a read-modify-write of it can put the
-     * reset back to a stale value while the NVMe driver is using it. */
+    /* BT_WAKE (GPIO2 D3) must be high or the controller sleeps and stops
+     * answering ("adapter stopped responding"): some boot loaders leave it
+     * low. The GPIO2 output register also holds the NVMe slot's PCIe reset
+     * (GPIO2 D4), so it is written only when BT_WAKE is actually low, and
+     * then in one tight read-modify-write; the common case writes nothing. */
     p = map(GPIO2_PHYS);
     if (p == NULL) return 0;
     d = rd(p, GPIO_DR);
-    if ((d & BT_WAKE) == 0)
-        btv_host_bridge_note("uart:", "BT_WAKE is low (left alone)");
+    if ((d & BT_WAKE) == 0 || (rd(p, GPIO_DDR) & BT_WAKE) == 0)
+    {
+        wr(p, GPIO_DR, rd(p, GPIO_DR) | BT_WAKE);
+        wr(p, GPIO_DDR, rd(p, GPIO_DDR) | BT_WAKE);
+        btv_host_bridge_note("uart:", "BT_WAKE was low: raised");
+    }
     p = map(UART_PHYS);
     if (p == NULL) return 0;
     wr(p, U_IER, 0);

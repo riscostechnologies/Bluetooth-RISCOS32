@@ -18,8 +18,8 @@
 #include <string.h>
 
 #define TASK_NAME "Bluetooth"
-#define VERSION_TEXT "0.96 (27-Oct-26)"
-#define VOICE_VERSION 96
+#define VERSION_TEXT "0.97 (28-Oct-26)"
+#define VOICE_VERSION 97
 
 #define SWI_CORE 0x000d7bc8
 #define SWI_SCAN 0x000d7bc9
