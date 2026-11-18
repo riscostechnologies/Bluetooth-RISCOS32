@@ -3,7 +3,9 @@ Bluetooth for RISC OS
 
 Plays sound through Bluetooth speakers and headphones (A2DP), and works
 with Bluetooth mice and keyboards (classic and Low Energy), through a
-USB Bluetooth adapter, or the Pinebook Pro's own Bluetooth.
+USB Bluetooth adapter, the Pinebook Pro's own Bluetooth, or the built-in
+Bluetooth of a Raspberry Pi 4, Pi 400 or CM4. The Pi radio needs a
+BCM4345C0 patch in !Bluetooth.Firmware; it is not included here.
 
 Icon bar
   SELECT   open the Devices window

@@ -15,10 +15,10 @@
 
 #define Module_Title		"BluetoothVoice"
 #define Module_Help		"BluetoothVoice"
-#define Module_VersionString	"1.01"
-#define Module_VersionNumber	25
+#define Module_VersionString	"1.02"
+#define Module_VersionNumber	26
 #ifndef Module_Date
-#define Module_Date		"20 Oct 2026"
+#define Module_Date		"18 Nov 2026"
 #endif
 
 #ifdef __cplusplus

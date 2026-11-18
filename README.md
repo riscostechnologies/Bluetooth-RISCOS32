@@ -1,7 +1,7 @@
 # Bluetooth for RISC OS (32-bit)
 
 A Bluetooth host stack for 32-bit RISC OS 5 that works through a USB
-Bluetooth adapter. Version 1.01.
+Bluetooth adapter or supported built-in radios. Version 1.02.
 
 - **Audio:** plays the computer's sound through Bluetooth speakers and
   headphones (A2DP, SBC).
@@ -15,6 +15,12 @@ Tested on a Raspberry Pi CM4 under RISC OS 5.31 with a TP-Link UB400
 UB500, are sent Realtek's patch at start-up, as Linux does; the firmware is
 in `desktop/firmware` and is installed in `!Bluetooth.Firmware`. Other RISC OS 5 machines with working USB 2 host drivers,
 such as a Pinebook Pro, should work with a USB adapter.
+
+The Pinebook Pro's built-in BCM4345C5 and the Raspberry Pi 4, Pi 400 and
+CM4's built-in BCM4345C0 are also detected when no USB adapter is present.
+The Pi controller needs a legally obtained `BCM4345C0` HCD patch in
+`!Bluetooth.Firmware`; it is not included in this repository or installer.
+The Pi transport is newly integrated and still needs a hardware smoke test.
 
 The software has three parts:
 

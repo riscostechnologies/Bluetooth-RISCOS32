@@ -1,0 +1,1744 @@
+/* SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 Phoenix RISC OS project. */
+/*******************************************************************
+ * File:     ro5_bridge
+ * Purpose:  The UART backend of Martin's BluetoothVoice host bridge
+ *           (the btv_ro5_* interface of port/h/uart_bridge) for the
+ *           built-in radio of a Raspberry Pi 4 under 32-bit RISC OS 5.
+ *           Compiled in place of his port/c/uart_bridge (which drives the
+ *           Pinebook Pro's radio); nothing else in his tree changes.
+ *
+ * The same job the Phoenix kernel's drivers/bt/bt_uart.c does at boot,
+ * redone as a polled module backend:
+ *
+ *   inspect  RISC OS 5 on a Pi (BCMVideo is there); reads no hardware
+ *   open     maps GPIO, UART0 and the VideoCore mailbox; checks the
+ *            board is a Pi 4 / Pi 400 / CM4; checks UART0 is not the
+ *            serial port; pins 30-33 to UART0 (ALT3); PL011 at 115200,
+ *            8N1, FIFOs, hardware RTS/CTS
+ *   boot     a step at a time: BT_ON off and on (firmware GPIO expander
+ *            pin 0, through the mailbox), HCI Reset, Download Minidriver,
+ *            the .hcd patch record by record (btm_firmware_load), the
+ *            patch's own launch, Reset again, Read Local Version, Read
+ *            BD_ADDR
+ *   submit   the H4 type byte and the packet into the PL011 FIFO
+ *   poll     the PL011 FIFO into a staging ring, through Martin's H4
+ *            framer (btuartcalc), into an event queue and an ACL queue
+ *   cancel, close (UART off, BT_ON low), counts, stats
+ *
+ * Tickets, as in Phoenix's phx_bridge: the top 8 bits hold the transfer
+ * kind and the low 24 a sequence number.  EVENT_IN / ACL_IN tickets claim
+ * "the next packet of that kind"; COMMAND / ACL_OUT are written to the
+ * FIFO before submit returns, so their first poll answers OK.
+ *
+ * Flow control.  When the queues are full the framer stops, the staging
+ * ring fills, this side stops reading the PL011, its receive FIFO fills
+ * and the PL011 drops RTS (RTSEn): the controller holds its data.
+ *
+ * Written in C90 with no inline assembler so that both GCCSDK and the
+ * Norcroft compiler take it.  Device pages from OS_Memory 13 are mapped
+ * uncached and unbuffered, so no barriers are needed between accesses.
+ *
+ * Hardware facts (BCM2711, ARM physical, "low peripheral" mode):
+ *   GPIO   0xFE200000  GPFSEL3 (+0x0C) holds pins 30-39, 3 bits each
+ *   UART0  0xFE201000  PL011, 48 MHz reference clock (firmware default)
+ *   MBOX   0xFE00B880  read +0x00, status +0x18, write +0x20; channel 8
+ *   BT_ON  firmware GPIO expander pin 0 = GPIO 128 (mailbox tags)
+ *   pins   GPIO30 CTS, 31 RTS, 32 TXD, 33 RXD, all UART0 on ALT3
+ *******************************************************************/
+#include "ro5_bridge.h"
+#include "btuartcalc.h"
+#include "host_bridge.h"
+#include "riscos_shim.h"
+#include "kernel.h"
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* ---- SWIs (called through _kernel_swi, which adds the X bit) ---------- */
+#define SWI_OS_Module              0x1E
+#define SWI_OS_ReadVarVal          0x23
+#define SWI_OS_SWINumberFromString 0x39
+#define SWI_OS_ReadMonotonicTime   0x42
+#define SWI_OS_Memory              0x68
+
+/* ---- hardware ---------------------------------------------------------- */
+#define PERI_PHYS     0xFE000000u
+#define GPIO_PHYS     (PERI_PHYS + 0x200000u)
+#define UART_PHYS     (PERI_PHYS + 0x201000u)
+#define MBOX_PAGE     (PERI_PHYS + 0x00B000u)
+#define MBOX_OFFSET   0x880u
+#define PAGE          0x1000u
+#define VC_BUS_ALIAS  0xC0000000u      /* uncached bus alias of ARM memory */
+
+#define GPFSEL1       0x04u            /* pins 10-19 */
+#define GPFSEL3       0x0Cu            /* pins 30-39 */
+#define GPCLR0        0x28u            /* pins 0-31: drive low */
+#define FSEL_IN       0u
+#define FSEL_OUT      1u
+#define FSEL_ALT0     4u
+#define FSEL_ALT3     7u
+
+#define U_DR          0x00u
+#define U_FR          0x18u
+#define U_IBRD        0x24u
+#define U_FBRD        0x28u
+#define U_LCRH        0x2Cu
+#define U_CR          0x30u
+#define U_IMSC        0x38u
+#define U_ICR         0x44u
+#define FR_RXFE       (1u << 4)
+#define FR_TXFF       (1u << 5)
+#define FR_BUSY       (1u << 3)
+#define IM_TX         (1u << 5)        /* U_IMSC transmit interrupt */
+#define DR_ERRORS     0xF00u           /* framing, parity, break, overrun */
+#define DR_OE         (1u << 11)
+#define LCRH_FEN      (1u << 4)
+#define LCRH_8BIT     (3u << 5)
+#define CR_UARTEN     (1u << 0)
+#define CR_TXE        (1u << 8)
+#define CR_RXE        (1u << 9)
+#define CR_RTSEN      (1u << 14)
+#define CR_CTSEN      (1u << 15)
+#define UART_CLOCK    48000000u
+#define LINK_BAUD     115200u
+
+#define MB_READ       0x00u
+#define MB_STATUS     0x18u
+#define MB_WRITE      0x20u
+#define MB_FULL       0x80000000u
+#define MB_EMPTY      0x40000000u
+#define MB_CHANNEL    8u
+#define MB_SPIN       2000000u
+
+#define TAG_BOARD_REVISION  0x00010002u
+#define TAG_SET_GPIO_STATE  0x00038041u
+#define TAG_SET_GPIO_CONFIG 0x00038043u
+#define TAG_GET_GPIO_STATE  0x00030041u
+#define TAG_FIRMWARE_REV    0x00000001u
+#define BT_ON_GPIO          128u
+
+/* ---- queues ------------------------------------------------------------ */
+#define EVENTS        64u
+#define EVENT_BYTES   260u
+#define ACLS          16u
+#define TX_SLOTS      16u
+#define STAGE_BYTES   4096u            /* a power of two */
+#define KIND_SHIFT    24
+#define SEQ_MASK      0xFFFFFFu
+#define TX_RING       8192u            /* a power of two (edition 15) */
+
+#define OP_RESET          0x0C03u
+#define OP_READ_VERSION   0x1001u
+#define OP_READ_BDADDR    0x1009u
+#define REPLY_MS          1000u
+#define PATCH_NAME        "BCM4345C0"  /* the Pi 4 / Pi 400 / CM4 radio */
+
+enum boot_state
+{
+    RB_IDLE, RB_POWER_OFF, RB_POWER_ON, RB_RESET_WAIT, RB_MINI_WAIT,
+    RB_MINI_PAUSE, RB_RECORD_WAIT, RB_LAUNCH_PAUSE, RB_RESET2_WAIT,
+    RB_VERSION_WAIT, RB_ADDRESS_WAIT, RB_BAUD_WAIT, RB_BAUD_SETTLE, RB_BAUD_CHECK,
+    RB_DONE, RB_FAILED
+};
+
+static struct
+{
+    volatile uint8_t *gpio, *uart, *mbox;
+    volatile uint32_t *mbuf;           /* mailbox buffer, logical */
+    uint32_t mbuf_phys;
+    int open, booting;
+
+    /* receive */
+    uint8_t stage[STAGE_BYTES];
+    uint32_t stage_in, stage_out;
+    struct h4_rx framer;
+    uint8_t event[EVENTS][EVENT_BYTES];
+    uint16_t event_len[EVENTS];
+    uint32_t event_in, event_out;
+    uint8_t acl[ACLS][H4_MAX_PACKET];
+    uint16_t acl_len[ACLS];
+    uint32_t acl_in, acl_out;
+
+    /* transmit */
+    struct { uint32_t ticket, bytes, end; } done[TX_SLOTS];
+    uint32_t sequence;
+    uint8_t tx[TX_RING];               /* edition 15: H4 bytes waiting */
+    uint32_t tx_in;
+    volatile uint32_t tx_out;          /* also moved by the interrupt */
+    volatile uint32_t imsc;            /* what U_IMSC holds */
+
+    /* start-up */
+    int state;
+    uint32_t attempts, since;
+    uint16_t awaiting;
+    int reply_ready;
+    uint8_t reply[EVENT_BYTES];
+    uint32_t reply_len;
+    const uint8_t *patch;
+    uint32_t patch_bytes, records;
+    size_t patch_at;
+
+    /* counts */
+    uint32_t rx_bytes, rx_errors, rx_overruns, events_lost, acl_lost;
+    uint32_t tx_bytes, acl_in_count, acl_out_count, tx_busy;
+    uint32_t revision;
+    int power_ok;
+    int power_retry;                   /* the longer power cycle was tried */
+    int pins_saved;                    /* GPIO 14/15 functions kept */
+    uint32_t fsel14, fsel15;
+    /* the receive interrupt (edition 8) */
+    void *pw;                          /* module private word (R12) */
+    int irq_device;                    /* HAL device number, -1 = none */
+    int irq_claimed;                   /* our handler is on its vector */
+    volatile int irq_on;               /* PL011 RX interrupts enabled */
+    volatile uint32_t irq_count, irq_full;
+    int serial_parked;                 /* we made Serial dormant */
+    /* the fast link (edition 14) */
+    uint32_t clock_orig;               /* the UART clock before us, 0 = unknown */
+    int clock_changed;                 /* we set the UART clock */
+    uint32_t link_baud;                /* the speed now */
+    int no_fast;                       /* the fast speed failed: stay at 115200 */
+    int clock_checked;                 /* edition 16: the 48 MHz clock timed */
+    uint32_t fast_tries;               /* edition 17: switches tried this start */
+    uint32_t desktop_ms;               /* edition 17: when the desktop came up, 0 = not yet */
+    int told_waiting;
+} r5;
+
+/* ---- small helpers ----------------------------------------------------- */
+
+static uint32_t rd(volatile uint8_t *base, uint32_t off)
+{
+    return *(volatile uint32_t *)(base + off);
+}
+
+static void wr(volatile uint8_t *base, uint32_t off, uint32_t v)
+{
+    *(volatile uint32_t *)(base + off) = v;
+}
+
+static void note(const char *text)
+{
+    btv_host_bridge_note("ro5:", text);
+}
+
+/* This module is linked without the DDE C library.  Keep the diagnostics
+ * local rather than pulling in sprintf; the bridge uses only these simple
+ * integer and bounded-string forms. */
+static char *ro5_number(char *out, uint32_t value, unsigned int base,
+                        unsigned int width, int zero, int negative)
+{
+    static const char digits[] = "0123456789ABCDEF";
+    char backwards[16];
+    unsigned int used = 0;
+    do
+    {
+        backwards[used++] = digits[value % base];
+        value /= base;
+    } while (value != 0);
+    if (negative) backwards[used++] = '-';
+    while (used < width) { *out++ = zero ? '0' : ' '; --width; }
+    while (used != 0) *out++ = backwards[--used];
+    return out;
+}
+
+static int ro5_sprintf(char *out, const char *format, ...)
+{
+    char *start = out;
+    va_list args;
+    va_start(args, format);
+    while (*format != 0)
+    {
+        unsigned int width = 0, precision = 0;
+        int zero = 0, bounded = 0;
+        if (*format != '%') { *out++ = *format++; continue; }
+        ++format;
+        if (*format == '0') { zero = 1; ++format; }
+        while (*format >= '0' && *format <= '9')
+            width = width * 10u + (unsigned int)(*format++ - '0');
+        if (*format == '.')
+        {
+            ++format;
+            bounded = 1;
+            while (*format >= '0' && *format <= '9')
+                precision = precision * 10u + (unsigned int)(*format++ - '0');
+        }
+        switch (*format++)
+        {
+        case 'u':
+            out = ro5_number(out, va_arg(args, unsigned int), 10u, width, zero, 0);
+            break;
+        case 'd':
+            {
+                int value = va_arg(args, int);
+                uint32_t magnitude = value < 0 ? (uint32_t)(-(value + 1)) + 1u :
+                                                (uint32_t)value;
+                out = ro5_number(out, magnitude, 10u, width, zero, value < 0);
+            }
+            break;
+        case 'X':
+            out = ro5_number(out, va_arg(args, unsigned int), 16u, width, zero, 0);
+            break;
+        case 's':
+            {
+                const char *text = va_arg(args, const char *);
+                if (text == NULL) text = "(null)";
+                while (*text != 0 && (!bounded || precision-- != 0)) *out++ = *text++;
+            }
+            break;
+        case '%':
+            *out++ = '%';
+            break;
+        default:
+            *out++ = '?';
+            break;
+        }
+    }
+    *out = 0;
+    va_end(args);
+    return (int)(out - start);
+}
+
+/* riscos_shim is the module's one X-SWI veneer.  The DDE source used
+ * _kernel_swi, which is not available in a -nostdlib GCCSDK module link. */
+static _kernel_oserror *ro5_swi(uint32_t number, _kernel_swi_regs *in,
+                                _kernel_swi_regs *out)
+{
+    uint32_t regs[8];
+    const struct os_error *error;
+    memcpy(regs, in->r, sizeof regs);
+    error = rs_swi(number, regs);
+    memcpy(out->r, regs, sizeof regs);
+    return (_kernel_oserror *)error;
+}
+
+static uint32_t now_ms(void)
+{
+    _kernel_swi_regs r;
+    memset(&r, 0, sizeof r);
+    if (ro5_swi(SWI_OS_ReadMonotonicTime, &r, &r) != NULL) return 0;
+    return (uint32_t)r.r[0] * 10u;
+}
+
+static int module_present(const char *name)
+{
+    _kernel_swi_regs r;
+    memset(&r, 0, sizeof r);
+    r.r[0] = 18;
+    r.r[1] = (int)name;
+    return ro5_swi(SWI_OS_Module, &r, &r) == NULL;
+}
+
+/* The first character of a system variable, or 0 if it is not set. */
+static char var_first(const char *name)
+{
+    _kernel_swi_regs r;
+    char value[8];
+    memset(&r, 0, sizeof r);
+    r.r[0] = (int)name;
+    r.r[1] = (int)value;
+    r.r[2] = (int)sizeof value - 1;
+    r.r[3] = 0;
+    r.r[4] = 3;                         /* expanded to a string */
+    if (ro5_swi(SWI_OS_ReadVarVal, &r, &r) != NULL || r.r[2] < 1)
+        return 0;
+    return value[0];
+}
+
+/* OS_Memory 13: one device page, uncached and unbuffered, with user
+ * read/write access (bit 17), as Martin's backend asks for. */
+static volatile uint8_t *map_page(uint32_t phys)
+{
+    _kernel_swi_regs r;
+    _kernel_oserror *e;
+    char text[80];
+    memset(&r, 0, sizeof r);
+    r.r[0] = 13 | (1 << 17);
+    r.r[1] = (int)phys;
+    r.r[2] = (int)PAGE;
+    e = ro5_swi(SWI_OS_Memory, &r, &r);
+    if (e != NULL || r.r[3] == 0)
+    {
+        ro5_sprintf(text, "map &%08X failed: %.40s", (unsigned)phys,
+                e != NULL ? e->errmess : "no address");
+        note(text);
+        return NULL;
+    }
+    return (volatile uint8_t *)r.r[3];
+}
+
+/* ---- the VideoCore mailbox (property channel) ------------------------- *
+ * The buffer must be in memory the GPU can reach, 16-byte aligned, with a
+ * known physical address: PCI_RAMAlloc gives exactly that.  Its SWI number
+ * is looked up by name so this file needs no PCI header.               */
+
+static int swi_number(const char *name, int *number)
+{
+    _kernel_swi_regs r;
+    memset(&r, 0, sizeof r);
+    r.r[1] = (int)name;
+    if (ro5_swi(SWI_OS_SWINumberFromString, &r, &r) != NULL) return 0;
+    *number = r.r[0];
+    return 1;
+}
+
+static int mbox_buffer(void)
+{
+    _kernel_swi_regs r;
+    int n;
+    if (r5.mbuf != NULL) return 1;
+    if (!swi_number("PCI_RAMAlloc", &n))
+    {
+        note("no PCI_RAMAlloc: cannot make a mailbox buffer");
+        return 0;
+    }
+    memset(&r, 0, sizeof r);
+    r.r[0] = 256;                       /* bytes */
+    r.r[1] = 16;                        /* alignment */
+    r.r[2] = 0;                         /* no boundary limit */
+    if (ro5_swi(n, &r, &r) != NULL || r.r[0] == 0)
+    {
+        note("PCI_RAMAlloc refused the mailbox buffer");
+        return 0;
+    }
+    r5.mbuf = (volatile uint32_t *)r.r[0];
+    r5.mbuf_phys = (uint32_t)r.r[1];
+    return 1;
+}
+
+static void mbox_buffer_free(void)
+{
+    _kernel_swi_regs r;
+    int n;
+    if (r5.mbuf == NULL) return;
+    if (swi_number("PCI_RAMFree", &n))
+    {
+        memset(&r, 0, sizeof r);
+        r.r[0] = (int)r5.mbuf;
+        (void)ro5_swi(n, &r, &r);
+    }
+    r5.mbuf = NULL;
+    r5.mbuf_phys = 0;
+}
+
+/* IRQ state, from s/ro5_asm (the DDE build) or Martin's riscos_shim. */
+uint32_t os_irqs_off(void);
+void os_irqs_restore(uint32_t old);
+
+/* One mailbox exchange with IRQs off, so that RISC OS's own interrupt-
+ * driven mailbox reader cannot take our reply (first test, 31 Oct: the
+ * reply was missed now and then).  1 if our buffer came back. */
+static int mbox_exchange(uint32_t want)
+{
+    uint32_t spin, word, irqs;
+    int got = 0;
+    irqs = os_irqs_off();
+    for (spin = 0; (rd(r5.mbox, MBOX_OFFSET + MB_STATUS) & MB_FULL) != 0; ++spin)
+        if (spin > MB_SPIN) goto out;
+    wr(r5.mbox, MBOX_OFFSET + MB_WRITE, want);
+    for (spin = 0; spin <= MB_SPIN; ++spin)
+    {
+        if ((rd(r5.mbox, MBOX_OFFSET + MB_STATUS) & MB_EMPTY) != 0) continue;
+        word = rd(r5.mbox, MBOX_OFFSET + MB_READ);
+        if (word == want) { got = 1; break; }   /* ours; others dropped */
+    }
+out:
+    os_irqs_restore(irqs);
+    return got;
+}
+
+/* One property tag: `values` words in, the same words back.  Answers 1
+ * if the firmware answered the tag (its response bit set), 2 if it
+ * processed the message but left the tag's response bit clear (31 Oct:
+ * the GPIO expander tags come back like that on RISC OS 5; Phoenix's
+ * kernel never checked that bit for them and they worked on a CM4), and
+ * 0 if no reply came.  Tried three times. */
+static int mbox_tag(uint32_t tag, uint32_t *values, uint32_t count)
+{
+    volatile uint32_t *m = r5.mbuf;
+    uint32_t i, want, attempt;
+    char text[160];
+    if (r5.mbox == NULL || m == NULL || count > 8) return 0;
+    want = ((r5.mbuf_phys | VC_BUS_ALIAS) & ~0xFu) | MB_CHANNEL;
+    for (attempt = 1; attempt <= 3; ++attempt)
+    {
+        m[0] = (6u + count) * 4u;           /* whole buffer */
+        m[1] = 0;                           /* a request */
+        m[2] = tag;
+        m[3] = count * 4u;                  /* value buffer */
+        m[4] = count * 4u;                  /* request length */
+        for (i = 0; i < count; ++i) m[5 + i] = values[i];
+        m[5 + count] = 0;                   /* end tag */
+        if (!mbox_exchange(want) || m[1] != 0x80000000u) continue;
+        for (i = 0; i < count; ++i) values[i] = m[5 + i];
+        if ((m[4] & 0x80000000u) != 0) return 1;
+        ro5_sprintf(text, "mailbox tag &%08X processed, tag bit clear: len &%08X, values &%08X &%08X",
+                (unsigned)tag, (unsigned)m[4], (unsigned)m[5],
+                (unsigned)(count > 1 ? m[6] : 0u));
+        note(text);
+        return 2;
+    }
+    ro5_sprintf(text, "mailbox tag &%08X: no reply (buffer phys &%08X, word &%08X, code &%08X)",
+            (unsigned)tag, (unsigned)r5.mbuf_phys, (unsigned)want, (unsigned)m[1]);
+    note(text);
+    return 0;
+}
+
+static int bt_on(int on)
+{
+    uint32_t v[6];
+    v[0] = BT_ON_GPIO; v[1] = 1; v[2] = 0; v[3] = 0; v[4] = 0;
+    v[5] = on ? 1u : 0u;
+    (void)mbox_tag(TAG_SET_GPIO_CONFIG, v, 6);  /* output, start level */
+    v[0] = BT_ON_GPIO; v[1] = on ? 1u : 0u;
+    return mbox_tag(TAG_SET_GPIO_STATE, v, 2) != 0;
+}
+
+/* BT_ON as the firmware reads it back (GET_GPIO_STATE), for the notes. */
+static void bt_on_report(const char *when)
+{
+    uint32_t v[2];
+    int r;
+    char text[96];
+    v[0] = BT_ON_GPIO; v[1] = 0xFFu;
+    r = mbox_tag(TAG_GET_GPIO_STATE, v, 2);
+    ro5_sprintf(text, "BT_ON %s: answer %d, status &%X, state &%X", when, r,
+            (unsigned)v[0], (unsigned)v[1]);
+    note(text);
+}
+
+/* ---- GPIO and the PL011 ------------------------------------------------ */
+
+static uint32_t fsel(uint32_t reg_offset, uint32_t pin)
+{
+    return (rd(r5.gpio, reg_offset) >> ((pin % 10u) * 3u)) & 7u;
+}
+
+static void set_fsel(uint32_t pin, uint32_t function)
+{
+    uint32_t off = 4u * (pin / 10u), shift = (pin % 10u) * 3u;
+    uint32_t v = rd(r5.gpio, off);
+    v &= ~(7u << shift);
+    v |= function << shift;
+    wr(r5.gpio, off, v);
+}
+
+/* RISC OS 5 may be using UART0 as its serial port (on GPIO 14/15).  Taking
+ * it over would cut that off, so only with Bluetooth$UARTForce set to 1. */
+static int uart0_busy(void)
+{
+    return (rd(r5.uart, U_CR) & CR_UARTEN) != 0 &&
+           fsel(GPFSEL1, 14) == FSEL_ALT0 && fsel(GPFSEL1, 15) == FSEL_ALT0;
+}
+
+/* The PL011 reference clock as the firmware set it (GET_CLOCK_RATE, clock
+ * 2 = UART).  48 MHz is the default, but config.txt init_uart_clock can
+ * change it, and the divisor must match (fourth RO5 test, 31 Oct: the
+ * radio powered up and never answered). */
+#define TAG_GET_CLOCK_RATE 0x00030002u
+#define CLOCK_UART         2u
+
+static uint32_t uart_clock(void)
+{
+    uint32_t v[2];
+    char text[80];
+    v[0] = CLOCK_UART; v[1] = 0;
+    if (mbox_tag(TAG_GET_CLOCK_RATE, v, 2) != 0 && v[1] >= 1000000u && v[1] <= 200000000u)
+    {
+        ro5_sprintf(text, "UART clock %u Hz (firmware)", (unsigned)v[1]);
+        note(text);
+        return v[1];
+    }
+    ro5_sprintf(text, "UART clock not read (got %u): assuming %u Hz",
+            (unsigned)v[1], (unsigned)UART_CLOCK);
+    note(text);
+    return UART_CLOCK;
+}
+
+/* 4 Nov (edition 14): the link speed once the patch is in.  A2DP needs
+ * far more than 115200 (SBC at good quality is about 330 kbit/s), and the
+ * mouse is smoother.  1.5 Mbaud by default; Bluetooth$UARTBaud gives
+ * another (115200 or less: no switch).  The PL011 clock is 3 MHz on RISC OS
+ * 5, which tops out at 187500, so the UART clock is raised to 48 MHz first
+ * and put back in btv_ro5_close, before Serial comes back. */
+#define FAST_BAUD          1500000u
+#define FAST_CLOCK         48000000u
+#define TAG_SET_CLOCK_RATE 0x00038002u
+#define BCM_OP_UPDATE_BAUD 0xFC18u
+
+static uint32_t fast_baud(void)
+{
+    char v[16];
+    uint32_t n = 0;
+    int i, len = 0;
+    if (r5.no_fast) return LINK_BAUD;
+    {
+        _kernel_swi_regs r;
+        r.r[0] = (int)"Bluetooth$UARTBaud";
+        r.r[1] = (int)v;
+        r.r[2] = (int)sizeof v - 1;
+        r.r[3] = 0;
+        r.r[4] = 0;
+        if (ro5_swi(0x23 /* OS_ReadVarVal; _kernel_swi adds X */, &r, &r) == NULL) len = r.r[2];
+    }
+    if (len <= 0) return FAST_BAUD;
+    for (i = 0; i < len && v[i] >= '0' && v[i] <= '9'; i++) n = n * 10u + (uint32_t)(v[i] - '0');
+    if (n <= LINK_BAUD) return LINK_BAUD;
+    return n > 3000000u ? 3000000u : n;
+}
+
+static uint32_t set_uart_clock(uint32_t hz)
+{
+    uint32_t v[3];
+    v[0] = CLOCK_UART; v[1] = hz; v[2] = 0;
+    if (mbox_tag(TAG_SET_CLOCK_RATE, v, 3) == 0) return 0;
+    return v[1];
+}
+
+/* The PL011 at `baud` from `clock`, flow control as it was. */
+static void pl011_set_baud(uint32_t clock, uint32_t baud)
+{
+    uint32_t ibrd = clock / (16u * baud);
+    uint32_t rem = clock - ibrd * 16u * baud;
+    uint32_t fbrd = (rem * 64u + 8u * baud) / (16u * baud);
+    uint32_t cr = rd(r5.uart, U_CR);
+    if (fbrd > 63u) { fbrd = 0; ibrd++; }
+    while ((rd(r5.uart, U_FR) & FR_BUSY) != 0) {}
+    wr(r5.uart, U_CR, 0);
+    wr(r5.uart, U_LCRH, 0);             /* flushes the FIFOs */
+    wr(r5.uart, U_IBRD, ibrd);
+    wr(r5.uart, U_FBRD, fbrd);
+    wr(r5.uart, U_LCRH, LCRH_FEN | LCRH_8BIT);
+    wr(r5.uart, U_CR, cr);
+}
+
+/* After the controller has agreed: the clock up, the divisor for `baud`.
+ * Answers 0 if the firmware would not set the clock. */
+static int uart_go_fast(uint32_t baud)
+{
+    char text[100];
+    uint32_t got;
+    if (r5.clock_orig == 0) r5.clock_orig = uart_clock();
+    /* edition 17: already raised (clock_check): leave it alone -- asking
+     * the firmware again at this moment may glitch the clock */
+    got = r5.clock_changed ? FAST_CLOCK : set_uart_clock(FAST_CLOCK);
+    if (got < 16u * baud)
+    {
+        ro5_sprintf(text, "UART clock not raised (got %u Hz): staying at %u baud",
+                (unsigned)got, (unsigned)LINK_BAUD);
+        note(text);
+        return 0;
+    }
+    r5.clock_changed = 1;
+    pl011_set_baud(got, baud);
+    r5.link_baud = baud;
+    ro5_sprintf(text, "UART clock %u Hz, link now %u baud", (unsigned)got, (unsigned)baud);
+    note(text);
+    return 1;
+}
+
+/* Edition 16: is the 48 MHz clock real?  On a Pi 4 under RISC OS 5 the
+ * controller took 1.5 Mbaud, the firmware said the UART clock was now
+ * 48 MHz, and the controller was never heard again (btvnotes22/23, 4 Nov);
+ * if the clock had stayed at 3 MHz the PL011 was at 93750 baud.  So, with
+ * the radio OFF (nothing listens on TXD), the clock is raised and 3000
+ * bytes are sent at 1.5 Mbaud and timed: 2 cs if the clock is 48 MHz,
+ * about 32 cs if it is still 3 MHz.  A real clock is then kept for the
+ * whole session (the start-up at 115200 divides by it too), so nothing
+ * changes clock at the moment of the switch; a false one is put back and
+ * the session stays at 115200.  Answers 1 = keep going fast. */
+#define CHECK_BYTES 1500u
+static uint32_t cs_now(void)
+{
+    _kernel_swi_regs r;
+    memset(&r, 0, sizeof r);
+    (void)ro5_swi(SWI_OS_ReadMonotonicTime, &r, &r);
+    return (uint32_t)r.r[0];
+}
+
+/* One timing: CHECK_BYTES at `baud`, in cs. */
+static uint32_t time_bytes(void)
+{
+    uint32_t t0 = cs_now(), i;
+    for (i = 0; i < CHECK_BYTES; ++i)
+    {
+        while ((rd(r5.uart, U_FR) & FR_TXFF) != 0)
+            if (cs_now() - t0 > 200u) break;
+        wr(r5.uart, U_DR, 0xFFu);
+    }
+    while ((rd(r5.uart, U_FR) & FR_BUSY) != 0)
+        if (cs_now() - t0 > 200u) break;
+    return cs_now() - t0;
+}
+
+/* Edition 18: the firmware answers SET_CLOCK_RATE at once but the clock
+ * itself can change later: btvnotes26 timed 3000 bytes in 18 cs -- neither
+ * 2 (48 MHz) nor 32 (3 MHz), so it changed part way through, about 16 cs
+ * after the call.  That also explains the switches that failed: the PL011
+ * was set for 1.5 Mbaud while its clock was still 3 MHz.  So time it again
+ * (up to CHECK_TRIES, CHECK_GAP_CS apart) until it is fast. */
+#define CHECK_TRIES  12u
+#define CHECK_GAP_CS 5u
+static int clock_check(uint32_t baud)
+{
+    char text[160];
+    uint32_t got, t = 0, first = 0, tries, expect_cs, limit, t0;
+    r5.clock_checked = 1;
+    if (r5.clock_orig == 0) r5.clock_orig = uart_clock();
+    got = set_uart_clock(FAST_CLOCK);
+    if (got < 16u * baud)
+    {
+        ro5_sprintf(text, "clock check: the firmware would not set the UART clock (got %u Hz)", (unsigned)got);
+        note(text);
+        return 0;
+    }
+    r5.clock_changed = 1;
+    wr(r5.uart, U_CR, 0);
+    wr(r5.uart, U_LCRH, 0);
+    pl011_set_baud(got, baud);          /* CR is 0 here: set it below */
+    wr(r5.uart, U_CR, CR_UARTEN | CR_TXE);   /* no CTS: nothing listens */
+    expect_cs = (CHECK_BYTES * 10u * 100u) / baud + 1u;
+    limit = expect_cs * 2u + 1u;
+    for (tries = 1; tries <= CHECK_TRIES; ++tries)
+    {
+        t = time_bytes();
+        if (tries == 1) first = t;
+        if (t <= limit) break;
+        t0 = cs_now();
+        while (cs_now() - t0 < CHECK_GAP_CS) {}
+    }
+    wr(r5.uart, U_CR, 0);
+    /* the clock it really ran at: 10 bits a byte, 16 x divisor clocks a bit
+     * (to the cs: a rough figure, but it tells 48 MHz from 3 or 5) */
+    ro5_sprintf(text, "clock check: %u bytes at %u baud took %u cs (expected about %u; first try %u cs, tries %u; clock about %u kHz): %s",
+            (unsigned)CHECK_BYTES, (unsigned)baud, (unsigned)t, (unsigned)expect_cs,
+            (unsigned)first, (unsigned)(tries > CHECK_TRIES ? CHECK_TRIES : tries),
+            t != 0 ? (unsigned)((CHECK_BYTES * 10u * (got / (16u * baud)) * 16u) / (t * 10u)) : 0u,
+            t <= limit ? "the 48 MHz clock is real" : "the clock did NOT change");
+    note(text);
+    return t <= limit;
+}
+
+/* The UART clock back to what it was (Serial divides by it). */
+static void uart_clock_restore(void)
+{
+    if (r5.clock_changed && r5.clock_orig != 0)
+    {
+        (void)set_uart_clock(r5.clock_orig);
+        r5.clock_changed = 0;
+    }
+}
+
+/* As Phoenix's kernel brings the radio up on a Pi 4: TXD and RXD on
+ * UART0, RTS driven low (the radio may always send), CTS ignored.  The
+ * flow-control pins go to the PL011 in boot_finish. */
+static void uart_setup(void)
+{
+    uint32_t clock = uart_clock();
+    uint32_t ibrd = clock / (16u * LINK_BAUD);
+    uint32_t rem = clock - ibrd * 16u * LINK_BAUD;
+    uint32_t fbrd = (rem * 64u + 8u * LINK_BAUD) / (16u * LINK_BAUD);
+    char text[80];
+    wr(r5.uart, U_CR, 0);
+    while ((rd(r5.uart, U_FR) & FR_BUSY) != 0) {}
+    wr(r5.uart, U_LCRH, 0);             /* flushes the FIFOs */
+    r5.imsc = 0;
+    wr(r5.uart, U_IMSC, 0);             /* polled: no interrupts */
+    wr(r5.uart, U_ICR, 0x7FFu);
+    wr(r5.uart, U_IBRD, ibrd);
+    wr(r5.uart, U_FBRD, fbrd);
+    wr(r5.uart, U_LCRH, LCRH_FEN | LCRH_8BIT);
+    set_fsel(30, FSEL_IN);              /* CTS: not used yet */
+    set_fsel(31, FSEL_OUT);             /* RTS: held low = may send */
+    wr(r5.gpio, GPCLR0, 1u << 31);
+    /* RISC OS 5 leaves UART0 on GPIO 14/15 as well (its serial port).
+     * With two pins on RXD0 the radio's line on 33 is not the one the
+     * PL011 hears (seventh test, 31 Oct: CTS from the radio, our bytes
+     * out, 0 bytes back).  So 14/15 become inputs while we have UART0,
+     * and go back to what they were in btv_ro5_close. */
+    if (!r5.pins_saved)
+    {
+        r5.fsel14 = fsel(GPFSEL1, 14);
+        r5.fsel15 = fsel(GPFSEL1, 15);
+        r5.pins_saved = 1;
+    }
+    set_fsel(14, FSEL_IN);
+    set_fsel(15, FSEL_IN);
+    set_fsel(32, FSEL_ALT3);            /* TXD */
+    set_fsel(33, FSEL_ALT3);            /* RXD */
+    wr(r5.uart, U_CR, CR_UARTEN | CR_TXE | CR_RXE);
+    ro5_sprintf(text, "PL011 IBRD %u FBRD %u, no flow control until the radio is up",
+            (unsigned)ibrd, (unsigned)fbrd);
+    note(text);
+    r5.link_baud = LINK_BAUD;
+}
+
+/* The radio is up: RTS and CTS to the PL011, hardware flow control on. */
+static void uart_flow_on(void)
+{
+    set_fsel(30, FSEL_ALT3);
+    set_fsel(31, FSEL_ALT3);
+    wr(r5.uart, U_CR, rd(r5.uart, U_CR) | CR_RTSEN | CR_CTSEN);
+}
+
+/* ---- receive ----------------------------------------------------------- */
+
+static int queues_full(void)
+{
+    return r5.event_in - r5.event_out >= EVENTS || r5.acl_in - r5.acl_out >= ACLS;
+}
+
+static void packet_done(void)
+{
+    const struct h4_rx *p = &r5.framer;
+    uint32_t i;
+    uint8_t status;
+    if (r5.booting)
+    {
+        if (p->type == H4_EVENT && r5.awaiting != 0 &&
+            hci_command_done(p->buf, p->length, r5.awaiting, &status))
+        {
+            r5.reply_len = p->length < EVENT_BYTES ? p->length : EVENT_BYTES;
+            memcpy(r5.reply, p->buf, r5.reply_len);
+            r5.reply_ready = 1;
+        }
+        return;
+    }
+    if (p->type == H4_EVENT)
+    {
+        if (p->length > EVENT_BYTES) { ++r5.events_lost; return; }
+        i = r5.event_in % EVENTS;
+        memcpy(r5.event[i], p->buf, p->length);
+        r5.event_len[i] = p->length;
+        ++r5.event_in;
+    }
+    else if (p->type == H4_ACL)
+    {
+        i = r5.acl_in % ACLS;
+        memcpy(r5.acl[i], p->buf, p->length);
+        r5.acl_len[i] = p->length;
+        ++r5.acl_in;
+        ++r5.acl_in_count;
+    }
+    else
+        ++r5.acl_lost;                  /* SCO over the UART: not carried */
+}
+
+/* The PL011 FIFO into the staging ring (only while it has room, so a full
+ * ring holds the controller off through RTS), then the framer. */
+/* The PL011 receive FIFO into the staging ring, while it has room.  Called
+ * by pump when there is no receive interrupt, and by the interrupt handler
+ * (with IRQs off) when there is.  A full ring leaves the bytes in the FIFO,
+ * and the PL011 then drops RTS. */
+/* ---- transmit (edition 15) ----------------------------------------------
+ * Edition 14 and before wrote each packet byte by byte before submit
+ * returned, spinning while the PL011 FIFO was full.  Fine for a keyboard;
+ * an A2DP stream wants about 40 KB a second, so the machine spent its time
+ * in that loop inside the core's ticker (and with RTS/CTS the controller
+ * could hold it there), the speaker got nothing and showed pause, and the
+ * desktop froze until the speaker was switched off (4 Nov, Pi 4).  Now a
+ * packet goes into a ring and submit returns at once (BUSY when the ring is
+ * full: the core tries again); the FIFO is topped up by pump and by the
+ * PL011 transmit interrupt, and a packet is complete when its last byte
+ * has gone into the FIFO, as Martin's uart_bridge does on the 16550. */
+
+#ifdef PHX_RO5
+static void set_imsc(uint32_t v)
+{
+    r5.imsc = v;
+    if (r5.uart != NULL) wr(r5.uart, U_IMSC, v);
+}
+#endif
+
+/* The ring into the FIFO while it has room.  Called with IRQs off. */
+static void tx_fill(void)
+{
+    if (r5.uart == NULL) return;
+    while (r5.tx_out != r5.tx_in && (rd(r5.uart, U_FR) & FR_TXFF) == 0)
+    {
+        wr(r5.uart, U_DR, r5.tx[r5.tx_out % TX_RING]);
+        ++r5.tx_out;
+        ++r5.tx_bytes;
+    }
+#ifdef PHX_RO5
+    if (r5.irq_claimed)
+    {
+        if (r5.tx_out != r5.tx_in) { if ((r5.imsc & IM_TX) == 0) set_imsc(r5.imsc | IM_TX); }
+        else if ((r5.imsc & IM_TX) != 0) set_imsc(r5.imsc & ~IM_TX);
+    }
+#endif
+}
+
+static void fifo_drain(void)
+{
+    uint32_t dr;
+    while (r5.stage_in - r5.stage_out < STAGE_BYTES &&
+           (rd(r5.uart, U_FR) & FR_RXFE) == 0)
+    {
+        dr = rd(r5.uart, U_DR);
+        if ((dr & DR_ERRORS) != 0)
+        {
+            if ((dr & DR_OE) != 0) ++r5.rx_overruns;
+            else ++r5.rx_errors;
+        }
+        r5.stage[r5.stage_in % STAGE_BYTES] = (uint8_t)dr;
+        ++r5.stage_in;
+        ++r5.rx_bytes;
+    }
+}
+
+/* ---- the receive interrupt (DDE build) ----------------------------------
+ * Edition 7 polled the FIFO from the 2 cs ticker.  The FIFO holds 16 bytes,
+ * about 1.4 ms at 115200 baud, so between polls the PL011 held the radio
+ * off with RTS and the link carried well under 1 KB a second: a mouse sends
+ * faster than that, so its reports queued in the radio and the pointer was
+ * slow and kept moving after the mouse stopped (1 Nov).  Now the PL011's
+ * receive and receive-timeout interrupts empty the FIFO into the staging
+ * ring as the bytes come.
+ *
+ * The interrupt is UART0's HAL device, found with OS_Hardware 5 (type
+ * Comms, UART); Bluetooth$UARTIRQ gives a number by hand.  Our handler goes
+ * on that device vector in front of RISC OS's serial driver and claims
+ * every interrupt while Bluetooth has UART0.  If no device is found the
+ * ticker poll is kept. */
+#ifdef PHX_RO5
+#define SWI_OS_ClaimDeviceVector   0x4B
+#define SWI_OS_ReleaseDeviceVector 0x4C
+#define SWI_OS_Hardware            0x7A
+#define HAL_IRQEnable   1
+#define HAL_IRQClear    3
+#define U_IFLS        0x34u
+#define U_MIS         0x40u
+#define IM_RX         (1u << 4)
+#define IM_RT         (1u << 6)
+
+extern void ro5_uart_irq_entry(void);  /* cmhg irq-handlers veneer */
+
+static void hal_call(int entry, int device)
+{
+    _kernel_swi_regs r;
+    memset(&r, 0, sizeof r);
+    r.r[0] = device;
+    r.r[8] = 0;                         /* call a HAL routine */
+    r.r[9] = entry;
+    (void)ro5_swi(SWI_OS_Hardware, &r, &r);
+}
+
+/* Entered through the veneer in SVC mode with IRQs off.  0 = claimed. */
+int ro5_uart_irq(_kernel_swi_regs *regs, void *pw)
+{
+    uint32_t mis;
+    (void)regs; (void)pw;
+    if (!r5.irq_claimed || r5.uart == NULL) return 1;
+    /* Not ours (another device on this vector, or a wrong number): pass on. */
+    mis = rd(r5.uart, U_MIS);
+    if ((mis & (IM_RX | IM_RT | IM_TX)) == 0) return 1;
+    ++r5.irq_count;
+    if ((mis & (IM_RX | IM_RT)) != 0)
+    {
+        fifo_drain();
+        if ((rd(r5.uart, U_FR) & FR_RXFE) == 0)
+        {
+            /* the ring is full: stop the interrupt, pump turns it back on */
+            set_imsc(r5.imsc & ~(IM_RX | IM_RT));
+            r5.irq_on = 0;
+            ++r5.irq_full;
+        }
+    }
+    tx_fill();                          /* the FIFO topped up; off when empty */
+    wr(r5.uart, U_ICR, IM_RX | IM_RT | IM_TX);
+    hal_call(HAL_IRQClear, r5.irq_device);
+    return 0;
+}
+
+/* UART0's interrupt: device 57 (the BCM2835 number for the PL011s, which
+ * RISC OS 5 keeps on the Pi 4) -- confirmed on a Pi 4B, 2 Nov, once
+ * RISC OS's Serial module was out of the way.  Bluetooth$UARTIRQ gives
+ * another number, or 0 / "none" for polling. */
+#define UART0_IRQ_BCM2835 57
+
+static int find_uart_device(void)
+{
+    _kernel_swi_regs v;
+    char value[12];
+    memset(&v, 0, sizeof v);
+    v.r[0] = (int)"Bluetooth$UARTIRQ";
+    v.r[1] = (int)value;
+    v.r[2] = (int)sizeof value - 1;
+    v.r[4] = 3;
+    if (ro5_swi(SWI_OS_ReadVarVal, &v, &v) == NULL && v.r[2] > 0)
+    {
+        value[v.r[2]] = 0;
+        if (value[0] == 'n' || value[0] == 'N') return -1;
+        return (int)strtoul(value, NULL, 0) > 0 ? (int)strtoul(value, NULL, 0) : -1;
+    }
+    return UART0_IRQ_BCM2835;
+}
+
+/* RISC OS's Serial module owns UART0's interrupt and empties the FIFO
+ * into its own buffer as soon as the PL011 interrupts are on, so while
+ * Bluetooth has UART0 it is made dormant (*RMKill: it is in ROM, so it
+ * stays listed) and brought back with *RMReInit when Bluetooth stops.
+ * 2 Nov, Pi 4B: with Serial out of the way interrupt 57 works. */
+static int serial_active(void)
+{
+    _kernel_swi_regs r;
+    memset(&r, 0, sizeof r);
+    r.r[0] = 18;                        /* look up: R4 = workspace */
+    r.r[1] = (int)"Serial";
+    if (ro5_swi(SWI_OS_Module, &r, &r) != NULL) return 0;
+    return r.r[4] != 0;                 /* dormant ROM modules have none */
+}
+
+static void cli(const char *command)
+{
+    _kernel_swi_regs r;
+    memset(&r, 0, sizeof r);
+    r.r[0] = (int)command;
+    (void)ro5_swi(0x05, &r, &r);    /* OS_CLI */
+}
+
+static void serial_park(void)
+{
+    if (r5.serial_parked || !serial_active()) return;
+    cli("RMKill Serial");
+    if (!serial_active())
+    {
+        r5.serial_parked = 1;
+        note("RISC OS Serial module made dormant while Bluetooth has UART0");
+    }
+    else
+        note("could not make the Serial module dormant: the interrupt may not reach us");
+}
+
+static void serial_restore(void)
+{
+    if (!r5.serial_parked) return;
+    cli("RMReInit Serial");
+    r5.serial_parked = 0;
+    note("RISC OS Serial module back");
+}
+
+static void irq_start(void)
+{
+    _kernel_swi_regs r;
+    char text[96];
+    if (r5.irq_claimed) return;
+    r5.irq_device = find_uart_device();
+    if (r5.irq_device < 0)
+    {
+        note("receiving by polling (2 cs): Bluetooth$UARTIRQ says none");
+        return;
+    }
+    serial_park();
+    memset(&r, 0, sizeof r);
+    r.r[0] = r5.irq_device;
+    r.r[1] = (int)ro5_uart_irq_entry;
+    r.r[2] = (int)r5.pw;
+    if (ro5_swi(SWI_OS_ClaimDeviceVector, &r, &r) != NULL)
+    {
+        note("OS_ClaimDeviceVector refused: receiving by polling (slow)");
+        serial_restore();
+        return;
+    }
+    r5.irq_claimed = 1;
+    wr(r5.uart, U_IFLS, 0x12u);         /* RX at 1/2 full, TX at 1/2 */
+    wr(r5.uart, U_ICR, 0x7FFu);
+    r5.irq_on = 1;
+    set_imsc(IM_RX | IM_RT);
+    hal_call(HAL_IRQEnable, r5.irq_device);
+    ro5_sprintf(text, "receive interrupt on, HAL device %d", r5.irq_device);
+    note(text);
+}
+
+static void irq_stop(void)
+{
+    _kernel_swi_regs r;
+    uint32_t s = os_irqs_off();
+    set_imsc(0);
+    r5.irq_on = 0;
+    os_irqs_restore(s);
+    if (!r5.irq_claimed) return;
+    memset(&r, 0, sizeof r);
+    r.r[0] = r5.irq_device;
+    r.r[1] = (int)ro5_uart_irq_entry;
+    r.r[2] = (int)r5.pw;
+    (void)ro5_swi(SWI_OS_ReleaseDeviceVector, &r, &r);
+    r5.irq_claimed = 0;
+    serial_restore();
+}
+
+/* After the framer has taken bytes: the interrupt back on if the ring had
+ * filled and now has room. */
+static void irq_rearm(void)
+{
+    if (r5.irq_claimed && !r5.irq_on &&
+        r5.stage_in - r5.stage_out < STAGE_BYTES / 2u)
+    {
+        uint32_t s = os_irqs_off();
+        r5.irq_on = 1;
+        set_imsc(r5.imsc | IM_RX | IM_RT);
+        os_irqs_restore(s);
+    }
+}
+#else
+static void irq_start(void) {}
+static void irq_stop(void) {}
+static void irq_rearm(void) {}
+#endif
+
+static void pump(void)
+{
+    if (r5.uart == NULL) return;
+    /* Always drain here as well, with IRQs off so the handler and this
+     * cannot both be in the ring: then a wrong or silent interrupt number
+     * only loses speed, never data (edition 9's test: interrupt 57 claimed,
+     * 0 interrupts, 0 bytes). */
+    {
+        uint32_t s = os_irqs_off();
+        fifo_drain();
+        tx_fill();
+        os_irqs_restore(s);
+    }
+    while (r5.stage_out != r5.stage_in && (r5.booting || !queues_full()))
+    {
+        uint8_t byte = r5.stage[r5.stage_out % STAGE_BYTES];
+        ++r5.stage_out;
+        if (h4_rx_byte(&r5.framer, byte)) packet_done();
+    }
+    irq_rearm();
+}
+
+static void rx_reset(void)
+{
+    uint32_t s = os_irqs_off();         /* the interrupt writes stage_in */
+    r5.stage_in = r5.stage_out = 0;
+    r5.tx_in = r5.tx_out = 0;           /* and moves tx_out */
+    os_irqs_restore(s);
+    h4_rx_init(&r5.framer);
+    r5.event_in = r5.event_out = 0;
+    r5.acl_in = r5.acl_out = 0;
+}
+
+/* ---- transmit ---------------------------------------------------------- */
+
+/* One H4 packet into the ring and the FIFO started: 1, or 0 when it will
+ * not fit (nothing written).  `end` is where its last byte leaves. */
+static int send_h4_end(uint8_t type, const uint8_t *data, uint32_t bytes, uint32_t *end)
+{
+    uint32_t i, s;
+    if (r5.uart == NULL) return 0;
+    if (r5.tx_in - r5.tx_out + bytes + 1u > TX_RING) return 0;
+    r5.tx[r5.tx_in % TX_RING] = type;
+    for (i = 0; i < bytes; ++i) r5.tx[(r5.tx_in + 1u + i) % TX_RING] = data[i];
+    s = os_irqs_off();
+    r5.tx_in += bytes + 1u;
+    if (end != NULL) *end = r5.tx_in;
+    tx_fill();
+    os_irqs_restore(s);
+    return 1;
+}
+
+static int send_h4(uint8_t type, const uint8_t *data, uint32_t bytes)
+{
+    return send_h4_end(type, data, bytes, NULL);
+}
+
+static uint32_t new_ticket(unsigned int kind)
+{
+    r5.sequence = (r5.sequence + 1u) & SEQ_MASK;
+    if (r5.sequence == 0) r5.sequence = 1;
+    return (uint32_t)kind << KIND_SHIFT | r5.sequence;
+}
+
+/* ---- the start-up ------------------------------------------------------ */
+
+static int boot_command(uint16_t opcode, const uint8_t *params, uint8_t length)
+{
+    uint8_t packet[4 + 255];
+    size_t n = h4_command(packet, sizeof packet, opcode, params, length);
+    r5.awaiting = opcode;
+    r5.reply_ready = 0;
+    r5.since = now_ms();
+    return n != 0 && send_h4(packet[0], packet + 1, (uint32_t)n - 1u);
+}
+
+static uint8_t reply_status(void)
+{
+    if (r5.reply_len >= 6 && r5.reply[0] == 0x0E) return r5.reply[5];
+    if (r5.reply_len >= 3 && r5.reply[0] == 0x0F) return r5.reply[2];
+    return 0xFFu;
+}
+
+static const uint8_t *reply_params(uint32_t want)
+{
+    if (r5.reply[0] != 0x0E || r5.reply_len < 6u + want) return NULL;
+    return r5.reply + 6;
+}
+
+static void release_patch(void)
+{
+    if (r5.patch != NULL) btm_firmware_free(r5.patch);
+    r5.patch = NULL;
+    r5.patch_bytes = 0;
+}
+
+static int boot_fail(const char *why)
+{
+    char text[200];
+    ro5_sprintf(text, "start-up failed: %.100s (UART: %u bytes in, %u errors, %u overruns, flags &%03X)",
+            why, (unsigned)r5.rx_bytes, (unsigned)r5.rx_errors, (unsigned)r5.rx_overruns,
+            r5.uart != NULL ? (unsigned)(rd(r5.uart, U_FR) & 0x1FFu) : 0u);
+    note(text);
+    release_patch();
+    r5.state = RB_FAILED;
+    return -1;
+}
+
+/* The next .hcd record, or 0 when the patch is all sent. */
+static int send_record(void)
+{
+    uint16_t opcode;
+    const uint8_t *params;
+    uint8_t plen;
+    if (!hcd_next(r5.patch, r5.patch_bytes, &r5.patch_at, &opcode, &params, &plen))
+        return 0;
+    ++r5.records;
+    return boot_command(opcode, params, plen) ? 1 : -1;
+}
+
+static void boot_finish(void)
+{
+    if (r5.uart != NULL) uart_flow_on();
+    r5.booting = 0;
+    r5.awaiting = 0;
+    r5.state = RB_DONE;
+    h4_rx_init(&r5.framer);
+    note("controller ready, handing over to the core");
+}
+
+/* ---- the btv_ro5_* interface ------------------------------------------ */
+
+/* The module's private word, for the interrupt handler's R12 (phx_module
+ * calls this from initialisation in the DDE build). */
+void ro5_bridge_set_pw(void *pw)
+{
+    r5.pw = pw;
+}
+
+/* The radio is not touched until the desktop is up and has had a little
+ * time to settle. The normal module header does not claim
+ * Service_StartedWimp, so the boot state machine detects it directly. */
+#define DESKTOP_SETTLE_MS 5000u
+static void ro5_bridge_desktop_up(void)
+{
+    if (r5.desktop_ms == 0) r5.desktop_ms = now_ms() | 1u;
+}
+
+static int desktop_running(void)
+{
+    uint32_t r[8] = { 0 };
+    r[0] = 3;                           /* Wimp_ReadSysInfo: desktop state */
+    return rs_swi(0x400F2u, r) == NULL && r[0] == 1;
+}
+
+int btv_ro5_is_open(void)
+{
+    return r5.open;
+}
+
+/* RISC OS 5 on a Raspberry Pi: its video driver is loaded.  Which Pi is
+ * found in btv_ro5_open (that needs the mailbox).  Bluetooth$UART set to
+ * 0 turns the built-in radio off for the stack, as upstream. */
+int btv_ro5_inspect(void)
+{
+    if (var_first("Bluetooth$UART") == '0') return 0;
+    return module_present("BCMVideo");
+}
+
+int btv_ro5_open(void)
+{
+    uint32_t v[1], type;
+    char text[96];
+    if (r5.open) return 1;
+    if (r5.gpio == NULL) r5.gpio = map_page(GPIO_PHYS);
+    if (r5.uart == NULL) r5.uart = map_page(UART_PHYS);
+    if (r5.mbox == NULL) r5.mbox = map_page(MBOX_PAGE);
+    if (r5.gpio == NULL || r5.uart == NULL || r5.mbox == NULL || !mbox_buffer())
+        return 0;
+
+    v[0] = 0;
+    if (mbox_tag(TAG_BOARD_REVISION, v, 1) != 1)
+    {
+        note("the firmware did not answer the board revision");
+        return 0;
+    }
+    r5.revision = v[0];
+    {
+        uint32_t fw[1];
+        fw[0] = 0;
+        if (mbox_tag(TAG_FIRMWARE_REV, fw, 1) != 0)
+        {
+            ro5_sprintf(text, "VideoCore firmware revision &%08X", (unsigned)fw[0]);
+            note(text);
+        }
+    }
+    type = (v[0] >> 4) & 0xFFu;
+    if ((v[0] & (1u << 23)) == 0 || (type != 0x11u && type != 0x13u && type != 0x14u))
+    {
+        ro5_sprintf(text, "board revision &%06X is not a Pi 4, Pi 400 or CM4",
+                (unsigned)v[0]);
+        note(text);
+        return 0;
+    }
+    /* 1 Nov: taken by default.  On the Pi 4 the radio is wired to UART0 and
+     * nowhere else, so Bluetooth cannot work without it; asking for a
+     * variable first only made a start at boot fail (the module started
+     * before !Bluetooth.!Run had set it).  Bluetooth$UARTForce 0 keeps the
+     * serial port instead. */
+    if (uart0_busy())
+    {
+        if (var_first("Bluetooth$UARTForce") == '0')
+        {
+            note("UART0 is the serial port and Bluetooth$UARTForce is 0: leaving it alone");
+            return 0;
+        }
+        note("UART0 was the serial port (GPIO 14/15): taken for Bluetooth, given back when it stops");
+    }
+    note("ro5_bridge edition 18 (4 Nov: the clock timed until it really is 48 MHz; starts after the desktop; 60 ms settle)");
+    ro5_sprintf(text, "Pi board &%06X, UART0 on GPIO 30-33 at %u baud with RTS/CTS",
+            (unsigned)r5.revision, (unsigned)LINK_BAUD);
+    note(text);
+
+    rx_reset();
+    memset(r5.done, 0, sizeof r5.done);
+    r5.state = RB_IDLE;
+    r5.attempts = 0;
+    r5.records = 0;
+    r5.power_retry = 0;
+    r5.booting = 1;
+    r5.open = 1;
+    return 1;
+}
+
+int btv_ro5_boot(void)
+{
+    uint32_t waited;
+    int sent;
+    char text[96];
+    if (!r5.open) return -1;
+    if (r5.state == RB_DONE) return 1;
+    if (r5.state == RB_FAILED) return -1;
+    pump();
+    waited = now_ms() - r5.since;
+    switch (r5.state)
+    {
+    case RB_IDLE:
+        if (r5.desktop_ms == 0 && desktop_running())
+            ro5_bridge_desktop_up();
+        if (r5.desktop_ms == 0 || now_ms() - r5.desktop_ms < DESKTOP_SETTLE_MS)
+        {
+            if (!r5.told_waiting)
+            {
+                note("waiting for the desktop (and 5 s more) before starting the radio");
+                r5.told_waiting = 1;
+            }
+            break;
+        }
+        /* If the firmware will not switch BT_ON, carry on: the radio may
+         * already be powered, and the Reset below will tell. */
+        r5.power_ok = bt_on(0);
+        if (!r5.power_ok) note("BT_ON not switched by the firmware; trying the radio as it is");
+        r5.since = now_ms();
+        r5.state = RB_POWER_OFF;
+        break;
+    case RB_POWER_OFF:
+        if (waited < (r5.power_retry ? 1000u : 20u)) break;
+        /* edition 16: the radio is off -- time the fast clock now, once */
+        if (!r5.clock_checked && !r5.no_fast && fast_baud() > LINK_BAUD && r5.uart != NULL)
+        {
+            if (!clock_check(fast_baud()))
+            {
+                uart_clock_restore();
+                r5.no_fast = 1;
+                note("staying at 115200 this session");
+            }
+        }
+        if (r5.power_ok && !bt_on(1)) return boot_fail("mailbox: BT_ON high");
+        r5.since = now_ms();
+        r5.state = RB_POWER_ON;
+        break;
+    case RB_POWER_ON:
+        if (waited < (r5.power_retry ? 1000u : 250u)) break;   /* the radio's ROM starting */
+        bt_on_report("after power-on");
+        uart_setup();                   /* also drops the power-up noise */
+        irq_start();
+        rx_reset();
+
+        r5.attempts = 1;
+        if (!boot_command(OP_RESET, NULL, 0)) return boot_fail("UART write (Reset)");
+        r5.state = RB_RESET_WAIT;
+        break;
+    case RB_RESET_WAIT:
+        if (r5.reply_ready)
+        {
+            if (reply_status() != 0) return boot_fail("Reset refused");
+            r5.patch = btm_firmware_load(PATCH_NAME, &r5.patch_bytes);
+            if (r5.patch == NULL)
+            {
+                note("no " PATCH_NAME " in !Bluetooth.Firmware: staying on the ROM");
+                if (!boot_command(OP_READ_VERSION, NULL, 0))
+                    return boot_fail("UART write (Read Local Version)");
+                r5.state = RB_VERSION_WAIT;
+                break;
+            }
+            if (!boot_command(BCM_OP_DOWNLOAD_MINI, NULL, 0))
+                return boot_fail("UART write (Download Minidriver)");
+            r5.state = RB_MINI_WAIT;
+        }
+        else if (waited > REPLY_MS)
+        {
+            if (++r5.attempts > 3)
+            {
+                /* Once more from a longer power cycle before giving up
+                 * (1 Nov: a first start after an earlier session got no
+                 * answer at all; the radio may not have reset in 20 ms). */
+                if (r5.power_retry) return boot_fail("no answer to Reset");
+                r5.power_retry = 1;
+                note("no answer to Reset: switching the radio off for 1 s and trying again");
+                (void)bt_on(0);
+                r5.since = now_ms();
+                r5.state = RB_POWER_OFF;
+                break;
+            }
+            if (!boot_command(OP_RESET, NULL, 0)) return boot_fail("UART write (Reset)");
+        }
+        break;
+    case RB_MINI_WAIT:
+        if (r5.reply_ready)
+        {
+            r5.since = now_ms();
+            r5.state = RB_MINI_PAUSE;
+        }
+        else if (waited > REPLY_MS) return boot_fail("no answer to Download Minidriver");
+        break;
+    case RB_MINI_PAUSE:
+        if (waited < 50u) break;
+        r5.patch_at = 0;
+        r5.records = 0;
+        sent = send_record();
+        if (sent <= 0) return boot_fail("the patch has no records");
+        r5.state = RB_RECORD_WAIT;
+        break;
+    case RB_RECORD_WAIT:
+        if (r5.reply_ready)
+        {
+            sent = send_record();
+            if (sent < 0) return boot_fail("UART write (patch record)");
+            if (sent == 0)
+            {
+                ro5_sprintf(text, "patch sent, %u records", (unsigned)r5.records);
+                note(text);
+                release_patch();
+                r5.awaiting = 0;
+                r5.since = now_ms();
+                r5.state = RB_LAUNCH_PAUSE;
+            }
+        }
+        else if (waited > REPLY_MS)
+        {
+            ro5_sprintf(text, "no answer to patch record %u", (unsigned)r5.records);
+            return boot_fail(text);
+        }
+        break;
+    case RB_LAUNCH_PAUSE:
+        if (waited < 250u) break;       /* the patched firmware starting */
+        rx_reset();
+        r5.attempts = 1;
+        if (!boot_command(OP_RESET, NULL, 0)) return boot_fail("UART write (Reset)");
+        r5.state = RB_RESET2_WAIT;
+        break;
+    case RB_RESET2_WAIT:
+        if (r5.reply_ready)
+        {
+            if (!boot_command(OP_READ_VERSION, NULL, 0))
+                return boot_fail("UART write (Read Local Version)");
+            r5.state = RB_VERSION_WAIT;
+        }
+        else if (waited > REPLY_MS)
+        {
+            if (++r5.attempts > 5) return boot_fail("no answer to Reset after the patch");
+            if (!boot_command(OP_RESET, NULL, 0)) return boot_fail("UART write (Reset)");
+        }
+        break;
+    case RB_VERSION_WAIT:
+        if (r5.reply_ready || waited > REPLY_MS)
+        {
+            const uint8_t *p = r5.reply_ready ? reply_params(8) : NULL;
+            if (p != NULL && reply_status() == 0)
+            {
+                ro5_sprintf(text, "HCI version %u, LMP sub &%04X, manufacturer %u",
+                        (unsigned)p[0], (unsigned)(p[6] | p[7] << 8),
+                        (unsigned)(p[4] | p[5] << 8));
+                note(text);
+            }
+            if (!boot_command(OP_READ_BDADDR, NULL, 0))
+                return boot_fail("UART write (Read BD_ADDR)");
+            r5.state = RB_ADDRESS_WAIT;
+        }
+        break;
+    case RB_ADDRESS_WAIT:
+        if (r5.reply_ready || waited > REPLY_MS)
+        {
+            const uint8_t *p = r5.reply_ready ? reply_params(6) : NULL;
+            if (p != NULL && reply_status() == 0)
+            {
+                ro5_sprintf(text, "controller address %02X:%02X:%02X:%02X:%02X:%02X",
+                        p[5], p[4], p[3], p[2], p[1], p[0]);
+                note(text);
+            }
+            /* 4 Nov (edition 14): the fast link.  Flow control first, so
+             * nothing is lost while the two ends change speed; then the
+             * Broadcom Update UART Baud Rate (two reserved bytes, the rate
+             * little-endian); the PL011 follows once it is agreed. */
+            {
+                uint32_t baud = fast_baud();
+                if (baud > LINK_BAUD && r5.patch_at != 0)
+                {
+                    uint8_t prm[6];
+                    prm[0] = 0; prm[1] = 0;
+                    prm[2] = (uint8_t)baud; prm[3] = (uint8_t)(baud >> 8);
+                    prm[4] = (uint8_t)(baud >> 16); prm[5] = (uint8_t)(baud >> 24);
+                    uart_flow_on();
+                    ro5_sprintf(text, "asking the controller for %u baud", (unsigned)baud);
+                    note(text);
+                    if (!boot_command(BCM_OP_UPDATE_BAUD, prm, 6))
+                        return boot_fail("UART write (Update UART Baud Rate)");
+                    r5.link_baud = baud;          /* what was asked for */
+                    r5.state = RB_BAUD_WAIT;
+                    break;
+                }
+            }
+            boot_finish();
+            return 1;
+        }
+        break;
+    case RB_BAUD_WAIT:
+        if (r5.reply_ready && reply_status() == 0)
+        {
+            /* edition 17: give the controller time to change speed after
+             * its Command Complete before anything is sent at the new one:
+             * bytes sent mid-change can leave its H4 framing out of step,
+             * and then every retry is swallowed (btvnotes24 worked,
+             * btvnotes25 did not, same code). */
+            r5.since = now_ms();
+            r5.state = RB_BAUD_SETTLE;
+        }
+        else if (r5.reply_ready || waited > REPLY_MS)
+        {
+            note("the controller did not take the new speed: staying at 115200");
+            r5.link_baud = LINK_BAUD;
+            boot_finish();
+            return 1;
+        }
+        break;
+    case RB_BAUD_SETTLE:
+        if (waited < 60u) break;
+        {
+            if (!uart_go_fast(r5.link_baud))
+            {
+                /* The controller is at the new speed and the PL011 cannot
+                 * follow: start again at 115200 from a power cycle. */
+                r5.no_fast = 1;
+                (void)bt_on(0);
+                r5.power_retry = 1;
+                r5.since = now_ms();
+                r5.state = RB_POWER_OFF;
+                break;
+            }
+            rx_reset();
+            r5.attempts = 1;
+            if (!boot_command(OP_READ_VERSION, NULL, 0))
+                return boot_fail("UART write (Read Local Version, fast)");
+            r5.state = RB_BAUD_CHECK;
+        }
+        break;
+    case RB_BAUD_CHECK:
+        if (r5.reply_ready && reply_status() == 0)
+        {
+            ro5_sprintf(text, "the controller answers at %u baud", (unsigned)r5.link_baud);
+            note(text);
+            boot_finish();
+            return 1;
+        }
+        else if (waited > REPLY_MS)
+        {
+            if (++r5.attempts <= 3)
+            {
+                if (!boot_command(OP_READ_VERSION, NULL, 0))
+                    return boot_fail("UART write (Read Local Version, fast)");
+                break;
+            }
+            /* No answer at the new speed: once more from the start at
+             * 115200, and stay there this session. */
+            if (++r5.fast_tries < 2)
+            {
+                /* edition 17: once more, fast, from a power cycle; the
+                 * clock stays at 48 MHz (115200 is divided from it) */
+                note("no answer at the new speed: power cycle and try it once more");
+                (void)bt_on(0);
+                r5.power_retry = 1;
+                r5.since = now_ms();
+                r5.state = RB_POWER_OFF;
+                break;
+            }
+            note("no answer at the new speed again: restarting at 115200");
+            r5.no_fast = 1;
+            uart_clock_restore();
+            (void)bt_on(0);
+            r5.power_retry = 1;
+            r5.since = now_ms();
+            r5.state = RB_POWER_OFF;
+        }
+        break;
+    default:
+        return -1;
+    }
+    return 0;
+}
+
+int btv_ro5_submit(unsigned int kind, const uint8_t *data, uint32_t bytes,
+                    uint32_t *ticket)
+{
+    uint32_t i;
+    if (!r5.open || ticket == NULL) return BTV_HOST_BRIDGE_INVALID;
+    switch (kind)
+    {
+    case BTV_HOST_BRIDGE_EVENT_IN:
+    case BTV_HOST_BRIDGE_ACL_IN:
+        *ticket = new_ticket(kind);
+        return BTV_HOST_BRIDGE_OK;
+    case BTV_HOST_BRIDGE_COMMAND:
+    case BTV_HOST_BRIDGE_ACL_OUT:
+        if (data == NULL && bytes != 0) return BTV_HOST_BRIDGE_INVALID;
+        if (bytes > H4_MAX_PACKET) return BTV_HOST_BRIDGE_INVALID;
+        for (i = 0; i < TX_SLOTS && r5.done[i].ticket != 0; ++i) {}
+        if (i == TX_SLOTS) { ++r5.tx_busy; return BTV_HOST_BRIDGE_BUSY; }
+        pump();
+        if (!send_h4_end(kind == BTV_HOST_BRIDGE_COMMAND ? H4_COMMAND : H4_ACL,
+                         data, bytes, &r5.done[i].end))
+        {
+            ++r5.tx_busy;
+            return BTV_HOST_BRIDGE_BUSY;  /* the ring is full: try again */
+        }
+        if (kind == BTV_HOST_BRIDGE_ACL_OUT) ++r5.acl_out_count;
+        r5.done[i].ticket = new_ticket(kind);
+        r5.done[i].bytes = bytes;
+        *ticket = r5.done[i].ticket;
+        return BTV_HOST_BRIDGE_OK;
+    default:
+        return BTV_HOST_BRIDGE_UNSUPPORTED;
+    }
+}
+
+int btv_ro5_poll(uint32_t ticket, btv_host_bridge_completion *c)
+{
+    uint32_t kind = ticket >> KIND_SHIFT, i;
+    if (c == NULL || !r5.open || ticket == 0) return BTV_HOST_BRIDGE_INVALID;
+    pump();
+    c->kind = kind;
+    c->error = 0;
+    c->packet_count = 0;
+    switch (kind)
+    {
+    case BTV_HOST_BRIDGE_EVENT_IN:
+        if (r5.event_out == r5.event_in) return BTV_HOST_BRIDGE_PENDING;
+        i = r5.event_out % EVENTS;
+        memcpy(c->data, r5.event[i], r5.event_len[i]);
+        c->bytes = r5.event_len[i];
+        ++r5.event_out;
+        return BTV_HOST_BRIDGE_OK;
+    case BTV_HOST_BRIDGE_ACL_IN:
+        if (r5.acl_out == r5.acl_in) return BTV_HOST_BRIDGE_PENDING;
+        i = r5.acl_out % ACLS;
+        memcpy(c->data, r5.acl[i], r5.acl_len[i]);
+        c->bytes = r5.acl_len[i];
+        ++r5.acl_out;
+        return BTV_HOST_BRIDGE_OK;
+    case BTV_HOST_BRIDGE_COMMAND:
+    case BTV_HOST_BRIDGE_ACL_OUT:
+        for (i = 0; i < TX_SLOTS; ++i)
+            if (r5.done[i].ticket == ticket)
+            {
+                if ((int32_t)(r5.tx_out - r5.done[i].end) < 0)
+                    return BTV_HOST_BRIDGE_PENDING;
+                c->bytes = r5.done[i].bytes;
+                r5.done[i].ticket = 0;
+                return BTV_HOST_BRIDGE_OK;
+            }
+        return BTV_HOST_BRIDGE_INVALID;
+    default:
+        return BTV_HOST_BRIDGE_INVALID;
+    }
+}
+
+int btv_ro5_cancel(uint32_t ticket)
+{
+    uint32_t i;
+    for (i = 0; i < TX_SLOTS; ++i)
+        if (r5.done[i].ticket == ticket) r5.done[i].ticket = 0;
+    return BTV_HOST_BRIDGE_OK;
+}
+
+int btv_ro5_close(void)
+{
+    if (r5.open)
+    {
+        /* edition 14: the UART stopped and its clock put back BEFORE
+         * irq_stop brings Serial back (Serial divides by the old clock). */
+        if (r5.uart != NULL) wr(r5.uart, U_CR, 0);
+        uart_clock_restore();
+        r5.clock_checked = 0;           /* edition 16: timed again next start */
+        r5.fast_tries = 0;
+        r5.no_fast = 0;
+        irq_stop();
+        if (r5.pins_saved && r5.gpio != NULL)
+        {
+            set_fsel(14, r5.fsel14);    /* the serial port back */
+            set_fsel(15, r5.fsel15);
+            r5.pins_saved = 0;
+        }
+        (void)bt_on(0);
+        release_patch();
+        r5.open = 0;
+        r5.booting = 0;
+        r5.state = RB_IDLE;
+        memset(r5.done, 0, sizeof r5.done);
+        rx_reset();
+        {
+            char t3[120];
+            ro5_sprintf(t3, "radio off, UART0 released (%u bytes in, %u out, %u interrupts, %u ring-full, %u overruns, %u send-busy)",
+                    (unsigned)r5.rx_bytes, (unsigned)r5.tx_bytes, (unsigned)r5.irq_count,
+                    (unsigned)r5.irq_full, (unsigned)r5.rx_overruns, (unsigned)r5.tx_busy);
+            note(t3);
+        }
+    }
+    mbox_buffer_free();
+    return BTV_HOST_BRIDGE_OK;
+}
+
+void btv_ro5_counts(uint32_t *in_count, uint32_t *out_count)
+{
+    if (in_count != NULL) *in_count = r5.acl_in_count;
+    if (out_count != NULL) *out_count = r5.acl_out_count;
+}
+
+void btv_ro5_stats(uint32_t *tx_waiting, uint32_t *rx_total, uint32_t *rx_lost)
+{
+    if (tx_waiting != NULL) *tx_waiting = r5.tx_in - r5.tx_out;
+    if (rx_total != NULL) *rx_total = r5.rx_bytes;
+    if (rx_lost != NULL)
+        *rx_lost = r5.rx_overruns + r5.rx_errors + r5.events_lost +
+                   r5.acl_lost + r5.framer.oversize;
+}

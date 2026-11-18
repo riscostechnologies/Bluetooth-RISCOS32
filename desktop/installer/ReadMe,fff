@@ -4,7 +4,7 @@ Bluetooth for RISC OS - VERSION
 What it does
   Plays the computer's sound through Bluetooth speakers and headphones
   (A2DP), and works with Bluetooth mice and keyboards, classic and Low
-  Energy, through a USB Bluetooth adapter.
+  Energy, through a USB Bluetooth adapter or a supported built-in radio.
 
 What you need
   RISC OS 5 on a Raspberry Pi (tested on a CM4 with RISC OS 5.31).
@@ -13,6 +13,10 @@ What you need
   drivers in the package are left alone.
   A USB Bluetooth adapter: CSR8510 (TP-Link UB400) or Realtek RTL8761B
   (TP-Link UB4A, UB500). The Realtek firmware is included.
+  Pi 4, Pi 400 and CM4 machines can use their built-in Bluetooth radio.
+  It needs the proprietary BCM4345C0 patch at
+  !Bluetooth.Firmware.BCM4345C0; this installer does not include that file.
+  The Pinebook Pro's built-in Bluetooth is also supported.
   SharedUnixLibrary 1.16 or later (a copy is included).
 
 Installing
@@ -32,6 +36,10 @@ Using it
 Removing
   Double-click !Install and click Remove. Your pairings stay in
   Choices:Bluetooth in case you install again.
+
+Licences
+  See ThirdPartyNotices beside this ReadMe for the licences and attributions
+  that apply to the included code and firmware.
 
 Known limits
   Audio uses SBC at a modest bitrate; quality depends on the radio link,

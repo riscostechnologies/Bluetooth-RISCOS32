@@ -18,6 +18,7 @@ mkdir -p "$out/Bluetooth/Apps"
 cp -r 'desktop/installer/!Install' "$out/Bluetooth/"
 cp -r 'build/desktop/app/!Bluetooth' 'build/desktop/app/!BTSetup' "$out/Bluetooth/Apps/"
 sed "s/VERSION/$version/" desktop/installer/ReadMe,fff > "$out/Bluetooth/ReadMe,fff"
+cp THIRD-PARTY-NOTICES.md "$out/Bluetooth/ThirdPartyNotices,fff"
 # The installer's icon: the application's sprite under the name !install.
 python3 - "$out/Bluetooth/Apps/!Bluetooth/!Sprites,ff9" "$out/Bluetooth/!Install/!Sprites,ff9" <<'PY'
 import struct, sys

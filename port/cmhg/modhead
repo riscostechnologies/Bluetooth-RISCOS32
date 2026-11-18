@@ -2,8 +2,8 @@
 ; Copyright (C) RISC OS Technologies 2026
 ; BluetoothVoice module boundary. Development allocations only.
 title-string: BluetoothVoice
-help-string: BluetoothVoice 1.01
-date-string: 28 Oct 2026
+help-string: BluetoothVoice 1.02
+date-string: 18 Nov 2026
 
 ; Module entry points. The initial backend has no retained resources.
 initialisation-code: Mod_Init

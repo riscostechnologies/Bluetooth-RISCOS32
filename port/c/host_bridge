@@ -7,9 +7,11 @@
 #include <host_bridge>
 #include <native_usb>
 #include "uart_bridge.h"
+#include "ro5_bridge.h"
 #include <string.h>
 
-enum bridge_backend { BRIDGE_NONE, BRIDGE_HOST, BRIDGE_NATIVE, BRIDGE_UART };
+enum bridge_backend { BRIDGE_NONE, BRIDGE_HOST, BRIDGE_NATIVE, BRIDGE_UART,
+                      BRIDGE_RO5 };
 static enum bridge_backend selected_backend;
 static btv_native_usb native_backend;
 
@@ -72,6 +74,15 @@ int btv_host_bridge_inspect(btv_host_bridge_info *info)
         info->product = 0x4345;          /* BCM4345 */
         return 1;
     }
+    if (selected_backend == BRIDGE_RO5 && btv_ro5_is_open())
+    {
+        info->version = BTV_HOST_BRIDGE_ABI;
+        info->max_transfer_bytes = BTV_HOST_BRIDGE_IO_BYTES;
+        info->result = BTV_HOST_BRIDGE_OK;
+        info->vendor = 0x0A5C;           /* Broadcom */
+        info->product = 0x4345;          /* BCM4345C0 */
+        return 1;
+    }
     values[0] = values[1] = values[2] = 0;
     values[3] = values[4] = values[5] = 0;
     if (!bridge_call(values) || values[0] != BTV_HOST_BRIDGE_ABI)
@@ -79,9 +90,13 @@ int btv_host_bridge_inspect(btv_host_bridge_info *info)
         selected_backend = BRIDGE_NONE;
         if (!btv_native_usb_inspect(&native_backend))
         {
-            /* No USB adapter: the Pinebook Pro's own controller. */
-            if (!btv_uart_inspect()) return 0;
-            selected_backend = BRIDGE_UART;
+            /* No USB adapter: try each supported board's own controller. */
+            if (btv_uart_inspect())
+                selected_backend = BRIDGE_UART;
+            else if (btv_ro5_inspect())
+                selected_backend = BRIDGE_RO5;
+            else
+                return 0;
             info->version = BTV_HOST_BRIDGE_ABI;
             info->max_transfer_bytes = BTV_HOST_BRIDGE_IO_BYTES;
             info->result = BTV_HOST_BRIDGE_OK;
@@ -131,6 +146,11 @@ int btv_host_bridge_open(uint32_t *windows_error)
         if (windows_error != 0) *windows_error = 0;
         return btv_uart_open() ? BTV_HOST_BRIDGE_OK : BTV_HOST_BRIDGE_IO_ERROR;
     }
+    if (selected_backend == BRIDGE_RO5)
+    {
+        if (windows_error != 0) *windows_error = 0;
+        return btv_ro5_open() ? BTV_HOST_BRIDGE_OK : BTV_HOST_BRIDGE_IO_ERROR;
+    }
     if (selected_backend == BRIDGE_NATIVE)
     {
         if (windows_error != 0) *windows_error = 0;
@@ -144,6 +164,11 @@ int btv_host_bridge_voice(uint8_t alternate, uint32_t *windows_error)
 {
     uint32_t values[6] = { 3, alternate, 0, 0, 0, 0 };
     if (selected_backend == BRIDGE_UART)
+    {
+        if (windows_error != 0) *windows_error = 0;
+        return BTV_HOST_BRIDGE_UNSUPPORTED;
+    }
+    if (selected_backend == BRIDGE_RO5)
     {
         if (windows_error != 0) *windows_error = 0;
         return BTV_HOST_BRIDGE_UNSUPPORTED;
@@ -166,6 +191,11 @@ int btv_host_bridge_submit(unsigned int kind, const uint8_t *data,
     {
         if (windows_error != 0) *windows_error = 0;
         return btv_uart_submit(kind, data, bytes, ticket);
+    }
+    if (selected_backend == BRIDGE_RO5)
+    {
+        if (windows_error != 0) *windows_error = 0;
+        return btv_ro5_submit(kind, data, bytes, ticket);
     }
     if (selected_backend == BRIDGE_NATIVE)
     {
@@ -194,6 +224,8 @@ int btv_host_bridge_poll(uint32_t ticket,
         return -1;
     if (selected_backend == BRIDGE_UART)
         return btv_uart_poll(ticket, completion);
+    if (selected_backend == BRIDGE_RO5)
+        return btv_ro5_poll(ticket, completion);
     if (selected_backend == BRIDGE_NATIVE)
         return btv_native_usb_poll(&native_backend, ticket, completion);
     values[0] = 5;
@@ -223,6 +255,11 @@ int btv_host_bridge_cancel(uint32_t ticket, uint32_t *windows_error)
         if (windows_error != 0) *windows_error = 0;
         return btv_uart_cancel(ticket);
     }
+    if (selected_backend == BRIDGE_RO5)
+    {
+        if (windows_error != 0) *windows_error = 0;
+        return btv_ro5_cancel(ticket);
+    }
     if (selected_backend == BRIDGE_NATIVE)
     {
         if (windows_error != 0) *windows_error = 0;
@@ -238,6 +275,11 @@ int btv_host_bridge_close(uint32_t *windows_error)
     {
         if (windows_error != 0) *windows_error = 0;
         return btv_uart_close();
+    }
+    if (selected_backend == BRIDGE_RO5)
+    {
+        if (windows_error != 0) *windows_error = 0;
+        return btv_ro5_close();
     }
     if (selected_backend == BRIDGE_NATIVE)
     {
@@ -262,6 +304,11 @@ void btv_host_bridge_acl_counts(uint32_t *in_count, uint32_t *out_count)
         btv_uart_counts(in_count, out_count);
         return;
     }
+    if (selected_backend == BRIDGE_RO5)
+    {
+        btv_ro5_counts(in_count, out_count);
+        return;
+    }
     *in_count = native_backend.acl_in_count;
     *out_count = native_backend.acl_out_count;
 }
@@ -282,6 +329,7 @@ uint32_t btv_host_bridge_monitor_output(void)
 int btv_host_bridge_present(void)
 {
     if (selected_backend == BRIDGE_UART) return btv_uart_is_open();
+    if (selected_backend == BRIDGE_RO5) return btv_ro5_is_open();
     if (selected_backend == BRIDGE_NATIVE)
         return native_backend.detected && !native_backend.removed;
     return selected_backend == BRIDGE_HOST;
@@ -315,6 +363,7 @@ void btv_host_bridge_device_dead(uint32_t service, uint32_t handle,
 int btv_host_bridge_boot(void)
 {
     if (selected_backend == BRIDGE_UART) return btv_uart_boot();
+    if (selected_backend == BRIDGE_RO5) return btv_ro5_boot();
     return selected_backend == BRIDGE_NATIVE && native_backend.opened ? 1 : -1;
 }
 
@@ -414,6 +463,11 @@ void btv_host_bridge_stats(uint32_t *tx_waiting, uint32_t *rx_total,
     if (selected_backend == BRIDGE_UART)
     {
         btv_uart_stats(tx_waiting, rx_total, rx_lost);
+        return;
+    }
+    if (selected_backend == BRIDGE_RO5)
+    {
+        btv_ro5_stats(tx_waiting, rx_total, rx_lost);
         return;
     }
     if (tx_waiting) *tx_waiting = 0;
