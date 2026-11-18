@@ -13,18 +13,20 @@ Bluetooth adapter or supported built-in radios. Version 1.03.
 Tested on a Raspberry Pi CM4 under RISC OS 5.31 with a TP-Link UB400
 (CSR8510) adapter. Realtek RTL8761B adapters, such as the TP-Link UB4A and
 UB500, are sent Realtek's patch at start-up, as Linux does; the firmware is
-in `desktop/firmware` and is installed in `!Bluetooth.Firmware`. Other RISC OS 5 machines with working USB 2 host drivers,
-such as a Pinebook Pro, should work with a USB adapter.
+in `desktop/firmware` and is installed in `!Bluetooth.Firmware`.
 
-The Pinebook Pro's built-in BCM4345C5 and the Raspberry Pi 4, Pi 400 and
-CM4's built-in BCM4345C0 are also detected when no USB adapter is present.
-The Pi controller needs a legally obtained `BCM4345C0` HCD patch in
-`!Bluetooth.Firmware`; it is not included in this repository or installer.
-The Pi transport is newly integrated and still needs a hardware smoke test.
+## Controller transports
 
-On Titanium, a passed-through USB adapter needs USBDriver 1.35 or later.
-When `!Bluetooth` offers to load the bundled driver, accept it; this safely
-restarts XHCIDriver as well.
+| Machine | Controller | Requirements |
+|---|---|---|
+| RISC OS 5 machine with USB | CSR8510, RTL8761B, or another standard HCI USB adapter | A working DeviceFS USB stack. RTL8761B firmware is included. |
+| Pinebook Pro | Built-in BCM4345C5 on RK3399 UART0 | A legally obtained `BCM4345C5` HCD patch in `!Bluetooth.Firmware`. |
+| Pi 4, Pi 400, CM4 | Built-in BCM4345C0 on PL011 UART0 | A legally obtained `BCM4345C0` HCD patch in `!Bluetooth.Firmware`. It is not included in the source or installer, and this new transport still needs hardware smoke testing. |
+| Titanium | Passed-through USB adapter | USBDriver 1.35 or later; `!Bluetooth` detects an insufficient driver and offers the bundled update. |
+
+On Titanium, accept `!Bluetooth`'s driver-update offer when it appears. It
+restarts USBDriver and XHCIDriver, so keyboards, mice and USB storage may be
+unavailable briefly.
 
 The software has three parts:
 
@@ -74,9 +76,10 @@ contain. Put them in `desktop/modules/` before building the desktop part:
 | `USBDriver,ffa` | RISC OS Open USBDriver 1.35. |
 | `DWCDriver,ffa` | RISC OS Open DWCDriver with the CM4 changes, 0.40. |
 
-`USBDriver` and `DWCDriver` are loaded only on a Raspberry Pi. On other
-machines the files must still be present for the package build, but they
-are never loaded.
+PreDesk automatically loads `USBDriver` and `DWCDriver` only on DWC-based
+Raspberry Pi systems. On Titanium, if a detected adapter lacks the deferred
+USB-control capability, `!Bluetooth` asks before replacing USBDriver and
+restarting XHCIDriver. Other machines retain their existing USB stacks.
 
 ### Steps
 
@@ -96,9 +99,9 @@ click Install.
 
 ### Changing the version
 
-The version appears in four places, which must agree:
+The module and client version appears in these places, which must agree:
 
-- `port/cmhg/modhead.o`: the `BluetoothVoice<tab>0.NN` help string.
+- `port/cmhg/modhead.o`: the `BluetoothVoice<tab>1.NN` help string.
 - `port/cmhg/modhead.h`.
 - `client/c/btbar`: `VOICE_VERSION` and `VERSION_TEXT`.
 - `client/c/btstack`: `VOICE_VERSION_NEEDED`.
