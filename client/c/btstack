@@ -19,7 +19,7 @@
 #define MODULE_INSERT_COPY 11
 #define MODULE_LOOKUP 18
 #define USB_VERSION_NEEDED 135
-#define VOICE_VERSION_NEEDED 102
+#define VOICE_VERSION_NEEDED 103
 
 typedef struct image
 {
@@ -102,7 +102,15 @@ static int booted_from_usb(void)
 
 int bt_usb_stack_ready(void)
 {
+    int ready;
     if (booted_from_usb()) return 1;
+    /* On a running current module, ask the actual adapter rather than
+     * inferring DeviceFS capabilities from the host controller. Titanium's
+     * XHCI plus USBDriver 1.32 exposes the dongle but cannot do the deferred
+     * control requests needed by this transport. */
+    if (bt_module_version("BluetoothVoice") >= VOICE_VERSION_NEEDED &&
+        bt_adapter_present(&ready) > 0)
+        return ready;
     /* A Pi 4's sockets are XHCI (VL805): the DWC fix is for DWC-only boards. */
     if (bt_module_version("XHCIDriver") >= 0) return 1;
     /* USBDriver 1.35 is only swapped in on a Raspberry Pi (DWCDriver), where

@@ -18,8 +18,8 @@
 #include <string.h>
 
 #define TASK_NAME "Bluetooth"
-#define VERSION_TEXT "1.02 (18-Nov-26)"
-#define VOICE_VERSION 102
+#define VERSION_TEXT "1.03 (18-Nov-26)"
+#define VOICE_VERSION 103
 
 #define SWI_CORE 0x000d7bc8
 #define SWI_SCAN 0x000d7bc9
@@ -203,7 +203,7 @@ static int ensure_modules(int ask)
 {
     char directory[260];
     char problem[160];
-    int replace = !bt_usb_stack_ready();
+    int replace;
     int adapter;
     if (!bt_read_var("Bluetooth$Dir", directory, (int)sizeof(directory)))
     {
@@ -220,6 +220,9 @@ static int ensure_modules(int ask)
         snprintf(status_line, sizeof(status_line), "%.70s", problem);
         return 0;
     }
+    /* Loading a current BluetoothVoice may make the exact DeviceFS
+     * capability query available, so do this only afterwards. */
+    replace = !bt_usb_stack_ready();
     if (!replace) return 1;
     adapter = bt_adapter_present(NULL);
     if (adapter <= 0)

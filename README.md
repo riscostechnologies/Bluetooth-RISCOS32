@@ -1,7 +1,7 @@
 # Bluetooth for RISC OS (32-bit)
 
 A Bluetooth host stack for 32-bit RISC OS 5 that works through a USB
-Bluetooth adapter or supported built-in radios. Version 1.02.
+Bluetooth adapter or supported built-in radios. Version 1.03.
 
 - **Audio:** plays the computer's sound through Bluetooth speakers and
   headphones (A2DP, SBC).
@@ -21,6 +21,10 @@ CM4's built-in BCM4345C0 are also detected when no USB adapter is present.
 The Pi controller needs a legally obtained `BCM4345C0` HCD patch in
 `!Bluetooth.Firmware`; it is not included in this repository or installer.
 The Pi transport is newly integrated and still needs a hardware smoke test.
+
+On Titanium, a passed-through USB adapter needs USBDriver 1.35 or later.
+When `!Bluetooth` offers to load the bundled driver, accept it; this safely
+restarts XHCIDriver as well.
 
 The software has three parts:
 

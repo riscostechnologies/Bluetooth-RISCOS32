@@ -17,6 +17,8 @@ What you need
   It needs the proprietary BCM4345C0 patch at
   !Bluetooth.Firmware.BCM4345C0; this installer does not include that file.
   The Pinebook Pro's built-in Bluetooth is also supported.
+  On Titanium, accept !Bluetooth's offer to load its USB drivers; it updates
+  USBDriver to 1.35 and restarts XHCIDriver.
   SharedUnixLibrary 1.16 or later (a copy is included).
 
 Installing

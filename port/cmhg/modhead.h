@@ -15,8 +15,8 @@
 
 #define Module_Title		"BluetoothVoice"
 #define Module_Help		"BluetoothVoice"
-#define Module_VersionString	"1.02"
-#define Module_VersionNumber	26
+#define Module_VersionString	"1.03"
+#define Module_VersionNumber	27
 #ifndef Module_Date
 #define Module_Date		"18 Nov 2026"
 #endif
